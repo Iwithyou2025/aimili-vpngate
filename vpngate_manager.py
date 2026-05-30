@@ -39,6 +39,19 @@ FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+
+PREFERRED_COUNTRIES = [
+    c.strip().upper()
+    for c in os.environ.get("PREFERRED_COUNTRIES", "US,GB,UK,CA,DE,IN,NG").split(",")
+    if c.strip()
+]
+
+PREFERRED_COUNTRY_MIN_NODES = int(os.environ.get("PREFERRED_COUNTRY_MIN_NODES", "10"))
+PREFERRED_COUNTRY_SCAN_ROWS = int(os.environ.get("PREFERRED_COUNTRY_SCAN_ROWS", "2000"))
+TEST_BATCH_SIZE = int(os.environ.get("TEST_BATCH_SIZE", "30"))
+
+
+
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -250,6 +263,58 @@ def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
 
 def decode_config(encoded: str) -> str:
     return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+def get_country_code(item: dict[str, Any]) -> str:
+    return str(
+        item.get("CountryShort")
+        or item.get("country_short")
+        or ""
+    ).upper()
+
+
+def select_candidate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    seen_ips: set[str] = set()
+    country_counts = {code: 0 for code in PREFERRED_COUNTRIES}
+
+    def add_row(row: dict[str, str]) -> bool:
+        ip = row.get("IP", "")
+        encoded = row.get("OpenVPN_ConfigData_Base64", "")
+
+        if not ip or not encoded:
+            return False
+
+        if ip in seen_ips:
+            return False
+
+        selected.append(row)
+        seen_ips.add(ip)
+
+        code = get_country_code(row)
+        if code in country_counts:
+            country_counts[code] += 1
+
+        return True
+
+    # 保留原来的逻辑：先取前 MAX_SCAN_ROWS 行
+    for row in rows[:MAX_SCAN_ROWS]:
+        add_row(row)
+
+    # 额外补充指定国家
+    for row in rows[:PREFERRED_COUNTRY_SCAN_ROWS]:
+        code = get_country_code(row)
+
+        if code not in country_counts:
+            continue
+
+        if country_counts[code] >= PREFERRED_COUNTRY_MIN_NODES:
+            continue
+
+        add_row(row)
+
+        if all(count >= PREFERRED_COUNTRY_MIN_NODES for count in country_counts.values()):
+            break
+
+    return selected
 
 def load_blacklist() -> dict[str, dict[str, Any]]:
     return {}
@@ -310,17 +375,22 @@ def fetch_candidates() -> list[dict[str, Any]]:
         try:
             api_text = fetch_api_text()
             rows = parse_vpngate_rows(api_text)
-            for row in rows[:MAX_SCAN_ROWS]:
+            selected_rows = select_candidate_rows(rows)
+
+            for row in selected_rows:
                 ip = row.get("IP", "")
                 if not ip or ip in seen_ips:
                     continue
+
                 encoded = row.get("OpenVPN_ConfigData_Base64", "")
                 if not encoded:
                     continue
+
                 config_text = decode_config(encoded)
                 node = row_to_node(row, config_text)
                 candidates.append(node)
                 seen_ips.add(ip)
+
         except Exception as e:
             print(f"[fetch_candidates] Fetch {i+1} failed: {e}", flush=True)
             log_to_json("WARNING", "Main", f"第 {i+1} 次拉取 API 节点失败: {e}")
@@ -598,6 +668,33 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
+
+def preferred_country_priority(node: dict[str, Any]) -> int:
+    code = get_country_code(node)
+
+    try:
+        return PREFERRED_COUNTRIES.index(code)
+    except ValueError:
+        return len(PREFERRED_COUNTRIES)
+
+
+def pick_nodes_to_test(nodes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    pending = [
+        n for n in nodes
+        if not n.get("active")
+           and n.get("probe_status") == "not_checked"
+    ]
+
+    pending.sort(
+        key=lambda n: (
+            0 if get_country_code(n) in PREFERRED_COUNTRIES else 1,
+            preferred_country_priority(n),
+            -parse_int(n.get("score")),
+            parse_int(n.get("ping")),
+        )
+    )
+
+    return pending[:limit]
 
 def get_free_test_index() -> int:
     with test_indexes_lock:
@@ -981,10 +1078,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
         # Test the first 10 non-active nodes from the new list
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")][:10]
+            to_test = pick_nodes_to_test(current_nodes, TEST_BATCH_SIZE)
             to_test_ids = [n["id"] for n in to_test]
-            
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
+
+        print(f"[维护线程] 正在检测优先国家节点，数量 {len(to_test_ids)}: {to_test_ids}", flush=True)
         set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
         test_multiple_nodes(to_test_ids)
         
