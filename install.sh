@@ -340,7 +340,7 @@ def print_status():
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print_line("=======================================================")
-    print_line(f"               {bold}AimiliVPN 管理终端 v2.2{reset}                  ")
+    print_line(f"               {bold}AimiliVPN 管理终端 v3.0{reset}                  ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
     print_line(format_line("代理网关 (Port 7928)", gateway_status))
