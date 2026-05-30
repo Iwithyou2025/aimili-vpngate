@@ -8,7 +8,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-# 1. Check root permissions
+# 1. Check root permissions。
 if [[ "$(id -u)" != "0" ]]; then
     echo -e "${RED}错误: 必须以 root 权限运行此脚本。请使用: sudo bash $0${PLAIN}"
     exit 1
