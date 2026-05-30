@@ -34,6 +34,10 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 import vpn_utils
 import proxy_server
 
+
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
@@ -61,6 +65,21 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+
+# IP 质量检测策略：自动切换时启用；手动连接仍允许临时测试
+QUALITY_CHECK_ENABLED = env_flag("QUALITY_CHECK_ENABLED", "1")
+IPPURE_API_URL = os.environ.get("IPPURE_API_URL", "https://my.ippure.com/v1/info")
+QUALITY_HTTP_TIMEOUT_SECONDS = int(os.environ.get("QUALITY_HTTP_TIMEOUT_SECONDS", "12"))
+QUALITY_MAX_FRAUD_SCORE = int(os.environ.get("QUALITY_MAX_FRAUD_SCORE", "30"))
+QUALITY_REQUIRE_RESIDENTIAL = env_flag("QUALITY_REQUIRE_RESIDENTIAL", "1")
+QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
+QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
+QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
+
+# 自动切换策略：默认只在当前活动节点的同一国家内切换
+AUTO_SWITCH_SAME_COUNTRY_ONLY = env_flag("AUTO_SWITCH_SAME_COUNTRY_ONLY", "1")
+AUTO_SWITCH_MAX_ATTEMPTS = int(os.environ.get("AUTO_SWITCH_MAX_ATTEMPTS", "0"))  # 0 表示直到候选耗尽
+
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -225,6 +244,12 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
+    state["quality_check_enabled"] = QUALITY_CHECK_ENABLED
+    state["quality_max_fraud_score"] = QUALITY_MAX_FRAUD_SCORE
+    state["quality_require_residential"] = QUALITY_REQUIRE_RESIDENTIAL
+    state["quality_require_native"] = QUALITY_REQUIRE_NATIVE
+    state["quality_min_human_ratio"] = QUALITY_MIN_HUMAN_RATIO
+    state["auto_switch_same_country_only"] = AUTO_SWITCH_SAME_COUNTRY_ONLY
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -243,6 +268,59 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def parse_float(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        if isinstance(value, str):
+            value = value.strip().replace("%", "")
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalize_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on", "是", "原生", "原生ip", "residential", "住宅", "家庭宽带"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", "否", "非原生", "广播", "广播ip", "hosting", "datacenter", "data center", "机房", "idc"}:
+            return False
+    return None
+
+
+def deep_find_value(data: Any, candidates: set[str]) -> Any:
+    """在第三方 API 返回里递归查找字段，兼容 camelCase/snake_case/大小写。"""
+    normalized = {re.sub(r"[^a-z0-9]+", "", key.lower()) for key in candidates}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            nk = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+            if nk in normalized:
+                return value
+        for value in data.values():
+            found = deep_find_value(value, candidates)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = deep_find_value(item, candidates)
+            if found is not None:
+                return found
+    return None
+
+
+def text_contains_any(value: Any, keywords: list[str]) -> bool:
+    s = str(value or "").lower()
+    return any(keyword.lower() in s for keyword in keywords)
+
 
 def fetch_api_text() -> str:
     request = urllib.request.Request(
@@ -357,6 +435,16 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probe_status": "not_checked",
         "probe_message": "",
         "probed_at": 0,
+        "quality_status": "unknown",
+        "quality_checked_at": 0,
+        "quality_fail_reason": "",
+        "quality_fail_until": 0,
+        "exit_ip": "",
+        "ippure_score": 0,
+        "human_ratio": 0,
+        "native_ip": None,
+        "is_residential": None,
+        "quality_source": "",
     }
 
 def fetch_candidates() -> list[dict[str, Any]]:
@@ -865,53 +953,111 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         
     return list(updated_nodes_map.values())
 
-def auto_switch_node(attempt: int = 0) -> None:
-    if attempt >= 3:
-        print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
-        return
-        
-    # Find the next best available node
+def get_active_country_code(nodes: list[dict[str, Any]], preferred_node_id: str = "") -> str:
+    if preferred_node_id:
+        node = next((n for n in nodes if n.get("id") == preferred_node_id), None)
+        if node:
+            return get_country_code(node)
+
+    active_node = next((n for n in nodes if n.get("active")), None)
+    if active_node:
+        return get_country_code(active_node)
+
+    return ""
+
+
+def quality_cooldown_active(node: dict[str, Any]) -> bool:
+    return float(node.get("quality_fail_until") or 0) > time.time()
+
+
+def get_auto_switch_candidates(nodes: list[dict[str, Any]], country_code: str = "", attempted_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    attempted_ids = attempted_ids or set()
+
+    candidates = [
+        n for n in nodes
+        if n.get("probe_status") == "available"
+        and not n.get("active")
+        and n.get("id") not in attempted_ids
+        and not quality_cooldown_active(n)
+    ]
+
+    if AUTO_SWITCH_SAME_COUNTRY_ONLY and country_code:
+        candidates = [n for n in candidates if get_country_code(n) == country_code]
+
+    candidates.sort(
+        key=lambda n: (
+            parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
+            -parse_int(n.get("human_ratio")),
+            parse_int(n.get("latency_ms")) or 999999,
+            -parse_int(n.get("score")),
+        )
+    )
+
+    return candidates
+
+
+def auto_switch_node(
+    attempt: int = 0,
+    country_code: str = "",
+    attempted_ids: set[str] | None = None,
+) -> None:
+    attempted_ids = attempted_ids or set()
+
     with lock:
         nodes = read_json(NODES_FILE, [])
-        candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
-            and not n.get("active")
-        ]
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
-        
-    if candidates:
-        next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("INFO", "VPN", msg)
-        try:
-            connect_node(next_node["id"])
-        except Exception as e:
-            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
-            print(f"[自动切换] {err_msg}", flush=True)
-            log_to_json("WARNING", "VPN", err_msg)
-            auto_switch_node(attempt + 1)
-    else:
-        msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
+        target_country = (country_code or get_active_country_code(nodes, active_openvpn_node_id)).upper()
+        candidates = get_auto_switch_candidates(nodes, target_country, attempted_ids)
+
+    if AUTO_SWITCH_MAX_ATTEMPTS > 0 and attempt >= AUTO_SWITCH_MAX_ATTEMPTS:
+        msg = f"自动切换已达到最大尝试次数 {AUTO_SWITCH_MAX_ATTEMPTS}，停止切换"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("WARNING", "VPN", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_json(NODES_FILE, [])
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message="没有可用的备选节点，已断开")
-        
-        def bg_fetch_and_switch():
-            try:
-                maintain_valid_nodes(force=False)
-                auto_switch_node()
-            except Exception as e:
-                print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
-        
-        threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+        return
+
+    if candidates:
+        next_node = candidates[0]
+        attempted_ids.add(str(next_node.get("id")))
+
+        scope = f"{target_country} 国家内" if (AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country) else "全部国家"
+        msg = f"当前连接失效或 IP 质量不达标，正在{scope}切换至备用节点: {next_node['id']}"
+        print(f"[自动切换] {msg}", flush=True)
+        log_to_json("INFO", "VPN", msg)
+
+        try:
+            connect_node_with_quality_check(next_node["id"])
+            return
+        except Exception as e:
+            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，继续尝试下一个"
+            print(f"[自动切换] {err_msg}", flush=True)
+            log_to_json("WARNING", "VPN", err_msg)
+            auto_switch_node(attempt + 1, target_country, attempted_ids)
+            return
+
+    if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
+        msg = f"{target_country} 国家内没有更多符合条件的可切换节点，已停止自动切换"
+    else:
+        msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点"
+
+    print(f"[自动切换] {msg}", flush=True)
+    log_to_json("WARNING", "VPN", msg)
+    stop_active_openvpn()
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        for item in nodes:
+            item["active"] = False
+        write_json(NODES_FILE, nodes)
+    set_state(active_openvpn_node_id="", last_check_message=msg)
+
+    def bg_fetch_and_switch() -> None:
+        try:
+            maintain_valid_nodes(force=False)
+            # 补齐后仍优先在原国家内继续尝试
+            auto_switch_node(country_code=target_country)
+        except Exception as e:
+            print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
+
+    threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -1012,6 +1158,197 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
+
+class QualityCheckFailed(RuntimeError):
+    pass
+
+
+def parse_ippure_quality(raw: dict[str, Any]) -> dict[str, Any]:
+    fraud_score_raw = deep_find_value(raw, {
+        "fraudScore", "fraud_score", "riskScore", "risk_score",
+        "ippureScore", "ippure_score", "score", "risk"
+    })
+    human_ratio_raw = deep_find_value(raw, {
+        "humanRatio", "human_ratio", "humanScore", "human_score",
+        "botScore", "bot_score", "cfBotScore", "cloudflareBotScore"
+    })
+    residential_raw = deep_find_value(raw, {
+        "isResidential", "is_residential", "residential", "isISP", "isp"
+    })
+    native_raw = deep_find_value(raw, {
+        "isNative", "is_native", "native", "nativeIP", "native_ip",
+        "isOriginal", "originalIP", "original_ip"
+    })
+    broadcast_raw = deep_find_value(raw, {
+        "isBroadcast", "is_broadcast", "broadcast", "broadcastIP", "broadcast_ip"
+    })
+    ip_type_raw = deep_find_value(raw, {
+        "ipType", "ip_type", "type", "usageType", "usage_type",
+        "connectionType", "connection_type"
+    })
+
+    asn_raw = deep_find_value(raw, {"asn", "asNumber", "as_number"})
+    org_raw = deep_find_value(raw, {"org", "organization", "asOrganization", "as_organization", "isp", "owner"})
+    ip_raw = deep_find_value(raw, {"ip", "query", "address"})
+
+    has_ippure_score = fraud_score_raw is not None and str(fraud_score_raw).strip() != ""
+    fraud_score = parse_int(fraud_score_raw)
+    human_ratio = parse_int(human_ratio_raw)
+
+    is_residential = normalize_bool(residential_raw)
+    if is_residential is None and ip_type_raw is not None:
+        is_residential = text_contains_any(ip_type_raw, ["residential", "住宅", "家庭宽带", "isp"])
+
+    native_ip = normalize_bool(native_raw)
+    broadcast_bool = normalize_bool(broadcast_raw)
+    if native_ip is None and broadcast_bool is not None:
+        native_ip = not broadcast_bool
+
+    if native_ip is None:
+        native_text = deep_find_value(raw, {"nativeStatus", "native_status", "source", "ipSource", "ip_source"})
+        if native_text is not None:
+            if text_contains_any(native_text, ["原生", "native", "original"]):
+                native_ip = True
+            elif text_contains_any(native_text, ["广播", "broadcast", "non-native", "非原生"]):
+                native_ip = False
+
+    return {
+        "source": "ippure",
+        "raw": raw,
+        "ip": str(ip_raw or ""),
+        "has_ippure_score": has_ippure_score,
+        "ippure_score": fraud_score,
+        "fraud_score": fraud_score,
+        "human_ratio": human_ratio,
+        "is_residential": is_residential,
+        "native_ip": native_ip,
+        "ip_type": str(ip_type_raw or ""),
+        "asn": str(asn_raw or ""),
+        "org": str(org_raw or ""),
+    }
+
+
+def fetch_ippure_quality() -> dict[str, Any]:
+    cmd = [
+        "curl", "-4", "-s",
+        "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
+        IPPURE_API_URL,
+        "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
+    ]
+
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3)
+    if res.returncode != 0:
+        raise RuntimeError(f"IPPure 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}")
+
+    body = res.stdout.strip()
+    if not body:
+        raise RuntimeError("IPPure 返回为空")
+
+    try:
+        raw = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"IPPure 返回不是 JSON: {exc}; body={body[:200]}")
+
+    return parse_ippure_quality(raw)
+
+
+def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
+    score = parse_int(info.get("ippure_score"))
+    if not info.get("has_ippure_score"):
+        return False, "无法读取 IPPure 风控系数"
+
+    if score > QUALITY_MAX_FRAUD_SCORE:
+        return False, f"IPPure 系数 {score}% 超过阈值 {QUALITY_MAX_FRAUD_SCORE}%"
+
+    if QUALITY_REQUIRE_RESIDENTIAL and info.get("is_residential") is not True:
+        return False, "IP 类型不是住宅/家庭宽带 IP"
+
+    if QUALITY_REQUIRE_NATIVE and info.get("native_ip") is not True:
+        return False, "IP 来源不是原生 IP"
+
+    if QUALITY_MIN_HUMAN_RATIO > 0:
+        human_ratio = parse_int(info.get("human_ratio"))
+        if human_ratio < QUALITY_MIN_HUMAN_RATIO:
+            return False, f"人机流量比 {human_ratio}% 低于阈值 {QUALITY_MIN_HUMAN_RATIO}%"
+
+    return True, "IP 质量达标"
+
+
+def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool, reason: str) -> None:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            return
+
+        now = time.time()
+        node["quality_status"] = "passed" if passed else "failed"
+        node["quality_checked_at"] = now
+        node["quality_fail_reason"] = "" if passed else reason
+        node["quality_fail_until"] = 0 if passed else now + QUALITY_FAIL_COOLDOWN_SECONDS
+        node["exit_ip"] = quality_info.get("ip") or node.get("exit_ip") or ""
+        node["ippure_score"] = parse_int(quality_info.get("ippure_score"))
+        node["human_ratio"] = parse_int(quality_info.get("human_ratio"))
+        node["native_ip"] = quality_info.get("native_ip")
+        node["is_residential"] = quality_info.get("is_residential")
+        node["quality_source"] = quality_info.get("source", "ippure")
+        if quality_info.get("asn"):
+            node["asn"] = quality_info.get("asn")
+        if quality_info.get("org"):
+            node["as_name"] = quality_info.get("org")
+        if quality_info.get("ip_type"):
+            node["ip_type"] = quality_info.get("ip_type")
+
+        if not passed:
+            node["active"] = False
+            node["probe_message"] = f"IP质量不达标: {reason}"
+
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+
+
+def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any]]:
+    if not QUALITY_CHECK_ENABLED:
+        return True, "IP质量检测未启用", {}
+
+    quality_info = fetch_ippure_quality()
+    passed, reason = evaluate_ip_quality(quality_info)
+    update_node_quality(node_id, quality_info, passed, reason)
+
+    set_state(
+        proxy_quality_ok=passed,
+        proxy_quality_error="" if passed else reason,
+        proxy_ippure_score=parse_int(quality_info.get("ippure_score")),
+        proxy_human_ratio=parse_int(quality_info.get("human_ratio")),
+        proxy_native_ip=quality_info.get("native_ip"),
+        proxy_is_residential=quality_info.get("is_residential"),
+    )
+
+    return passed, reason, quality_info
+
+
+def connect_node_with_quality_check(node_id: str) -> str:
+    result = connect_node(node_id)
+
+    set_state(last_check_message="正在通过本地代理请求 IPPure 检测出口 IP 质量...")
+    try:
+        passed, reason, quality_info = check_active_exit_ip_quality(node_id)
+    except Exception as exc:
+        reason = f"IP质量检测异常: {exc}"
+        update_node_quality(node_id, {}, False, reason)
+        set_state(proxy_quality_ok=False, proxy_quality_error=reason)
+        stop_active_openvpn()
+        raise QualityCheckFailed(reason) from exc
+
+    if not passed:
+        log_to_json("WARNING", "Quality", f"节点 {node_id} IP质量不达标: {reason}")
+        stop_active_openvpn()
+        raise QualityCheckFailed(reason)
+
+    log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标: {quality_info}")
+    set_state(last_check_message=f"Connected {node_id}; IP质量达标")
+    return result
+
+
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
@@ -1095,7 +1432,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested first 10 nodes."
+        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} prioritized nodes."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
