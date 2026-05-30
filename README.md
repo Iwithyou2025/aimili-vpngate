@@ -52,7 +52,7 @@ sudo apt-get update && sudo apt-get install -y curl ca-certificates
 ##### 2. Debian 系统兼容运行方法
 本脚本一键包默认限制在 Ubuntu 系统运行。Debian 用户如需运行，可先下载并用 `sed` 临时将系统类型限制替换为 `"ubuntu"` 后再执行安装：
 ```bash
-curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh -o install.sh
+curl -Ls https://raw.githubusercontent.com/Iwithyou2025/aimili-vpngate/main/install.sh -o install.sh
 sed -i 's/"${ID:-}"/"ubuntu"/g' install.sh
 sudo bash install.sh
 ```
@@ -130,7 +130,7 @@ sudo apt-get update
 To install and deploy AimiliVPN on your **Ubuntu** server, copy and paste the following command:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Iwithyou2025/aimili-vpngate/main/install.sh)
 ```
 
 ---
@@ -159,7 +159,7 @@ sudo apt-get update && sudo apt-get install -y curl ca-certificates
 ##### 2. Bypass OS Restrictions for Debian
 The script is restricted to Ubuntu by default. For Debian systems, run the following commands to download, patch, and install:
 ```bash
-curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh -o install.sh
+curl -Ls https://raw.githubusercontent.com/Iwithyou2025/aimili-vpngate/main/install.sh -o install.sh
 sed -i 's/"${ID:-}"/"ubuntu"/g' install.sh
 sudo bash install.sh
 ```
