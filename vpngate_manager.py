@@ -70,7 +70,7 @@ PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() i
 }
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
-
+PROXY_AUTH_ENV_FILE = Path(os.environ.get("AIMILIVPN_ENV_FILE", "/etc/default/aimilivpn"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
@@ -265,6 +265,10 @@ def get_state() -> dict[str, Any]:
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+    proxy_auth_cfg = load_proxy_auth_config()
+    state["proxy_auth_enabled"] = bool(proxy_auth_cfg.get("enabled"))
+    state["proxy_username"] = proxy_auth_cfg.get("username", "")
+    state["proxy_password"] = proxy_auth_cfg.get("password", "")
     
     return state
 
@@ -291,7 +295,108 @@ def get_internal_curl_proxy_args(scheme: str = "socks5h", host: str = "127.0.0.1
         ])
 
     return args
+def normalize_env_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+
+def load_proxy_auth_config() -> dict[str, Any]:
+    cfg = {
+        "enabled": PROXY_AUTH_ENABLED,
+        "username": PROXY_USERNAME,
+        "password": PROXY_PASSWORD,
+    }
+
+    try:
+        if PROXY_AUTH_ENV_FILE.exists():
+            for line in PROXY_AUTH_ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+
+                if key == "PROXY_AUTH_ENABLED":
+                    cfg["enabled"] = normalize_env_bool(value)
+                elif key == "PROXY_USERNAME":
+                    cfg["username"] = value
+                elif key == "PROXY_PASSWORD":
+                    cfg["password"] = value
+    except Exception as exc:
+        print(f"[代理认证] 读取代理认证配置失败: {exc}", flush=True)
+
+    return cfg
+
+
+def validate_proxy_credential(name: str, value: str, min_len: int, max_len: int) -> str:
+    value = str(value or "").strip()
+
+    if not (min_len <= len(value) <= max_len):
+        raise ValueError(f"{name}长度必须在 {min_len} 到 {max_len} 位之间")
+
+    if not re.match(r"^[A-Za-z0-9_.@-]+$", value):
+        raise ValueError(f"{name}只能包含英文字母、数字、下划线、点、@ 和短横线")
+
+    return value
+
+
+def write_proxy_auth_env(enabled: bool, username: str, password: str) -> None:
+    PROXY_AUTH_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    old_lines: list[str] = []
+    if PROXY_AUTH_ENV_FILE.exists():
+        old_lines = PROXY_AUTH_ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    skip_keys = {
+        "PROXY_AUTH_ENABLED",
+        "PROXY_USERNAME",
+        "PROXY_PASSWORD",
+    }
+
+    new_lines: list[str] = []
+    for line in old_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            new_lines.append(line)
+            continue
+
+        key = stripped.split("=", 1)[0]
+        if key in skip_keys:
+            continue
+
+        new_lines.append(line)
+
+    new_lines.extend([
+        f"PROXY_AUTH_ENABLED={'1' if enabled else '0'}",
+        f"PROXY_USERNAME={username}",
+        f"PROXY_PASSWORD={password}",
+    ])
+
+    tmp_path = PROXY_AUTH_ENV_FILE.with_suffix(".tmp")
+    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    tmp_path.replace(PROXY_AUTH_ENV_FILE)
+
+    try:
+        PROXY_AUTH_ENV_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def apply_proxy_auth_runtime(enabled: bool, username: str, password: str) -> None:
+    global PROXY_AUTH_ENABLED, PROXY_USERNAME, PROXY_PASSWORD
+
+    PROXY_AUTH_ENABLED = enabled
+    PROXY_USERNAME = username
+    PROXY_PASSWORD = password
+
+    os.environ["PROXY_AUTH_ENABLED"] = "1" if enabled else "0"
+    os.environ["PROXY_USERNAME"] = username
+    os.environ["PROXY_PASSWORD"] = password
+
+    # 关键：同步修改 proxy_server 模块里的全局变量，保证无需重启实时生效
+    proxy_server.PROXY_AUTH_ENABLED = enabled
+    proxy_server.PROXY_USERNAME = username
+    proxy_server.PROXY_PASSWORD = password
 
 def get_proxy_authorization_header() -> str:
     if not (PROXY_AUTH_ENABLED and PROXY_USERNAME and PROXY_PASSWORD):
@@ -2861,6 +2966,32 @@ INDEX_HTML = r"""<!doctype html>
           <button type="submit" id="settings_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
         </div>
       </form>
+        <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px; margin-top: 20px;">
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">
+            落地代理认证配置
+          </div>
+
+          <label style="display:flex; align-items:center; gap:8px; color:var(--text-secondary); font-size:13px; margin-bottom:14px;">
+            <input type="checkbox" id="settings_proxy_auth_enabled" style="width:16px; height:16px;">
+            启用 HTTP/SOCKS5 代理认证
+          </label>
+
+          <div class="form-group">
+            <label class="form-label" for="settings_proxy_username">代理用户名</label>
+            <input type="text" id="settings_proxy_username" class="input-field" autocomplete="off">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="settings_proxy_password">代理密码</label>
+            <input type="text" id="settings_proxy_password" class="input-field" autocomplete="off">
+          </div>
+
+          <button type="button" id="settings_proxy_save_btn" class="btn-primary" onclick="saveProxyAuthSettings()" style="width:100%; margin-top: 4px;">
+            保存代理认证并实时生效
+          </button>
+
+          <div id="settings_proxy_msg" style="font-size:13px; margin-top:12px; display:none;"></div>
+        </div>
     </div>
   </div>
 </main>
@@ -3098,7 +3229,12 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const proxyAuthInfo = state.proxy_auth_enabled
+    ? ` | <span style="white-space:nowrap;">● 代理用户名：<strong class="mono" style="color:#34d399;">${esc(state.proxy_username || "未配置")}</strong></span>
+        <span style="white-space:nowrap; margin-left:12px;">● 代理密码：<strong class="mono" style="color:#fbbf24;">${esc(state.proxy_password || "未配置")}</strong></span>`
+    : ` | <span style="white-space:nowrap; color:#fb7185;">● 代理认证：未开启</span>`;
+
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${proxyAuthInfo}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -3481,10 +3617,26 @@ function openSettingsModal() {
   $("settings_error").style.display = "none";
   $("settings_success").style.display = "none";
   $("settings_form").reset();
+
+  const proxyMsg = $("settings_proxy_msg");
+  if (proxyMsg) {
+    proxyMsg.style.display = "none";
+    proxyMsg.textContent = "";
+  }
   
   if (state) {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
+
+    if ($("settings_proxy_auth_enabled")) {
+      $("settings_proxy_auth_enabled").checked = !!state.proxy_auth_enabled;
+    }
+    if ($("settings_proxy_username")) {
+      $("settings_proxy_username").value = state.proxy_username || "";
+    }
+    if ($("settings_proxy_password")) {
+      $("settings_proxy_password").value = state.proxy_password || "";
+    }
   }
   
   $("settings_modal").style.display = "flex";
@@ -3564,6 +3716,71 @@ async function saveSettings(e) {
     errorDivEl.style.display = "block";
     submitBtn.disabled = false;
     submitBtn.textContent = "保存修改";
+  }
+}
+async function saveProxyAuthSettings() {
+  const btn = $("settings_proxy_save_btn");
+  const msg = $("settings_proxy_msg");
+
+  const enabled = $("settings_proxy_auth_enabled").checked;
+  const username = $("settings_proxy_username").value.trim();
+  const password = $("settings_proxy_password").value.trim();
+
+  msg.style.display = "none";
+  msg.textContent = "";
+
+  if (!/^[A-Za-z0-9_.@-]{3,64}$/.test(username)) {
+    msg.textContent = "代理用户名长度必须为 3-64 位，只能包含字母、数字、下划线、点、@ 和短横线";
+    msg.style.color = "var(--danger)";
+    msg.style.display = "block";
+    return;
+  }
+
+  if (!/^[A-Za-z0-9_.@-]{6,128}$/.test(password)) {
+    msg.textContent = "代理密码长度必须为 6-128 位，只能包含字母、数字、下划线、点、@ 和短横线";
+    msg.style.color = "var(--danger)";
+    msg.style.display = "block";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "正在保存...";
+
+  try {
+    const res = await fetch("./api/update_proxy_auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        username,
+        password,
+      }),
+    });
+
+    const data = await res.json();
+
+    if (res.ok && data.ok) {
+      state.proxy_auth_enabled = data.proxy_auth_enabled;
+      state.proxy_username = data.proxy_username;
+      state.proxy_password = data.proxy_password;
+
+      msg.textContent = "代理认证已更新，并已实时生效";
+      msg.style.color = "var(--success)";
+      msg.style.display = "block";
+
+      render();
+    } else {
+      msg.textContent = data.error || "代理认证保存失败";
+      msg.style.color = "var(--danger)";
+      msg.style.display = "block";
+    }
+  } catch (err) {
+    msg.textContent = "连接服务器失败，请稍后重试";
+    msg.style.color = "var(--danger)";
+    msg.style.display = "block";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "保存代理认证并实时生效";
   }
 }
 
@@ -3973,6 +4190,47 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+        if effective_path == "/api/update_proxy_auth":
+
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+
+                enabled = normalize_env_bool(payload.get("enabled", True))
+                username = validate_proxy_credential(
+                    "代理用户名",
+                    str(payload.get("username") or ""),
+                    3,
+                    64,
+                )
+                password = validate_proxy_credential(
+                    "代理密码",
+                    str(payload.get("password") or ""),
+                    6,
+                    128,
+                )
+
+                write_proxy_auth_env(enabled, username, password)
+                apply_proxy_auth_runtime(enabled, username, password)
+
+                set_state(
+                    proxy_auth_enabled=enabled,
+                    proxy_username=username,
+                    proxy_password=password,
+                )
+
+                self.send_json({
+                    "ok": True,
+                    "message": "代理认证配置已更新，并已实时生效",
+                    "proxy_auth_enabled": enabled,
+                    "proxy_username": username,
+                    "proxy_password": password,
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/update_settings":
