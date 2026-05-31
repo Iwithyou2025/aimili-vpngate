@@ -3017,7 +3017,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
 
       <button type="button" id="settings_proxy_save_btn" class="btn-primary" onclick="saveProxyAuthSettings()" style="width:100%; margin-top: 4px;">
-        保存代理认证并实时生效
+        保存配置
       </button>
 
       <div id="settings_proxy_msg" style="font-size:13px; margin-top:12px; display:none;"></div>
@@ -3826,7 +3826,7 @@ async function saveProxyAuthSettings() {
     msg.style.display = "block";
   } finally {
     btn.disabled = false;
-    btn.textContent = "提交";
+    btn.textContent = "保存配置";
   }
 }
 
