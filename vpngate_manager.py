@@ -46,7 +46,7 @@ MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
 
 PREFERRED_COUNTRIES = [
     c.strip().upper()
-    for c in os.environ.get("PREFERRED_COUNTRIES", "KR,JP,US,CA").split(",")
+    for c in os.environ.get("PREFERRED_COUNTRIES", "JP,KR,US,CA").split(",")
     if c.strip()
 ]
 
