@@ -3024,11 +3024,6 @@ INDEX_HTML = r"""<!doctype html>
         落地代理认证配置
       </div>
 
-      <label style="display:flex; align-items:center; gap:8px; color:var(--text-secondary); font-size:13px; margin-bottom:14px;">
-        <input type="checkbox" id="settings_proxy_auth_enabled" style="width:16px; height:16px;">
-        启用 HTTP/SOCKS5 代理认证
-      </label>
-
       <div class="form-group">
         <label class="form-label" for="settings_proxy_username">代理用户名</label>
         <input type="text" id="settings_proxy_username" class="input-field" autocomplete="off">
@@ -3685,9 +3680,7 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
 
-    if ($("settings_proxy_auth_enabled")) {
-      $("settings_proxy_auth_enabled").checked = !!state.proxy_auth_enabled;
-    }
+
     if ($("settings_proxy_username")) {
       $("settings_proxy_username").value = state.proxy_username || "";
     }
@@ -3795,7 +3788,7 @@ async function saveProxyAuthSettings() {
   const btn = $("settings_proxy_save_btn");
   const msg = $("settings_proxy_msg");
 
-  const enabled = $("settings_proxy_auth_enabled").checked;
+  const enabled = true;
   const username = $("settings_proxy_username").value.trim();
   const password = $("settings_proxy_password").value.trim();
 
@@ -4270,7 +4263,7 @@ class Handler(BaseHTTPRequestHandler):
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
 
-                enabled = normalize_env_bool(payload.get("enabled", True))
+                enabled = True
                 username = validate_proxy_credential(
                     "代理用户名",
                     str(payload.get("username") or ""),
