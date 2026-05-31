@@ -1644,6 +1644,41 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       cursor: not-allowed;
       transform: none !important;
     }
+
+    .login-loader {
+      display: none;
+      align-items: center;
+      gap: 4px;
+      height: 14px;
+    }
+
+    .login-loader i {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: currentColor;
+      opacity: 0.65;
+      animation: loginBounce 0.8s infinite ease-in-out;
+    }
+
+    .login-loader i:nth-child(2) {
+      animation-delay: 0.12s;
+    }
+
+    .login-loader i:nth-child(3) {
+      animation-delay: 0.24s;
+    }
+
+    @keyframes loginBounce {
+      0%, 80%, 100% {
+        transform: translateY(0);
+        opacity: 0.45;
+      }
+      40% {
+        transform: translateY(-6px);
+        opacity: 1;
+      }
+    }
   </style>
 </head>
 <body>
@@ -1673,51 +1708,87 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         </div>
         
         <button type="submit" id="submit_btn" class="login-btn">
-          <span>登录</span>
+          <span id="login_loader" class="login-loader" aria-hidden="true">
+            <i></i><i></i><i></i>
+          </span>
+          <span id="login_btn_text">登录</span>
         </button>
       </form>
     </div>
   </div>
 
   <script>
+    function setLoginLoading(isLoading) {
+      const submitBtn = document.getElementById("submit_btn");
+      const btnText = document.getElementById("login_btn_text");
+      const loader = document.getElementById("login_loader");
+
+      submitBtn.disabled = isLoading;
+      btnText.textContent = isLoading ? "正在验证..." : "登录";
+      loader.style.display = isLoading ? "inline-flex" : "none";
+    }
+
+    function showLoginError(message) {
+      const errorText = document.getElementById("error_text");
+      errorText.textContent = message;
+      errorText.style.display = "block";
+    }
+
     async function handleLogin(e) {
       e.preventDefault();
+
       const uname = document.getElementById("username").value.trim();
       const pwd = document.getElementById("password").value.trim();
       const errorText = document.getElementById("error_text");
-      const submitBtn = document.getElementById("submit_btn");
-      
+
       errorText.style.display = "none";
-      submitBtn.disabled = true;
-      submitBtn.querySelector("span").textContent = "正在验证...";
-      
+      errorText.textContent = "";
+
+      setLoginLoading(true);
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      let shouldRestoreButton = true;
+
       try {
         const response = await fetch("./api/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username: uname, password: pwd })
+          body: JSON.stringify({ username: uname, password: pwd }),
+          signal: controller.signal,
+          cache: "no-store"
         });
-        
-        const data = await response.json();
-        if (response.ok && data.ok) {
-          window.location.reload();
-        } else {
-          errorText.textContent = data.error || "账号或密码不正确，请重新输入";
-          errorText.style.display = "block";
-          submitBtn.disabled = false;
-          submitBtn.querySelector("span").textContent = "登录";
+
+        clearTimeout(timer);
+
+        let data = {};
+        try {
+          data = await response.json();
+        } catch (_) {
+          data = {};
         }
+
+        if (response.ok && data.ok) {
+          shouldRestoreButton = false;
+          window.location.reload();
+          return;
+        }
+
+        showLoginError(data.error || "账号或密码不正确，请重新输入");
       } catch (err) {
-        errorText.textContent = "连接服务器失败，请稍后重试";
-        errorText.style.display = "block";
-        submitBtn.disabled = false;
-        submitBtn.querySelector("span").textContent = "登录";
+        clearTimeout(timer);
+        showLoginError("网络错误，请刷新页面后重试");
+      } finally {
+        if (shouldRestoreButton) {
+          setLoginLoading(false);
+        }
       }
     }
   </script>
 </body>
 </html>
 """
+
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
