@@ -3826,7 +3826,7 @@ async function saveProxyAuthSettings() {
     msg.style.display = "block";
   } finally {
     btn.disabled = false;
-    btn.textContent = "保存代理认证并实时生效";
+    btn.textContent = "提交";
   }
 }
 
