@@ -2011,13 +2011,36 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
     }
 
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--success);
-      box-shadow: 0 0 10px var(--success);
-      display: inline-block;
+    .status {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      line-height: 1.45;
+    }
+    
+    .proxy-auth-info {
+      display: inline-flex;
+      flex-direction: column;
+      gap: 2px;
+      margin-left: 8px;
+      min-width: 230px;
+      line-height: 1.35;
+    }
+    
+    .proxy-auth-info span {
+      white-space: nowrap;
+    }
+    
+    .proxy-auth-user strong {
+      color: #34d399;
+    }
+    
+    .proxy-auth-pass strong {
+      color: #fbbf24;
     }
 
     .btn-group {
@@ -3260,9 +3283,13 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const proxyAuthInfo = state.proxy_auth_enabled
-    ? ` | <span style="white-space:nowrap;">● 代理用户名：<strong class="mono" style="color:#34d399;">${esc(state.proxy_username || "未配置")}</strong></span>
-        <span style="white-space:nowrap; margin-left:12px;">● 代理密码：<strong class="mono" style="color:#fbbf24;">${esc(state.proxy_password || "未配置")}</strong></span>`
-    : ` | <span style="white-space:nowrap; color:#fb7185;">● 代理认证：未开启</span>`;
+  ? `<span class="proxy-auth-info">
+       <span class="proxy-auth-user">● 代理用户名：<strong class="mono">${esc(state.proxy_username || "未配置")}</strong></span>
+       <span class="proxy-auth-pass">● 代理密码：<strong class="mono">${esc(state.proxy_password || "未配置")}</strong></span>
+     </span>`
+  : `<span class="proxy-auth-info">
+       <span style="color:#fb7185;">● 代理认证：未开启</span>
+     </span>`;
 
   $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${proxyAuthInfo}`;
   
