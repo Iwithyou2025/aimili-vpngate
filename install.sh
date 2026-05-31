@@ -49,6 +49,67 @@ apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc pyt
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
+ENV_FILE="/etc/default/aimilivpn"
+generate_proxy_username() {
+python3 - <<'PY'
+import random
+import string
+
+chars = string.ascii_letters + string.digits
+suffix = ''.join(random.choices(chars, k=12))
+print("aimili_" + suffix)
+PY
+}
+
+generate_proxy_password() {
+python3 - <<'PY'
+import random
+import string
+
+chars = string.ascii_letters + string.digits
+while True:
+    pwd = ''.join(random.choices(chars, k=24))
+    if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd):
+        print(pwd)
+        break
+PY
+}
+
+ensure_env_var_nonempty() {
+    local key="$1"
+    local value="$2"
+
+    mkdir -p "$(dirname "$ENV_FILE")"
+    touch "$ENV_FILE"
+
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        local current
+        current="$(grep "^${key}=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | sed 's/^"//; s/"$//')"
+
+        if [ -z "$current" ]; then
+            sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+        fi
+    else
+        echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+}
+
+ensure_proxy_auth_env() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE" || true
+
+    # 如果用户已经手动配置了 PROXY_AUTH_ENABLED，就尊重用户配置
+    # 如果没有配置，默认开启认证，避免公网开放代理
+    if ! grep -q "^PROXY_AUTH_ENABLED=" "$ENV_FILE"; then
+        echo "PROXY_AUTH_ENABLED=1" >> "$ENV_FILE"
+    fi
+
+    ensure_env_var_nonempty "PROXY_USERNAME" "$(generate_proxy_username)"
+    ensure_env_var_nonempty "PROXY_PASSWORD" "$(generate_proxy_password)"
+
+    chmod 600 "$ENV_FILE" || true
+}
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
@@ -85,6 +146,10 @@ else
 fi
 
 # 5. Configure Systemd Service (direct python3 run)
+echo -e "\n${YELLOW}正在初始化代理认证配置...${PLAIN}"
+ensure_proxy_auth_env
+echo -e "${GREEN} -> 代理认证配置已准备完成: ${ENV_FILE}${PLAIN}"
+
 echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
 echo -e "  -> 正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
 cat > /lib/systemd/system/aimilivpn.service <<EOF
@@ -152,6 +217,37 @@ def load_ui_cfg():
             pass
     return cfg
 
+def load_proxy_auth_cfg():
+    path = "/etc/default/aimilivpn"
+    cfg = {
+        "enabled": "0",
+        "username": "",
+        "password": "",
+    }
+
+    if not os.path.exists(path):
+        return cfg
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+
+                if key == "PROXY_AUTH_ENABLED":
+                    cfg["enabled"] = value
+                elif key == "PROXY_USERNAME":
+                    cfg["username"] = value
+                elif key == "PROXY_PASSWORD":
+                    cfg["password"] = value
+    except Exception:
+        pass
+
+    return cfg
 def save_ui_cfg(cfg):
     import json
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
@@ -353,6 +449,21 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
+
+    proxy_auth = load_proxy_auth_cfg()
+    proxy_auth_enabled = proxy_auth.get("enabled") in ("1", "true", "yes", "on")
+    proxy_user = proxy_auth.get("username", "")
+    proxy_pwd = proxy_auth.get("password", "")
+
+    if proxy_auth_enabled:
+        masked_proxy_pwd = proxy_pwd if len(proxy_pwd) <= 4 else proxy_pwd[:3] + "********" + proxy_pwd[-2:]
+        print_line(format_line("代理认证状态", f"{green}[已开启]{reset}"))
+        print_line(format_line("代理用户名", proxy_user or "未配置"))
+        print_line(format_line("代理密码", masked_proxy_pwd or "未配置"))
+    else:
+        print_line(format_line("代理认证状态", f"{red}[未开启]{reset}"))
+
+
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -953,7 +1064,9 @@ if [ -f "$AUTH_FILE" ]; then
     PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
     UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
 fi
-
+PROXY_AUTH_ENABLED_VAL="$(grep '^PROXY_AUTH_ENABLED=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || echo "0")"
+PROXY_USERNAME_VAL="$(grep '^PROXY_USERNAME=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || echo "")"
+PROXY_PASSWORD_VAL="$(grep '^PROXY_PASSWORD=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || echo "")"
 # Get VPS public IP
 echo -e "正在获取 VPS 公网 IP..."
 PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 icanhazip.com || echo "您的服务器公网IP")
@@ -966,6 +1079,15 @@ echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
+
+
+if [ "$PROXY_AUTH_ENABLED_VAL" = "1" ]; then
+    echo -e " * 代理认证状态: ${GREEN}已开启${PLAIN}"
+    echo -e " * 代理用户名: ${YELLOW}${PROXY_USERNAME_VAL}${PLAIN}"
+    echo -e " * 代理密码: ${YELLOW}${PROXY_PASSWORD_VAL}${PLAIN}"
+else
+    echo -e " * 代理认证状态: ${RED}未开启${PLAIN}"
+fi
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"

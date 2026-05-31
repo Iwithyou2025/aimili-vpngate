@@ -62,6 +62,15 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
+PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
@@ -269,6 +278,28 @@ def parse_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
+def get_internal_curl_proxy_args(scheme: str = "socks5h", host: str = "127.0.0.1") -> list[str]:
+    args = [
+        "-x",
+        f"{scheme}://{host}:{LOCAL_PROXY_PORT}",
+    ]
+
+    if PROXY_AUTH_ENABLED and PROXY_USERNAME and PROXY_PASSWORD:
+        args.extend([
+            "--proxy-user",
+            f"{PROXY_USERNAME}:{PROXY_PASSWORD}",
+        ])
+
+    return args
+
+
+def get_proxy_authorization_header() -> str:
+    if not (PROXY_AUTH_ENABLED and PROXY_USERNAME and PROXY_PASSWORD):
+        return ""
+
+    raw = f"{PROXY_USERNAME}:{PROXY_PASSWORD}".encode("utf-8")
+    token = base64.b64encode(raw).decode("ascii")
+    return f"Proxy-Authorization: Basic {token}\r\n"
 
 def parse_float(value: Any) -> float:
     try:
@@ -1231,11 +1262,10 @@ def parse_ippure_quality(raw: dict[str, Any]) -> dict[str, Any]:
 def fetch_ippure_quality() -> dict[str, Any]:
     cmd = [
         "curl", "-4", "-s",
-        "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
+        *get_internal_curl_proxy_args("socks5h", "127.0.0.1"),
         IPPURE_API_URL,
         "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
     ]
-
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3)
     if res.returncode != 0:
         raise RuntimeError(f"IPPure 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}")
@@ -3590,43 +3620,62 @@ def check_proxy_health() -> dict[str, Any]:
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
-    cmd = [
-        "curl", "-4", "-s",
-        "-w", "\n%{time_total} %{http_code}",
-        "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
-        "http://ip.sb",
-        "--max-time", "5"
-    ]
+    def run_proxy_ip_check(url: str, timeout_seconds: int = 6) -> dict[str, Any] | None:
+        cmd = [
+            "curl", "-4", "-sS",
+            "-w", "\n%{time_total} %{http_code}",
+            *get_internal_curl_proxy_args("socks5h", "127.0.0.1"),
+            url,
+            "--max-time", str(timeout_seconds),
+        ]
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds + 2)
+
+        if res.returncode != 0:
+            return None
+
+        lines = res.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return None
+
+        ip = lines[0].strip()
+        time_info = lines[-1].strip().split()
+
+        if len(time_info) != 2:
+            return None
+
+        total_time_str, http_code = time_info
+
+        if http_code != "200" or not ip:
+            return None
+
+        latency_ms = int(float(total_time_str) * 1000)
+        return {
+            "ok": True,
+            "ip": ip,
+            "latency_ms": latency_ms,
+        }
+
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-        if res.returncode == 0:
-            lines = res.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                ip = lines[0].strip()
-                time_info = lines[1].strip().split()
-                if len(time_info) == 2:
-                    total_time_str, http_code = time_info
-                    if http_code == "200" and ip:
-                        latency_ms = int(float(total_time_str) * 1000)
-                        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-        
-        # 如果 ip.sb 失败，使用备用地址 http://api.ipify.org
-        cmd[7] = "http://api.ipify.org"
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-        if res.returncode == 0:
-            lines = res.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                ip = lines[0].strip()
-                time_info = lines[1].strip().split()
-                if len(time_info) == 2:
-                    total_time_str, http_code = time_info
-                    if http_code == "200" and ip:
-                        latency_ms = int(float(total_time_str) * 1000)
-                        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-                        
-        return {"ok": False, "error": f"出口连接测试失败 (curl 返回码: {res.returncode}, stderr: {res.stderr.strip()})"}
+        for url in (
+                "http://ip.sb",
+                "http://api.ipify.org",
+                "https://ifconfig.me/ip",
+        ):
+            result = run_proxy_ip_check(url, 6)
+            if result:
+                return result
+
+        return {
+            "ok": False,
+            "error": "出口连接测试失败：所有 IP 检测接口均不可用"
+        }
     except Exception as e:
-        return {"ok": False, "error": f"出口连接测试异常: {e}"}
+        return {
+            "ok": False,
+            "error": f"出口连接测试异常: {e}"
+        }
+
 
 def background_proxy_checker() -> None:
     time.sleep(2)

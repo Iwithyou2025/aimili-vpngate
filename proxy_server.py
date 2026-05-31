@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
+import base64
+import hmac
+import os
 import select
 import socket
 import threading
@@ -12,6 +16,121 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on"
+    }
+
+
+PROXY_AUTH_ENABLED = env_flag("PROXY_AUTH_ENABLED", "0")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
+
+def proxy_auth_ready() -> bool:
+    return bool(PROXY_USERNAME and PROXY_PASSWORD)
+
+
+def proxy_auth_match(username: str, password: str) -> bool:
+    if not proxy_auth_ready():
+        return False
+
+    return hmac.compare_digest(username, PROXY_USERNAME) and hmac.compare_digest(password, PROXY_PASSWORD)
+
+
+def parse_basic_proxy_auth(value: str) -> tuple[str, str] | None:
+    value = value.strip()
+
+    if not value.lower().startswith("basic "):
+        return None
+
+    token = value[6:].strip()
+
+    try:
+        raw = base64.b64decode(token).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    username, sep, password = raw.partition(":")
+    if not sep:
+        return None
+
+    return username, password
+
+
+def http_proxy_auth_ok(lines: list[str]) -> bool:
+    if not PROXY_AUTH_ENABLED:
+        return True
+
+    for line in lines[1:]:
+        if not line.lower().startswith("proxy-authorization:"):
+            continue
+
+        value = line.split(":", 1)[1].strip()
+        parsed = parse_basic_proxy_auth(value)
+        if not parsed:
+            return False
+
+        username, password = parsed
+        return proxy_auth_match(username, password)
+
+    return False
+
+
+def send_http_auth_required(client: socket.socket) -> None:
+    client.sendall(
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+        b"Proxy-Authenticate: Basic realm=\"AimiliVPN Proxy\"\r\n"
+        b"Content-Length: 0\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+
+
+def socks5_auth(client: socket.socket, methods: bytes) -> bool:
+    if not PROXY_AUTH_ENABLED:
+        if 0x00 not in methods:
+            client.sendall(b"\x05\xff")
+            return False
+
+        client.sendall(b"\x05\x00")
+        return True
+
+    # 认证开启后，只接受 username/password 认证方式
+    if 0x02 not in methods:
+        client.sendall(b"\x05\xff")
+        return False
+
+    client.sendall(b"\x05\x02")
+
+    try:
+        auth_version = recv_exact(client, 1)[0]
+        if auth_version != 1:
+            client.sendall(b"\x01\x01")
+            return False
+
+        username_len = recv_exact(client, 1)[0]
+        username = recv_exact(client, username_len).decode("utf-8", errors="replace")
+
+        password_len = recv_exact(client, 1)[0]
+        password = recv_exact(client, password_len).decode("utf-8", errors="replace")
+
+        if proxy_auth_match(username, password):
+            client.sendall(b"\x01\x00")
+            return True
+
+        client.sendall(b"\x01\x01")
+        return False
+    except Exception:
+        try:
+            client.sendall(b"\x01\x01")
+        except OSError:
+            pass
+        return False
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = b""
@@ -155,9 +274,12 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
-        recv_exact(client, methods_count)
-        client.sendall(b"\x05\x00")
+        methods = recv_exact(client, methods_count)
+
+        if not socks5_auth(client, methods):
+            return
         version, command, _, address_type = recv_exact(client, 4)
+
         if version != 5 or command != 1:
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
@@ -202,6 +324,10 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         head, rest = header.split(b"\r\n\r\n", 1)
         lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
         method, target, version = lines[0].split(" ", 2)
+
+        if not http_proxy_auth_ok(lines):
+            send_http_auth_required(client)
+            return
         if method.upper() == "CONNECT":
             host, _, port_text = target.partition(":")
             port = parse_int(port_text) or 443
@@ -218,7 +344,15 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             return
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:"))]
+        headers = [
+            line
+            for line in lines[1:]
+            if not line.lower().startswith((
+                "proxy-connection:",
+                "connection:",
+                "proxy-authorization:",
+            ))
+        ]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
         upstream = create_connection((parsed.hostname, port), timeout=20)
         upstream.sendall(request.encode("iso-8859-1") + rest)
@@ -253,7 +387,14 @@ def start_proxy_server(host: str, port: int) -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
+        if PROXY_AUTH_ENABLED and not proxy_auth_ready():
+            print(
+                "[WARN] PROXY_AUTH_ENABLED=1, but PROXY_USERNAME or PROXY_PASSWORD is empty. "
+                "All proxy requests will be rejected.",
+                flush=True
+            )
+        auth_status = "auth enabled" if PROXY_AUTH_ENABLED else "no auth"
+        print(f"HTTP/SOCKS5 proxy listening on {host}:{port} ({auth_status})", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
         return
