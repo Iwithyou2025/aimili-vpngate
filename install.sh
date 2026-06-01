@@ -1057,6 +1057,33 @@ with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
 fi
 
 # 8. Start service
+# 8. Start service
+
+# 优化网络参数：rp_filter loose 模式，避免策略路由 / tun0 回包被内核丢弃
+echo -e "\n${YELLOW}正在优化网络参数: 配置 rp_filter=2 以支持策略路由...${PLAIN}"
+
+mkdir -p /etc/sysctl.d
+
+cat > /etc/sysctl.d/99-aimilivpn.conf <<EOF
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+
+sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
+
+# 立即应用到当前系统已存在网卡
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+
+if [ -d "/proc/sys/net/ipv4/conf" ]; then
+    for dev_dir in /proc/sys/net/ipv4/conf/*; do
+        dev_name="$(basename "$dev_dir")"
+        sysctl -w "net.ipv4.conf.${dev_name}.rp_filter=2" >/dev/null 2>&1 || true
+    done
+fi
+
+echo -e "${GREEN} -> rp_filter 已设置为 loose 模式。${PLAIN}"
+
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 systemctl restart aimilivpn.service || true
 

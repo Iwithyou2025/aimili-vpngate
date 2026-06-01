@@ -1006,8 +1006,30 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         process = None
     return ok, message, process
 
+def set_rp_filter_loose(interface: str = "tun0") -> None:
+    """
+    设置 rp_filter=2 loose 模式。
+    在策略路由 + tun0 场景下，避免严格反向路径过滤导致回包被内核丢弃。
+    """
+    targets = ["all", "default"]
+
+    if interface:
+        targets.append(interface)
+
+    for target in targets:
+        try:
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv4.conf.{target}.rp_filter=2"],
+                capture_output=True,
+                timeout=2,
+            )
+        except Exception:
+            pass
+
 
 def setup_policy_routing(interface: str = "tun0") -> None:
+    set_rp_filter_loose(interface)
+
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
     except Exception:
@@ -1016,19 +1038,28 @@ def setup_policy_routing(interface: str = "tun0") -> None:
         subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
     except Exception:
         pass
-    
+
     success = False
     for attempt in range(1, 4):
         try:
+            set_rp_filter_loose(interface)
+
             subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
-            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
+
+            set_rp_filter_loose(interface)
+
+            print(
+                f"[policy_routing] Enabled policy routing for interface {interface} "
+                f"(attempt {attempt} success, rp_filter=2)",
+                flush=True,
+            )
             success = True
             break
         except Exception as e:
             print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
             time.sleep(1)
-            
+
     if not success:
         print("[policy_routing] Failed to enable policy routing after 3 attempts", flush=True)
 
