@@ -104,14 +104,42 @@ ensure_proxy_auth_env() {
     if ! grep -q "^PROXY_AUTH_ENABLED=" "$ENV_FILE"; then
         echo "PROXY_AUTH_ENABLED=1" >> "$ENV_FILE"
     fi
+
     if ! grep -q "^TRUST_PROXY_HEADERS=" "$ENV_FILE"; then
         echo "TRUST_PROXY_HEADERS=1" >> "$ENV_FILE"
     fi
+
+    # 7928 落地代理默认监听公网地址。
+    # 关键：如果旧配置是 127.0.0.1，也自动迁移到 0.0.0.0。
+    if grep -q "^LOCAL_PROXY_HOST=" "$ENV_FILE"; then
+        current_host="$(grep "^LOCAL_PROXY_HOST=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -d "'\"")"
+
+        if [ -z "$current_host" ] || [ "$current_host" = "127.0.0.1" ] || [ "$current_host" = "localhost" ]; then
+            sed -i 's|^LOCAL_PROXY_HOST=.*|LOCAL_PROXY_HOST=0.0.0.0|' "$ENV_FILE"
+        fi
+    else
+        echo "LOCAL_PROXY_HOST=0.0.0.0" >> "$ENV_FILE"
+    fi
+
+    # 7928 落地代理端口，默认保持 7928。
+    # 如果用户已经自定义了 LOCAL_PROXY_PORT，则不覆盖。
+    if grep -q "^LOCAL_PROXY_PORT=" "$ENV_FILE"; then
+        current_port="$(grep "^LOCAL_PROXY_PORT=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | tr -d "'\"")"
+
+        if [ -z "$current_port" ]; then
+            sed -i 's|^LOCAL_PROXY_PORT=.*|LOCAL_PROXY_PORT=7928|' "$ENV_FILE"
+        fi
+    else
+        echo "LOCAL_PROXY_PORT=7928" >> "$ENV_FILE"
+    fi
+
     ensure_env_var_nonempty "PROXY_USERNAME" "$(generate_proxy_username)"
     ensure_env_var_nonempty "PROXY_PASSWORD" "$(generate_proxy_password)"
 
     chmod 600 "$ENV_FILE" || true
 }
+
+
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"

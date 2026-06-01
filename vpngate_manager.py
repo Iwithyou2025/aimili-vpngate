@@ -60,7 +60,7 @@ OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS"
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
-LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
+LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() in {
     "1",
@@ -3600,7 +3600,9 @@ function render(){
        <span style="color:#fb7185;">● 代理认证：未开启</span>
      </span>`;
 
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${proxyAuthInfo}`;
+const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
+
+$("status").innerHTML=`<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${proxyAuthInfo}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
