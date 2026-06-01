@@ -104,7 +104,9 @@ ensure_proxy_auth_env() {
     if ! grep -q "^PROXY_AUTH_ENABLED=" "$ENV_FILE"; then
         echo "PROXY_AUTH_ENABLED=1" >> "$ENV_FILE"
     fi
-
+    if ! grep -q "^TRUST_PROXY_HEADERS=" "$ENV_FILE"; then
+        echo "TRUST_PROXY_HEADERS=1" >> "$ENV_FILE"
+    fi
     ensure_env_var_nonempty "PROXY_USERNAME" "$(generate_proxy_username)"
     ensure_env_var_nonempty "PROXY_PASSWORD" "$(generate_proxy_password)"
 
@@ -350,6 +352,32 @@ def check_port_listening(port):
         return True
     except Exception:
         return False
+def check_bind_port_available(host, port):
+    bind_host = str(host or "0.0.0.0").strip() or "0.0.0.0"
+
+    if bind_host == "::":
+        bind_host = "0.0.0.0"
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_host, port))
+        sock.close()
+        return True, ""
+    except OSError as exc:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if exc.errno == 98:
+            return False, f"端口 {port} 已被占用，请换一个端口，或先停止占用该端口的服务"
+        if exc.errno == 13:
+            return False, f"端口 {port} 权限不足，请换用 1024 以上端口，或确认服务以 root 权限运行"
+
+        return False, f"端口 {port} 不可用：{exc}"
 
 def get_service_pid(service_name="aimilivpn.service"):
     try:
@@ -658,6 +686,15 @@ def configure_port():
         if val:
             port = int(val)
             if 1 <= port <= 65535:
+                old_port = int(cfg.get('port', 8787) or 8787)
+
+                if port != old_port:
+                    ok, reason = check_bind_port_available(cfg.get('host', '0.0.0.0'), port)
+                    if not ok:
+                        print(f"错误: {reason}")
+                        time.sleep(3)
+                        return
+
                 cfg['port'] = port
                 save_ui_cfg(cfg)
                 print(f"管理端口已更新为: {port}")
@@ -958,6 +995,11 @@ while True:
                 break
             fi
             if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+                if ss -lnt | awk '{print $4}' | grep -Eq "(:|\])${input_port}$"; then
+                    echo -e "${RED}错误: 端口 ${input_port} 已被占用，请换一个端口。${PLAIN}"
+                    continue
+                fi
+
                 UI_PORT=$input_port
                 break
             else

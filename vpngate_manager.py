@@ -75,6 +75,23 @@ UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
 
+LOGIN_FAIL_MAX_ATTEMPTS = max(
+    1,
+    int(os.environ.get("LOGIN_FAIL_MAX_ATTEMPTS", "5"))
+)
+
+LOGIN_FAIL_WINDOW_SECONDS = max(
+    60,
+    int(os.environ.get("LOGIN_FAIL_WINDOW_SECONDS", str(10 * 60)))
+)
+
+LOGIN_LOCK_SECONDS = max(
+    60,
+    int(os.environ.get("LOGIN_LOCK_SECONDS", str(10 * 60)))
+)
+
+TRUST_PROXY_HEADERS = env_flag("TRUST_PROXY_HEADERS", "0")
+
 # IP 质量检测策略：自动切换时启用；手动连接仍允许临时测试
 QUALITY_CHECK_ENABLED = env_flag("QUALITY_CHECK_ENABLED", "1")
 IPPURE_API_URL = os.environ.get("IPPURE_API_URL", "https://my.ippure.com/v1/info")
@@ -84,6 +101,16 @@ QUALITY_REQUIRE_RESIDENTIAL = env_flag("QUALITY_REQUIRE_RESIDENTIAL", "1")
 QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
 QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
 QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
+
+PROXY_HEALTH_CONFIRM_TIMES = max(
+    1,
+    int(os.environ.get("PROXY_HEALTH_CONFIRM_TIMES", "2"))
+)
+
+PROXY_HEALTH_CONFIRM_DELAY_SECONDS = max(
+    0,
+    int(os.environ.get("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", "2"))
+)
 
 # 自动切换策略：默认只在当前活动节点的同一国家内切换
 AUTO_SWITCH_SAME_COUNTRY_ONLY = env_flag("AUTO_SWITCH_SAME_COUNTRY_ONLY", "1")
@@ -101,6 +128,7 @@ lock = threading.RLock()
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
+login_failures: dict[str, dict[str, float | int]] = {}
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -120,6 +148,20 @@ def write_json(path: Path, data: Any) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+SENSITIVE_STATE_KEYS = {
+    "proxy_username",
+    "proxy_password",
+}
+
+
+def sanitize_state_for_disk(state: dict[str, Any]) -> dict[str, Any]:
+    clean = dict(state)
+
+    for key in SENSITIVE_STATE_KEYS:
+        clean.pop(key, None)
+
+    return clean
 
 def read_json(path: Path, default: Any) -> Any:
     with lock:
@@ -196,6 +238,122 @@ def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
+
+def get_request_ip(handler: BaseHTTPRequestHandler) -> str:
+    ip = ""
+
+    if TRUST_PROXY_HEADERS:
+        cf_ip = handler.headers.get("CF-Connecting-IP", "").strip()
+        if cf_ip:
+            return cf_ip
+
+        real_ip = handler.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
+
+        forwarded_for = handler.headers.get("X-Forwarded-For", "").strip()
+        if forwarded_for:
+            return forwarded_for.split(",", 1)[0].strip()
+
+    try:
+        ip = str(handler.client_address[0])
+    except Exception:
+        ip = "unknown"
+
+    return ip or "unknown"
+
+
+def cleanup_login_failures(now: float | None = None) -> None:
+    now = now or time.time()
+
+    expired_keys = []
+    for key, info in login_failures.items():
+        locked_until = float(info.get("locked_until", 0) or 0)
+        first_failed_at = float(info.get("first_failed_at", 0) or 0)
+
+        if locked_until > now:
+            continue
+
+        if first_failed_at and now - first_failed_at > LOGIN_FAIL_WINDOW_SECONDS:
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        login_failures.pop(key, None)
+
+
+def get_login_lock_status(client_ip: str) -> tuple[bool, int]:
+    now = time.time()
+
+    with lock:
+        cleanup_login_failures(now)
+        info = login_failures.get(client_ip) or {}
+        locked_until = float(info.get("locked_until", 0) or 0)
+
+        if locked_until > now:
+            return True, int(locked_until - now)
+
+    return False, 0
+
+
+def register_login_failure(client_ip: str) -> dict[str, Any]:
+    now = time.time()
+
+    with lock:
+        cleanup_login_failures(now)
+
+        info = login_failures.get(client_ip)
+        if not info:
+            info = {
+                "count": 0,
+                "first_failed_at": now,
+                "locked_until": 0,
+            }
+
+        first_failed_at = float(info.get("first_failed_at", now) or now)
+
+        if now - first_failed_at > LOGIN_FAIL_WINDOW_SECONDS:
+            info = {
+                "count": 0,
+                "first_failed_at": now,
+                "locked_until": 0,
+            }
+
+        count = int(info.get("count", 0) or 0) + 1
+        info["count"] = count
+
+        locked = False
+        remaining_seconds = 0
+
+        if count >= LOGIN_FAIL_MAX_ATTEMPTS:
+            locked = True
+            info["locked_until"] = now + LOGIN_LOCK_SECONDS
+            remaining_seconds = LOGIN_LOCK_SECONDS
+
+        login_failures[client_ip] = info
+
+        return {
+            "count": count,
+            "max_attempts": LOGIN_FAIL_MAX_ATTEMPTS,
+            "locked": locked,
+            "remaining_seconds": remaining_seconds,
+        }
+
+
+def clear_login_failure(client_ip: str) -> None:
+    with lock:
+        login_failures.pop(client_ip, None)
+
+
+def format_seconds_zh(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes = seconds // 60
+    remain = seconds % 60
+
+    if minutes > 0:
+        return f"{minutes}分{remain}秒"
+
+    return f"{remain}秒"
+
 def cleanup_old_logs(logs_dir: Path) -> None:
     try:
         now = time.time()
@@ -238,11 +396,15 @@ def log_to_json(level: str, module: str, message: str) -> None:
 def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
-    write_json(STATE_FILE, state)
+    write_json(STATE_FILE, sanitize_state_for_disk(state))
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
+
+    # 防止历史版本已经写入 state.json 的代理账号密码被继续带出来
+    for key in SENSITIVE_STATE_KEYS:
+        state.pop(key, None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
@@ -281,6 +443,35 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+def check_ui_port_available(host: str, port: int) -> tuple[bool, str]:
+    bind_host = str(host or "0.0.0.0").strip() or "0.0.0.0"
+
+    # 当前管理后台使用 ThreadingHTTPServer，默认 IPv4 监听
+    family = socket.AF_INET
+
+    if bind_host == "::":
+        bind_host = "0.0.0.0"
+
+    sock = None
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_host, port))
+        sock.close()
+        return True, ""
+    except OSError as exc:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if exc.errno == 98:
+            return False, f"端口 {port} 已被占用，请换一个端口，或先停止占用该端口的服务"
+        if exc.errno == 13:
+            return False, f"端口 {port} 权限不足，请换用 1024 以上端口，或确认服务以 root 权限运行"
+
+        return False, f"端口 {port} 不可用：{exc}"
 
 def get_internal_curl_proxy_args(scheme: str = "socks5h", host: str = "127.0.0.1") -> list[str]:
     args = [
@@ -2033,6 +2224,28 @@ INDEX_HTML = r"""<!doctype html>
     
     .proxy-auth-info span {
       white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    
+    .copy-auth-btn {
+      height: 20px;
+      padding: 0 7px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      background: rgba(99, 102, 241, 0.14);
+      color: #a5b4fc;
+      cursor: pointer;
+      box-shadow: none;
+    }
+    
+    .copy-auth-btn:hover {
+      background: rgba(99, 102, 241, 0.25);
+      border-color: rgba(99, 102, 241, 0.55);
+      transform: none;
     }
     
     .proxy-auth-user strong {
@@ -3033,7 +3246,12 @@ INDEX_HTML = r"""<!doctype html>
         <label class="form-label" for="settings_proxy_password">代理密码</label>
         <input type="text" id="settings_proxy_password" class="input-field" autocomplete="off">
       </div>
-
+      
+      <div style="display:flex; gap:10px; margin-top: 4px;">
+      <button type="button" id="settings_proxy_random_btn" onclick="generateProxyCredentials()" style="flex:1; height:40px; border-radius:8px; border:1px solid rgba(99,102,241,0.35); background:rgba(99,102,241,0.12); color:#a5b4fc; font-weight:600; cursor:pointer;">
+        随机生成
+      </button>
+      
       <button type="button" id="settings_proxy_save_btn" class="btn-primary" onclick="saveProxyAuthSettings()" style="width:100%; margin-top: 4px;">
         保存配置
       </button>
@@ -3051,6 +3269,57 @@ let currentPageNodes = [];
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  try {
+    document.execCommand("copy");
+    return true;
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+async function copyProxyField(field, btn) {
+  const value = field === "username"
+    ? state.proxy_username
+    : state.proxy_password;
+
+  if (!value) {
+    return;
+  }
+
+  const oldText = btn.textContent;
+
+  try {
+    await copyTextToClipboard(value);
+    btn.textContent = "已复制";
+    btn.style.color = "#6ee7b7";
+  } catch (err) {
+    btn.textContent = "失败";
+    btn.style.color = "#fb7185";
+  }
+
+  setTimeout(() => {
+    btn.textContent = oldText;
+    btn.style.color = "#a5b4fc";
+  }, 1200);
+}
+
+
 const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
@@ -3279,8 +3548,14 @@ function render(){
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const proxyAuthInfo = state.proxy_auth_enabled
   ? `<span class="proxy-auth-info">
-       <span class="proxy-auth-user">● 代理用户名：<strong class="mono">${esc(state.proxy_username || "未配置")}</strong></span>
-       <span class="proxy-auth-pass">● 代理密码：<strong class="mono">${esc(state.proxy_password || "未配置")}</strong></span>
+       <span class="proxy-auth-user">
+         ● 代理用户名：<strong class="mono">${esc(state.proxy_username || "未配置")}</strong>
+         <button type="button" class="copy-auth-btn" onclick="copyProxyField('username', this)">复制</button>
+       </span>
+       <span class="proxy-auth-pass">
+         ● 代理密码：<strong class="mono">${esc(state.proxy_password || "未配置")}</strong>
+         <button type="button" class="copy-auth-btn" onclick="copyProxyField('password', this)">复制</button>
+       </span>
      </span>`
   : `<span class="proxy-auth-info">
        <span style="color:#fb7185;">● 代理认证：未开启</span>
@@ -3784,6 +4059,64 @@ async function saveSettings(e) {
     submitBtn.textContent = "保存修改";
   }
 }
+function randomChars(length, chars) {
+  const result = [];
+  const cryptoObj = window.crypto || window.msCrypto;
+
+  if (cryptoObj && cryptoObj.getRandomValues) {
+    const values = new Uint32Array(length);
+    cryptoObj.getRandomValues(values);
+
+    for (let i = 0; i < length; i++) {
+      result.push(chars[values[i] % chars.length]);
+    }
+  } else {
+    for (let i = 0; i < length; i++) {
+      result.push(chars[Math.floor(Math.random() * chars.length)]);
+    }
+  }
+
+  return result.join("");
+}
+
+function generateStrongProxyPassword(length = 24) {
+  const lower = "abcdefghijklmnopqrstuvwxyz";
+  const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const digits = "0123456789";
+  const all = lower + upper + digits;
+
+  while (true) {
+    const password = randomChars(length, all);
+
+    if (
+      /[a-z]/.test(password) &&
+      /[A-Z]/.test(password) &&
+      /[0-9]/.test(password)
+    ) {
+      return password;
+    }
+  }
+}
+
+function generateProxyCredentials() {
+  const username = "aimili_" + randomChars(
+    12,
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  );
+
+  const password = generateStrongProxyPassword(24);
+
+  $("settings_proxy_username").value = username;
+  $("settings_proxy_password").value = password;
+
+  const msg = $("settings_proxy_msg");
+  if (msg) {
+    msg.textContent = "已随机生成代理账号密码，点击“保存配置”后实时生效";
+    msg.style.color = "var(--success)";
+    msg.style.display = "block";
+  }
+}
+
 async function saveProxyAuthSettings() {
   const btn = $("settings_proxy_save_btn");
   const msg = $("settings_proxy_msg");
@@ -3959,9 +4292,38 @@ def check_proxy_health() -> dict[str, Any]:
             "error": f"出口连接测试异常: {e}"
         }
 
+def confirm_proxy_health_failure() -> tuple[bool, dict[str, Any]]:
+    """
+    连续检测代理健康状态。
+    返回:
+      True  = 确认故障，需要切换
+      False = 未确认故障，不切换
+    """
+    last_result: dict[str, Any] = {
+        "ok": False,
+        "error": "未知错误",
+    }
+
+    for index in range(PROXY_HEALTH_CONFIRM_TIMES):
+        result = check_proxy_health()
+        last_result = result
+
+        if result.get("ok"):
+            return False, result
+
+        print(
+            f"[代理检测] 第 {index + 1}/{PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {result.get('error', '未知错误')}",
+            flush=True,
+        )
+
+        if index < PROXY_HEALTH_CONFIRM_TIMES - 1 and PROXY_HEALTH_CONFIRM_DELAY_SECONDS > 0:
+            time.sleep(PROXY_HEALTH_CONFIRM_DELAY_SECONDS)
+
+    return True, last_result
 
 def background_proxy_checker() -> None:
     time.sleep(2)
+
     while True:
         try:
             if is_connecting:
@@ -3969,40 +4331,113 @@ def background_proxy_checker() -> None:
                 continue
 
             res = check_proxy_health()
+
             if res["ok"]:
                 set_state(
                     proxy_ok=True,
                     proxy_ip=res["ip"],
                     proxy_latency_ms=res["latency_ms"],
-                    proxy_error=""
+                    proxy_error="",
+                    proxy_fail_count=0,
+                    proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                 )
-                log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
+
+                log_to_json(
+                    "INFO",
+                    "Proxy",
+                    f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms",
+                )
+
             else:
-                error_msg = res.get("error", "未知错误")
-                if active_openvpn_node_id:
-                    print(f"[警告] 7928 端口本地代理当前不可用！原因: {error_msg}", flush=True)
-                    log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
+                first_error = res.get("error", "未知错误")
+
+                print(
+                    f"[警告] 7928 端口本地代理首次检测不可用，开始连续确认检测: {first_error}",
+                    flush=True,
+                )
+
+                log_to_json(
+                    "WARNING",
+                    "Proxy",
+                    f"代理首次检测不可用，开始连续确认检测: {first_error}",
+                )
+
+                confirmed_failed, final_res = confirm_proxy_health_failure()
+                final_error = final_res.get("error", first_error)
+
+                if not confirmed_failed:
+                    set_state(
+                        proxy_ok=True,
+                        proxy_ip=final_res.get("ip", "-"),
+                        proxy_latency_ms=final_res.get("latency_ms", 0),
+                        proxy_error="",
+                        proxy_fail_count=0,
+                        proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
+                    )
+
+                    print(
+                        "[代理检测] 追加检测已恢复正常，判定为临时抖动，不切换节点",
+                        flush=True,
+                    )
+
+                    log_to_json(
+                        "INFO",
+                        "Proxy",
+                        "追加检测已恢复正常，判定为临时抖动，不切换节点",
+                    )
+
+                    time.sleep(30)
+                    continue
+
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
                     proxy_latency_ms=0,
-                    proxy_error=error_msg
+                    proxy_error=final_error,
+                    proxy_fail_count=PROXY_HEALTH_CONFIRM_TIMES,
+                    proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                 )
 
-                # If we intended to have an active VPN node but proxy failed, trigger auto-switch
-                if active_openvpn_node_id:
-                    with lock:
-                        nodes = read_json(NODES_FILE, [])
-                        active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                        if active_node:
-                            mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
-                            active_node["probe_status"] = "unavailable"
-                            write_json(NODES_FILE, nodes)
-                    
-                    auto_switch_node()
+                if not active_openvpn_node_id:
+                    time.sleep(30)
+                    continue
+
+                print(
+                    f"[代理检测] 连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败，确认故障，开始自动切换节点",
+                    flush=True,
+                )
+
+                log_to_json(
+                    "WARNING",
+                    "Proxy",
+                    f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败，确认故障，开始自动切换节点，最后错误: {final_error}",
+                )
+
+                with lock:
+                    nodes = read_json(NODES_FILE, [])
+                    active_node = next(
+                        (n for n in nodes if n.get("id") == active_openvpn_node_id),
+                        None,
+                    )
+
+                    if active_node:
+                        mark_blacklisted(
+                            active_node,
+                            f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}",
+                        )
+                        active_node["probe_status"] = "unavailable"
+                        active_node["probe_message"] = (
+                            f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                        )
+                        active_node["probed_at"] = time.time()
+                        write_json(NODES_FILE, nodes)
+
+                auto_switch_node()
+
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
+
         time.sleep(30)
 
 def active_node_pinger() -> None:
@@ -4178,19 +4613,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
-        
+
         if effective_path == "/api/login":
             try:
+                client_ip = get_request_ip(self)
+
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 input_pwd = str(payload.get("password") or "")
                 input_uname = str(payload.get("username") or "")
-                
+
+                locked, remaining_seconds = get_login_lock_status(client_ip)
+                if locked:
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": f"登录失败次数过多，请 {format_seconds_zh(remaining_seconds)} 后再试",
+                            "locked": True,
+                            "remaining_seconds": remaining_seconds,
+                        },
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+
                 ui_cfg = load_ui_config()
                 expected_pwd = ui_cfg.get("password", "")
                 expected_uname = ui_cfg.get("username", "admin")
-                
+
                 if expected_pwd and input_pwd == expected_pwd and input_uname == expected_uname:
+                    clear_login_failure(client_ip)
+
                     token = uuid.uuid4().hex
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
@@ -4213,7 +4665,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     self.close_connection = True
                 else:
-                    self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
+                    fail_info = register_login_failure(client_ip)
+
+                    if fail_info["locked"]:
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": f"登录失败次数过多，已锁定 {format_seconds_zh(LOGIN_LOCK_SECONDS)}",
+                                "locked": True,
+                                "remaining_seconds": LOGIN_LOCK_SECONDS,
+                            },
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                        )
+                    else:
+                        remaining_attempts = max(
+                            0,
+                            LOGIN_FAIL_MAX_ATTEMPTS - int(fail_info["count"]),
+                            )
+
+                        self.send_json(
+                            {
+                                "ok": False,
+                                "error": f"用户名或密码不正确，还可尝试 {remaining_attempts} 次",
+                                "locked": False,
+                                "remaining_attempts": remaining_attempts,
+                            },
+                            HTTPStatus.FORBIDDEN,
+                        )
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -4280,11 +4758,7 @@ class Handler(BaseHTTPRequestHandler):
                 write_proxy_auth_env(enabled, username, password)
                 apply_proxy_auth_runtime(enabled, username, password)
 
-                set_state(
-                    proxy_auth_enabled=enabled,
-                    proxy_username=username,
-                    proxy_password=password,
-                )
+                set_state(proxy_auth_enabled=enabled)
 
                 self.send_json({
                     "ok": True,
@@ -4335,7 +4809,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not new_suffix or not re.match(r"^[A-Za-z0-9]+$", new_suffix):
                     self.send_json({"ok": False, "error": "安全后缀仅能由英文字母和数字组成"}, HTTPStatus.BAD_REQUEST)
                     return
-                
+                old_port = parse_int(ui_cfg.get("port")) or UI_PORT
+                old_host = str(ui_cfg.get("host") or UI_HOST or "0.0.0.0")
+
+                # 如果端口发生变化，先检测新端口是否可绑定。
+                # 注意：当前端口本来就被当前进程占用，所以端口没变时不能检测。
+                if new_port_int != old_port:
+                    ok, reason = check_ui_port_available(old_host, new_port_int)
+                    if not ok:
+                        self.send_json({"ok": False, "error": reason}, HTTPStatus.BAD_REQUEST)
+                        return
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 if new_username:
