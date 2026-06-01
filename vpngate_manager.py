@@ -3247,14 +3247,22 @@ INDEX_HTML = r"""<!doctype html>
         <input type="text" id="settings_proxy_password" class="input-field" autocomplete="off">
       </div>
       
-      <div style="display:flex; gap:10px; margin-top: 4px;">
-      <button type="button" id="settings_proxy_random_btn" onclick="generateProxyCredentials()" style="flex:1; height:40px; border-radius:8px; border:1px solid rgba(99,102,241,0.35); background:rgba(99,102,241,0.12); color:#a5b4fc; font-weight:600; cursor:pointer;">
+      <div style="display:flex; gap:10px; margin-top: 4px; align-items:center;">
+      <button type="button"
+        id="settings_proxy_random_btn"
+        onclick="generateProxyCredentials()"
+        style="flex:1; height:40px; min-width:0; border-radius:8px; border:1px solid rgba(99,102,241,0.35); background:rgba(99,102,241,0.12); color:#a5b4fc; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;">
         随机生成
       </button>
-      
-      <button type="button" id="settings_proxy_save_btn" class="btn-primary" onclick="saveProxyAuthSettings()" style="width:100%; margin-top: 4px;">
+    
+      <button type="button"
+        id="settings_proxy_save_btn"
+        class="btn-primary"
+        onclick="saveProxyAuthSettings()"
+        style="flex:2; height:40px; margin-top:0; font-size:13px; white-space:nowrap;">
         保存配置
       </button>
+      </div>
 
       <div id="settings_proxy_msg" style="font-size:13px; margin-top:12px; display:none;"></div>
     </div>
