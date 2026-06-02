@@ -123,8 +123,15 @@ CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
-
+PROJECT_UPDATE_CONFIG_FILE = DATA_DIR / "project_update.json"
+PROJECT_AUTO_UPDATE_INTERVAL_SECONDS = max(
+    30,
+    int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "120"))
+)
 lock = threading.RLock()
+
+project_update_lock = threading.Lock()
+
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
@@ -233,6 +240,169 @@ def load_ui_config() -> dict[str, Any]:
                 pass
                 
         return config
+
+def load_project_update_config() -> dict[str, Any]:
+    cfg = read_json(PROJECT_UPDATE_CONFIG_FILE, {})
+    return {
+        "enabled": cfg.get("enabled", True) is not False,
+        "last_check_at": cfg.get("last_check_at", 0),
+        "last_message": cfg.get("last_message", "尚未检测项目更新"),
+        "last_local_commit": cfg.get("last_local_commit", ""),
+        "last_remote_commit": cfg.get("last_remote_commit", ""),
+    }
+
+
+def save_project_update_config(**kwargs: Any) -> dict[str, Any]:
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    cfg = load_project_update_config()
+    cfg.update(kwargs)
+    write_json(PROJECT_UPDATE_CONFIG_FILE, cfg)
+    return cfg
+
+
+def project_auto_update_enabled() -> bool:
+    return load_project_update_config().get("enabled", True) is not False
+
+
+def run_git_cmd(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def detect_git_upstream_ref() -> str:
+    p = run_git_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        timeout=10,
+    )
+    if p.returncode == 0 and p.stdout.strip():
+        return p.stdout.strip()
+
+    for ref in ("origin/main", "origin/master"):
+        p = run_git_cmd(["git", "rev-parse", "--verify", ref], timeout=10)
+        if p.returncode == 0:
+            return ref
+
+    raise RuntimeError("未找到 origin/main 或 origin/master，无法检测项目更新")
+
+
+def start_project_update_unit(upstream_ref: str) -> None:
+    log_file = DATA_DIR / "project_update.log"
+    lock_file = "/tmp/aimilivpn_project_update.lock"
+
+    shell_script = f"""
+set -e
+exec 9>{shlex.quote(lock_file)}
+flock -n 9 || exit 0
+
+cd {shlex.quote(str(ROOT_DIR))}
+
+echo "[$(date '+%F %T')] 开始自动更新项目，目标版本: {shlex.quote(upstream_ref)}" >> {shlex.quote(str(log_file))}
+
+git fetch --all --prune >> {shlex.quote(str(log_file))} 2>&1
+git reset --hard {shlex.quote(upstream_ref)} >> {shlex.quote(str(log_file))} 2>&1
+find . -type d -name "__pycache__" -exec rm -rf {{}} + >> {shlex.quote(str(log_file))} 2>&1 || true
+
+bash install.sh >> {shlex.quote(str(log_file))} 2>&1
+
+echo "[$(date '+%F %T')] 项目自动更新完成" >> {shlex.quote(str(log_file))}
+"""
+
+    subprocess.Popen(
+        [
+            "systemd-run",
+            "--unit=aimilivpn-project-update",
+            "--collect",
+            "--property",
+            f"WorkingDirectory={str(ROOT_DIR)}",
+            "/bin/bash",
+            "-lc",
+            shell_script,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def check_and_start_project_update() -> dict[str, Any]:
+    if not project_update_lock.acquire(blocking=False):
+        return {"ok": False, "message": "项目更新检测已在运行，跳过本次检测"}
+
+    try:
+        if (ROOT_DIR / ".local_dev").exists():
+            cfg = save_project_update_config(
+                last_check_at=time.time(),
+                last_message="检测到 .local_dev，本地开发模式下跳过项目自动更新",
+            )
+            return {"ok": True, **cfg}
+
+        if not (ROOT_DIR / ".git").exists():
+            cfg = save_project_update_config(
+                last_check_at=time.time(),
+                last_message="当前目录不是 Git 仓库，无法自动更新项目",
+            )
+            return {"ok": False, **cfg}
+
+        fetch = run_git_cmd(["git", "fetch", "--all", "--prune"], timeout=60)
+        if fetch.returncode != 0:
+            msg = fetch.stderr.strip() or fetch.stdout.strip() or "git fetch 失败"
+            cfg = save_project_update_config(
+                last_check_at=time.time(),
+                last_message=f"项目更新检测失败: {msg}",
+            )
+            return {"ok": False, **cfg}
+
+        upstream_ref = detect_git_upstream_ref()
+
+        local_commit = run_git_cmd(["git", "rev-parse", "HEAD"], timeout=10).stdout.strip()
+        remote_commit = run_git_cmd(["git", "rev-parse", upstream_ref], timeout=10).stdout.strip()
+
+        if local_commit == remote_commit:
+            cfg = save_project_update_config(
+                last_check_at=time.time(),
+                last_message="项目已是最新版本",
+                last_local_commit=local_commit,
+                last_remote_commit=remote_commit,
+            )
+            return {"ok": True, "updated": False, **cfg}
+
+        save_project_update_config(
+            last_check_at=time.time(),
+            last_message=f"检测到项目新版本，准备从 {local_commit[:8]} 更新到 {remote_commit[:8]}",
+            last_local_commit=local_commit,
+            last_remote_commit=remote_commit,
+        )
+
+        start_project_update_unit(upstream_ref)
+
+        cfg = save_project_update_config(
+            last_check_at=time.time(),
+            last_message=f"已启动项目自动更新任务: {local_commit[:8]} -> {remote_commit[:8]}",
+            last_local_commit=local_commit,
+            last_remote_commit=remote_commit,
+        )
+
+        return {"ok": True, "updated": True, **cfg}
+
+    finally:
+        project_update_lock.release()
+
+def project_auto_update_loop() -> None:
+    while True:
+        try:
+            if project_auto_update_enabled():
+                check_and_start_project_update()
+        except Exception as exc:
+            save_project_update_config(
+                last_check_at=time.time(),
+                last_message=f"项目自动更新异常: {exc}",
+            )
+
+        time.sleep(PROJECT_AUTO_UPDATE_INTERVAL_SECONDS)
 
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
@@ -2992,6 +3162,63 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
       background: rgba(15, 23, 42, 0.6);
     }
+    .project-auto-update-box {
+      height: 46px;
+      padding: 0 14px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.06);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+    
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: rgba(255,255,255,0.18);
+      border-radius: 999px;
+      transition: 0.25s;
+    }
+    
+    .toggle-slider:before {
+      content: "";
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 3px;
+      top: 3px;
+      background: #fff;
+      border-radius: 50%;
+      transition: 0.25s;
+    }
+    
+    .toggle-switch input:checked + .toggle-slider {
+      background: #22c55e;
+    }
+    
+    .toggle-switch input:checked + .toggle-slider:before {
+      transform: translateX(22px);
+    }
   </style>
 </head>
 <body>
@@ -3791,6 +4018,37 @@ function startConnectionPolling() {
     }
   }, 1000);
 }
+
+async function initProjectAutoUpdateSetting() {
+  try {
+    const r = await fetch("./api/project_auto_update");
+    const d = await r.json();
+
+    const toggle = document.getElementById("project_auto_update_toggle");
+    if (toggle) {
+      toggle.checked = d.enabled !== false;
+    }
+  } catch (e) {}
+}
+
+async function setProjectAutoUpdateEnabled(enabled) {
+  try {
+    await fetch("./api/project_auto_update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled })
+    });
+  } catch (e) {}
+}
+
+const projectAutoUpdateToggle = document.getElementById("project_auto_update_toggle");
+if (projectAutoUpdateToggle) {
+  projectAutoUpdateToggle.addEventListener("change", function () {
+    setProjectAutoUpdateEnabled(this.checked);
+  });
+}
+
+initProjectAutoUpdateSetting();
 
 async function connectNode(id){
   state.is_connecting = true;
@@ -4605,6 +4863,10 @@ class Handler(BaseHTTPRequestHandler):
                 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+
+        elif effective_path == "/api/project_auto_update":
+            self.send_json(load_project_update_config())
+
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_json(NODES_FILE, [])
@@ -4889,6 +5151,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        if effective_path == "/api/project_auto_update":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                enabled = payload.get("enabled", True) is not False
+
+                cfg = save_project_update_config(
+                    enabled=enabled,
+                    last_message="项目自动更新已开启" if enabled else "项目自动更新已关闭",
+                )
+
+                self.send_json({"ok": True, **cfg})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        
         elif effective_path == "/api/refresh_nodes":
             try:
                 threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
@@ -5029,7 +5307,8 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
-    
+    threading.Thread(target=project_auto_update_loop, daemon=True).start()
+
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
     ui_port = int(ui_cfg.get("port", UI_PORT))
