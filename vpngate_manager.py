@@ -3240,7 +3240,6 @@ INDEX_HTML = r"""<!doctype html>
       立即检测补齐
     </button>
     
-    
     <div class="project-auto-update-box">
       <span>项目自动更新</span>
       <label class="toggle-switch">
