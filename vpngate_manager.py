@@ -96,6 +96,29 @@ TRUST_PROXY_HEADERS = env_flag("TRUST_PROXY_HEADERS", "0")
 QUALITY_CHECK_ENABLED = env_flag("QUALITY_CHECK_ENABLED", "1")
 IPPURE_API_URL = os.environ.get("IPPURE_API_URL", "https://my.ippure.com/v1/info")
 QUALITY_HTTP_TIMEOUT_SECONDS = int(os.environ.get("QUALITY_HTTP_TIMEOUT_SECONDS", "12"))
+
+IPAPI_API_URL = os.environ.get("IPAPI_API_URL", "https://api.ipapi.is")
+
+# 是否启用 ipapi.is 补充检测
+QUALITY_CHECK_IPAPI_ENABLED = env_flag("QUALITY_CHECK_IPAPI_ENABLED", "1")
+
+# ipapi.is 请求失败时是否直接判定失败
+# 建议默认 0，避免第三方 API 抽风导致误杀节点
+QUALITY_IPAPI_STRICT = env_flag("QUALITY_IPAPI_STRICT", "0")
+
+# ipapi.is 风险字段拦截开关
+QUALITY_REJECT_IPAPI_BOGON = env_flag("QUALITY_REJECT_IPAPI_BOGON", "1")
+QUALITY_REJECT_IPAPI_CRAWLER = env_flag("QUALITY_REJECT_IPAPI_CRAWLER", "1")
+QUALITY_REJECT_IPAPI_DATACENTER = env_flag("QUALITY_REJECT_IPAPI_DATACENTER", "1")
+QUALITY_REJECT_IPAPI_TOR = env_flag("QUALITY_REJECT_IPAPI_TOR", "1")
+QUALITY_REJECT_IPAPI_PROXY = env_flag("QUALITY_REJECT_IPAPI_PROXY", "1")
+QUALITY_REJECT_IPAPI_VPN = env_flag("QUALITY_REJECT_IPAPI_VPN", "1")
+QUALITY_REJECT_IPAPI_ABUSER = env_flag("QUALITY_REJECT_IPAPI_ABUSER", "1")
+
+# mobile / satellite 不一定代表差，默认先不拦截
+QUALITY_REJECT_IPAPI_MOBILE = env_flag("QUALITY_REJECT_IPAPI_MOBILE", "0")
+QUALITY_REJECT_IPAPI_SATELLITE = env_flag("QUALITY_REJECT_IPAPI_SATELLITE", "0")
+
 QUALITY_MAX_FRAUD_SCORE = int(os.environ.get("QUALITY_MAX_FRAUD_SCORE", "30"))
 QUALITY_REQUIRE_RESIDENTIAL = env_flag("QUALITY_REQUIRE_RESIDENTIAL", "1")
 QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
@@ -139,6 +162,31 @@ login_failures: dict[str, dict[str, float | int]] = {}
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
+
+IPAPI_RISK_FIELD_LABELS = {
+    "is_bogon": "保留/异常地址 bogon",
+    "is_mobile": "移动网络 mobile",
+    "is_satellite": "卫星网络 satellite",
+    "is_crawler": "爬虫 crawler",
+    "is_datacenter": "数据中心 datacenter",
+    "is_tor": "Tor 网络",
+    "is_proxy": "代理 proxy",
+    "is_vpn": "VPN",
+    "is_abuser": "滥用 IP abuser",
+}
+
+
+IPAPI_REJECT_CONFIG = {
+    "is_bogon": lambda: QUALITY_REJECT_IPAPI_BOGON,
+    "is_mobile": lambda: QUALITY_REJECT_IPAPI_MOBILE,
+    "is_satellite": lambda: QUALITY_REJECT_IPAPI_SATELLITE,
+    "is_crawler": lambda: QUALITY_REJECT_IPAPI_CRAWLER,
+    "is_datacenter": lambda: QUALITY_REJECT_IPAPI_DATACENTER,
+    "is_tor": lambda: QUALITY_REJECT_IPAPI_TOR,
+    "is_proxy": lambda: QUALITY_REJECT_IPAPI_PROXY,
+    "is_vpn": lambda: QUALITY_REJECT_IPAPI_VPN,
+    "is_abuser": lambda: QUALITY_REJECT_IPAPI_ABUSER,
+}
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -1778,14 +1826,84 @@ def fetch_ippure_quality() -> dict[str, Any]:
 
     return parse_ippure_quality(raw)
 
+def parse_ipapi_quality(raw: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "source": "ipapi.is",
+        "raw": raw,
+        "ipapi_checked": True,
+        "ipapi_ip": str(deep_find_value(raw, {"ip", "query", "address"}) or ""),
+        "ipapi_asn": str(deep_find_value(raw, {"asn", "asNumber", "as_number"}) or ""),
+        "ipapi_org": "",
+    }
+
+    company_raw = raw.get("company")
+    if isinstance(company_raw, dict):
+        result["ipapi_org"] = str(
+            company_raw.get("name")
+            or company_raw.get("domain")
+            or company_raw.get("type")
+            or ""
+        )
+    else:
+        result["ipapi_org"] = str(
+            deep_find_value(raw, {"org", "organization", "isp", "owner"}) or ""
+        )
+
+    for field in IPAPI_RISK_FIELD_LABELS:
+        result[field] = normalize_bool(raw.get(field))
+
+    return result
+
+
+def fetch_ipapi_quality() -> dict[str, Any]:
+    cmd = [
+        "curl", "-4", "-s",
+        *get_internal_curl_proxy_args("socks5h", "127.0.0.1"),
+        IPAPI_API_URL,
+        "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
+    ]
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
+    )
+
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"ipapi.is 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+        )
+
+    body = res.stdout.strip()
+    if not body:
+        raise RuntimeError("ipapi.is 返回为空")
+
+    try:
+        raw = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ipapi.is 返回不是 JSON: {exc}; body={body[:200]}")
+
+    return parse_ipapi_quality(raw)
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     score = parse_int(info.get("ippure_score"))
+
     if not info.get("has_ippure_score"):
         return False, "无法读取 IPPure 风控系数"
 
     if score > QUALITY_MAX_FRAUD_SCORE:
         return False, f"IPPure 系数 {score}% 超过阈值 {QUALITY_MAX_FRAUD_SCORE}%"
+
+    if QUALITY_IPAPI_STRICT and info.get("ipapi_error"):
+        return False, f"ipapi.is 检测异常: {info.get('ipapi_error')}"
+
+    if QUALITY_CHECK_IPAPI_ENABLED and info.get("ipapi_checked"):
+        for field, label in IPAPI_RISK_FIELD_LABELS.items():
+            reject_enabled = IPAPI_REJECT_CONFIG[field]()
+
+            if reject_enabled and info.get(field) is True:
+                return False, f"ipapi.is 风险命中: {label}=true"
 
     if QUALITY_REQUIRE_RESIDENTIAL and info.get("is_residential") is not True:
         return False, "IP 类型不是住宅/家庭宽带 IP"
@@ -1818,7 +1936,22 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         node["human_ratio"] = parse_int(quality_info.get("human_ratio"))
         node["native_ip"] = quality_info.get("native_ip")
         node["is_residential"] = quality_info.get("is_residential")
-        node["quality_source"] = quality_info.get("source", "ippure")
+
+        for field in IPAPI_RISK_FIELD_LABELS:
+            node[field] = quality_info.get(field)
+
+        node["ipapi_checked"] = quality_info.get("ipapi_checked", False)
+        node["ipapi_error"] = quality_info.get("ipapi_error", "")
+        node["ipapi_ip"] = quality_info.get("ipapi_ip", "")
+        node["ipapi_asn"] = quality_info.get("ipapi_asn", "")
+        node["ipapi_org"] = quality_info.get("ipapi_org", "")
+
+        node["quality_source"] = (
+            "ippure+ipapi"
+            if quality_info.get("ipapi_checked")
+            else quality_info.get("source", "ippure")
+        )
+
         if quality_info.get("asn"):
             node["asn"] = quality_info.get("asn")
         if quality_info.get("org"):
@@ -1836,19 +1969,41 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
 def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any]]:
     if not QUALITY_CHECK_ENABLED:
         return True, "IP质量检测未启用", {}
-
     quality_info = fetch_ippure_quality()
+    if QUALITY_CHECK_IPAPI_ENABLED:
+        try:
+            ipapi_info = fetch_ipapi_quality()
+            for field in IPAPI_RISK_FIELD_LABELS:
+                quality_info[field] = ipapi_info.get(field)
+            quality_info["ipapi_checked"] = True
+            quality_info["ipapi_ip"] = ipapi_info.get("ipapi_ip", "")
+            quality_info["ipapi_asn"] = ipapi_info.get("ipapi_asn", "")
+            quality_info["ipapi_org"] = ipapi_info.get("ipapi_org", "")
+            quality_info["ipapi_error"] = ""
+        except Exception as exc:
+            quality_info["ipapi_checked"] = False
+            quality_info["ipapi_error"] = str(exc)
+
     passed, reason = evaluate_ip_quality(quality_info)
+
     update_node_quality(node_id, quality_info, passed, reason)
 
-    set_state(
-        proxy_quality_ok=passed,
-        proxy_quality_error="" if passed else reason,
-        proxy_ippure_score=parse_int(quality_info.get("ippure_score")),
-        proxy_human_ratio=parse_int(quality_info.get("human_ratio")),
-        proxy_native_ip=quality_info.get("native_ip"),
-        proxy_is_residential=quality_info.get("is_residential"),
-    )
+    state_updates = {
+        "proxy_quality_ok": passed,
+        "proxy_quality_error": "" if passed else reason,
+        "proxy_ippure_score": parse_int(quality_info.get("ippure_score")),
+        "proxy_human_ratio": parse_int(quality_info.get("human_ratio")),
+        "proxy_native_ip": quality_info.get("native_ip"),
+        "proxy_is_residential": quality_info.get("is_residential"),
+        "proxy_ipapi_checked": quality_info.get("ipapi_checked", False),
+        "proxy_ipapi_error": quality_info.get("ipapi_error", ""),
+    }
+
+    for field in IPAPI_RISK_FIELD_LABELS:
+        state_updates[f"proxy_{field}"] = quality_info.get(field)
+
+    set_state(**state_updates)
+
 
     return passed, reason, quality_info
 
