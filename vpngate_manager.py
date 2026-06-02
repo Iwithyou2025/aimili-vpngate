@@ -3239,7 +3239,6 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       立即检测补齐
     </button>
-    
     <div class="project-auto-update-box">
       <span>项目自动更新</span>
       <label class="toggle-switch">
