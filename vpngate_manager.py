@@ -1927,7 +1927,9 @@ def fetch_ipapi_quality() -> dict[str, Any]:
 def fetch_proxy_speed_quality() -> dict[str, Any]:
     """
     通过 127.0.0.1:7928 下载测速文件前 N 字节，检测当前出口下载速度。
-    使用 HTTP 代理模式，因为你的 7928 HTTP CONNECT 已经验证可用。
+    注意：
+    - curl=0：完整完成测速
+    - curl=28：超时，但如果已经下载到数据，也可以用 speed_download 判断速度
     """
     range_end = max(0, QUALITY_SPEED_TEST_BYTES - 1)
     test_mb = QUALITY_SPEED_TEST_BYTES / 1024 / 1024
@@ -1960,52 +1962,66 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
         timeout=QUALITY_SPEED_HTTP_TIMEOUT_SECONDS + 5,
     )
 
+    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    # curl 即使超时，也会输出 -w 里的测速信息，所以先尝试解析
+    if len(lines) >= 4:
+        http_code = lines[-4]
+        size_download = parse_int(parse_float(lines[-3]))
+        time_total = parse_float(lines[-2])
+        speed_download = parse_int(parse_float(lines[-1]))
+
+        # 200 / 206 都算有效；curl=28 只要有下载数据，也算有效测速结果
+        if http_code in {"200", "206"} and size_download > 0 and speed_download > 0:
+            speed_mib_s = speed_download / 1024 / 1024
+            speed_mbps = speed_download * 8 / 1000 / 1000
+
+            if res.returncode == 28:
+                print(
+                    f"[测速] 7928 出口测速超时但已获得有效速度: "
+                    f"{speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
+                    f"已下载 {size_download}/{QUALITY_SPEED_TEST_BYTES} bytes, "
+                    f"耗时 {time_total:.2f}s",
+                    flush=True,
+                )
+                log_to_json(
+                    "WARNING",
+                    "Speed",
+                    f"测速超时但已获得有效速度: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
+                    f"已下载 {size_download}/{QUALITY_SPEED_TEST_BYTES} bytes, 耗时 {time_total:.2f}s",
+                )
+            else:
+                print(
+                    f"[测速] 7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
+                    f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
+                    flush=True,
+                )
+                log_to_json(
+                    "INFO",
+                    "Speed",
+                    f"7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
+                    f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
+                )
+
+            return {
+                "speed_test_checked": True,
+                "speed_test_url": QUALITY_SPEED_TEST_URL,
+                "speed_test_http_code": http_code,
+                "speed_test_size_bytes": size_download,
+                "speed_test_time_seconds": time_total,
+                "download_speed_bps": speed_download,
+                "download_speed_mbps": round(speed_mbps, 2),
+                "download_speed_mib_s": round(speed_mib_s, 2),
+                "speed_test_timeout": res.returncode == 28,
+            }
+
+    # 走到这里，才是真正无法测速
     if res.returncode != 0:
         raise RuntimeError(
             f"测速请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
         )
 
-    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
-
-    if len(lines) < 4:
-        raise RuntimeError(f"测速返回格式异常: stdout={res.stdout[:200]!r}")
-
-    http_code = lines[-4]
-    size_download = parse_int(parse_float(lines[-3]))
-    time_total = parse_float(lines[-2])
-    speed_download = parse_int(parse_float(lines[-1]))
-
-    if http_code not in {"200", "206"}:
-        raise RuntimeError(f"测速 HTTP 状态异常: {http_code}")
-
-    if size_download <= 0:
-        raise RuntimeError("测速下载大小为 0")
-
-    speed_mib_s = speed_download / 1024 / 1024
-    speed_mbps = speed_download * 8 / 1000 / 1000
-
-    print(
-        f"[测速] 7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-        f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
-        flush=True,
-    )
-    log_to_json(
-        "INFO",
-        "Speed",
-        f"7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-        f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
-    )
-
-    return {
-        "speed_test_checked": True,
-        "speed_test_url": QUALITY_SPEED_TEST_URL,
-        "speed_test_http_code": http_code,
-        "speed_test_size_bytes": size_download,
-        "speed_test_time_seconds": time_total,
-        "download_speed_bps": speed_download,
-        "download_speed_mbps": round(speed_mbps, 2),
-        "download_speed_mib_s": round(speed_mib_s, 2),
-    }
+    raise RuntimeError(f"测速返回格式异常: stdout={res.stdout[:200]!r}")
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     score = parse_int(info.get("ippure_score"))
