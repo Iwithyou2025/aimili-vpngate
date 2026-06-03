@@ -125,6 +125,38 @@ QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
 QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
 QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
 
+# 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
+QUALITY_CHECK_SPEED_ENABLED = env_flag("QUALITY_CHECK_SPEED_ENABLED", "1")
+
+QUALITY_SPEED_TEST_URL = os.environ.get(
+    "QUALITY_SPEED_TEST_URL",
+    "https://raw.githubusercontent.com/Iwithyou2025/aimili-vpngate/main/speedtest_80m.bin"
+)
+
+QUALITY_SPEED_TEST_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("QUALITY_SPEED_TEST_BYTES", str(16 * 1024 * 1024)))
+)
+
+QUALITY_MIN_DOWNLOAD_SPEED_BPS = max(
+    1,
+    int(os.environ.get("QUALITY_MIN_DOWNLOAD_SPEED_BPS", str(1 * 1024 * 1024)))
+)
+
+QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS = max(
+    3,
+    int(os.environ.get("QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS", "8"))
+)
+
+QUALITY_SPEED_HTTP_TIMEOUT_SECONDS = max(
+    15,
+    int(os.environ.get("QUALITY_SPEED_HTTP_TIMEOUT_SECONDS", "25"))
+)
+
+# 测速接口异常是否直接判定失败
+# 默认 0：测速异常只记录，不误杀节点
+QUALITY_SPEED_STRICT = env_flag("QUALITY_SPEED_STRICT", "0")
+
 PROXY_HEALTH_CONFIRM_TIMES = max(
     1,
     int(os.environ.get("PROXY_HEALTH_CONFIRM_TIMES", "2"))
@@ -661,6 +693,12 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+def parse_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
 def check_ui_port_available(host: str, port: int) -> tuple[bool, str]:
     bind_host = str(host or "0.0.0.0").strip() or "0.0.0.0"
 
@@ -1885,6 +1923,62 @@ def fetch_ipapi_quality() -> dict[str, Any]:
         raise RuntimeError(f"ipapi.is 返回不是 JSON: {exc}; body={body[:200]}")
 
     return parse_ipapi_quality(raw)
+def fetch_proxy_speed_quality() -> dict[str, Any]:
+    """
+    通过 127.0.0.1:7928 下载测速文件前 N 字节，检测当前出口速度。
+    默认使用 HTTP 代理模式，因为你的 7928 HTTP CONNECT 测试已经验证可用。
+    """
+    range_end = max(0, QUALITY_SPEED_TEST_BYTES - 1)
+
+    cmd = [
+        "curl", "-4", "-L", "-sS",
+        *get_internal_curl_proxy_args("http", "127.0.0.1"),
+        "--range", f"0-{range_end}",
+        "--connect-timeout", str(QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS),
+        "--max-time", str(QUALITY_SPEED_HTTP_TIMEOUT_SECONDS),
+        "-o", "/dev/null",
+        "-w", "\n%{http_code}\n%{size_download}\n%{time_total}\n%{speed_download}\n",
+        QUALITY_SPEED_TEST_URL,
+    ]
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=QUALITY_SPEED_HTTP_TIMEOUT_SECONDS + 5,
+    )
+
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"测速请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+        )
+
+    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    if len(lines) < 4:
+        raise RuntimeError(f"测速返回格式异常: stdout={res.stdout[:200]!r}")
+
+    http_code = lines[-4]
+    size_download = parse_int(parse_float(lines[-3]))
+    time_total = parse_float(lines[-2])
+    speed_download = parse_int(parse_float(lines[-1]))
+
+    if http_code not in {"200", "206"}:
+        raise RuntimeError(f"测速 HTTP 状态异常: {http_code}")
+
+    if size_download <= 0:
+        raise RuntimeError("测速下载大小为 0")
+
+    return {
+        "speed_test_checked": True,
+        "speed_test_url": QUALITY_SPEED_TEST_URL,
+        "speed_test_http_code": http_code,
+        "speed_test_size_bytes": size_download,
+        "speed_test_time_seconds": time_total,
+        "download_speed_bps": speed_download,
+        "download_speed_mbps": round(speed_download * 8 / 1000 / 1000, 2),
+        "download_speed_mib_s": round(speed_download / 1024 / 1024, 2),
+    }
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     score = parse_int(info.get("ippure_score"))
@@ -1904,6 +1998,17 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
             if reject_enabled and info.get(field) is True:
                 return False, f"ipapi.is 风险命中: {label}=true"
+
+    if QUALITY_SPEED_STRICT and info.get("speed_test_error"):
+        return False, f"出口测速异常: {info.get('speed_test_error')}"
+
+    if QUALITY_CHECK_SPEED_ENABLED and info.get("speed_test_checked"):
+        speed_bps = parse_int(info.get("download_speed_bps"))
+
+        if speed_bps < QUALITY_MIN_DOWNLOAD_SPEED_BPS:
+            speed_mib = speed_bps / 1024 / 1024
+            min_mib = QUALITY_MIN_DOWNLOAD_SPEED_BPS / 1024 / 1024
+            return False, f"出口下载速度 {speed_mib:.2f} MB/s 低于阈值 {min_mib:.2f} MB/s"
 
     if QUALITY_REQUIRE_RESIDENTIAL and info.get("is_residential") is not True:
         return False, "IP 类型不是住宅/家庭宽带 IP"
@@ -1937,6 +2042,16 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         node["native_ip"] = quality_info.get("native_ip")
         node["is_residential"] = quality_info.get("is_residential")
 
+        node["speed_test_checked"] = quality_info.get("speed_test_checked", False)
+        node["speed_test_error"] = quality_info.get("speed_test_error", "")
+        node["speed_test_url"] = quality_info.get("speed_test_url", "")
+        node["speed_test_http_code"] = quality_info.get("speed_test_http_code", "")
+        node["speed_test_size_bytes"] = parse_int(quality_info.get("speed_test_size_bytes"))
+        node["speed_test_time_seconds"] = parse_float(quality_info.get("speed_test_time_seconds"))
+        node["download_speed_bps"] = parse_int(quality_info.get("download_speed_bps"))
+        node["download_speed_mbps"] = parse_float(quality_info.get("download_speed_mbps"))
+        node["download_speed_mib_s"] = parse_float(quality_info.get("download_speed_mib_s"))
+
         for field in IPAPI_RISK_FIELD_LABELS:
             node[field] = quality_info.get(field)
 
@@ -1946,11 +2061,15 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         node["ipapi_asn"] = quality_info.get("ipapi_asn", "")
         node["ipapi_org"] = quality_info.get("ipapi_org", "")
 
-        node["quality_source"] = (
-            "ippure+ipapi"
-            if quality_info.get("ipapi_checked")
-            else quality_info.get("source", "ippure")
-        )
+        quality_sources = ["ippure"]
+
+        if quality_info.get("ipapi_checked"):
+            quality_sources.append("ipapi")
+
+        if quality_info.get("speed_test_checked"):
+            quality_sources.append("speedtest")
+
+        node["quality_source"] = "+".join(quality_sources)
 
         if quality_info.get("asn"):
             node["asn"] = quality_info.get("asn")
@@ -1984,6 +2103,23 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["ipapi_checked"] = False
             quality_info["ipapi_error"] = str(exc)
 
+    if QUALITY_CHECK_SPEED_ENABLED:
+        try:
+            speed_info = fetch_proxy_speed_quality()
+
+            quality_info["speed_test_checked"] = True
+            quality_info["speed_test_error"] = ""
+            quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
+            quality_info["speed_test_http_code"] = speed_info.get("speed_test_http_code", "")
+            quality_info["speed_test_size_bytes"] = speed_info.get("speed_test_size_bytes", 0)
+            quality_info["speed_test_time_seconds"] = speed_info.get("speed_test_time_seconds", 0)
+            quality_info["download_speed_bps"] = speed_info.get("download_speed_bps", 0)
+            quality_info["download_speed_mbps"] = speed_info.get("download_speed_mbps", 0)
+            quality_info["download_speed_mib_s"] = speed_info.get("download_speed_mib_s", 0)
+        except Exception as exc:
+            quality_info["speed_test_checked"] = False
+            quality_info["speed_test_error"] = str(exc)
+
     passed, reason = evaluate_ip_quality(quality_info)
 
     update_node_quality(node_id, quality_info, passed, reason)
@@ -1997,6 +2133,14 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
         "proxy_is_residential": quality_info.get("is_residential"),
         "proxy_ipapi_checked": quality_info.get("ipapi_checked", False),
         "proxy_ipapi_error": quality_info.get("ipapi_error", ""),
+
+        "proxy_speed_test_checked": quality_info.get("speed_test_checked", False),
+        "proxy_speed_test_error": quality_info.get("speed_test_error", ""),
+        "proxy_download_speed_bps": parse_int(quality_info.get("download_speed_bps")),
+        "proxy_download_speed_mbps": parse_float(quality_info.get("download_speed_mbps")),
+        "proxy_download_speed_mib_s": parse_float(quality_info.get("download_speed_mib_s")),
+        "proxy_speed_test_size_bytes": parse_int(quality_info.get("speed_test_size_bytes")),
+        "proxy_speed_test_time_seconds": parse_float(quality_info.get("speed_test_time_seconds")),
     }
 
     for field in IPAPI_RISK_FIELD_LABELS:
@@ -2011,7 +2155,7 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
 def connect_node_with_quality_check(node_id: str) -> str:
     result = connect_node(node_id)
 
-    set_state(last_check_message="正在通过本地代理请求 IPPure 检测出口 IP 质量...")
+    set_state(last_check_message="正在通过本地代理请求 IPPure 检测出口 IP 质量与 代理下载速度...")
     try:
         passed, reason, quality_info = check_active_exit_ip_quality(node_id)
     except Exception as exc:
