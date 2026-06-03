@@ -2615,6 +2615,9 @@ INDEX_HTML = r"""<!doctype html>
     .btn-group {
       display: flex;
       gap: 12px;
+      align-items: center;
+      flex-wrap: nowrap;
+      flex-shrink: 0;
     }
 
     button {
@@ -3201,9 +3204,22 @@ INDEX_HTML = r"""<!doctype html>
         width: 100%;
         margin-top: 12px;
       }
-      .btn-group button {
-        flex: 1;
+        .btn-group {
+        width: 100%;
+        margin-top: 12px;
+        flex-wrap: wrap;
       }
+    
+      .btn-group > button,
+      .btn-group > .dropdown,
+      .project-auto-update-box {
+        flex: 1 1 calc(50% - 8px);
+      }
+    
+      .btn-group > .dropdown > button {
+        width: 100%;
+      }
+  
       main {
         padding: 16px 20px;
       }
@@ -3331,7 +3347,56 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 600;
       white-space: nowrap;
     }
+    .project-auto-update-box {
+      height: 44px;
+      padding: 0 12px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.06);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      line-height: 1;
+      flex-shrink: 0;
+    }
     
+    .btn-group > button,
+    .btn-group > .dropdown > button {
+      height: 44px;
+      padding: 0 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1;
+      white-space: nowrap;
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
+    
+    .btn-group > button svg,
+    .btn-group > .dropdown > button svg {
+      flex-shrink: 0;
+    }
+    
+    #refresh {
+      min-width: 112px;
+    }
+    
+    #check {
+      min-width: 138px;
+    }
+    
+    #admin_btn {
+      min-width: 108px;
+    }
+    
+    #project_auto_update_toggle {
+      flex-shrink: 0;
+    }
+
     .toggle-switch {
       position: relative;
       display: inline-block;
