@@ -1359,18 +1359,95 @@ def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = time.time()
+
+    def ipapi_risk_count(node: dict[str, Any]) -> int:
+        return sum(
+            1
+            for field in IPAPI_RISK_FIELD_LABELS
+            if node.get(field) is True
+        )
+
+    def quality_status_rank(node: dict[str, Any]) -> int:
+        status = str(node.get("quality_status") or "")
+
+        if node.get("active"):
+            return 0
+
+        if status == "passed":
+            return 1
+
+        if status == "":
+            return 2
+
+        if status == "failed":
+            return 3
+
+        return 4
+
+    def ippure_rank(node: dict[str, Any]) -> int:
+        score = parse_int(node.get("ippure_score"))
+
+        # 没有检测过的放后面，但不要当成 0 分优质节点
+        if score <= 0 and node.get("quality_status") != "passed":
+            return 999
+
+        return score
+
+    def speed_rank(node: dict[str, Any]) -> int:
+        speed = parse_int(node.get("download_speed_bps"))
+
+        # 速度越高越靠前
+        return -speed if speed > 0 else 0
+
     available_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
-        key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score")))
+        [
+            n for n in nodes
+            if n.get("probe_status") == "available" or n.get("active")
+        ],
+        key=lambda n: (
+            0 if n.get("active") else 1,
+            1 if should_skip_candidate_by_quality(n, now) else 0,
+            quality_status_rank(n),
+            ippure_rank(n),
+            ipapi_risk_count(n),
+            0 if n.get("is_residential") is True else 1,
+            0 if n.get("native_ip") is True else 1,
+            -parse_int(n.get("human_ratio")),
+            speed_rank(n),
+            parse_int(n.get("latency_ms")) or 999999,
+            -parse_int(n.get("score")),
+        )
     )
+
     untested_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
+        [
+            n for n in nodes
+            if n.get("probe_status") == "not_checked"
+               and not n.get("active")
+        ],
+        key=lambda n: (
+            1 if should_skip_candidate_by_quality(n, now) else 0,
+            0 if get_country_code(n) in PREFERRED_COUNTRIES else 1,
+            preferred_country_priority(n),
+            -parse_int(n.get("score")),
+            parse_int(n.get("ping")),
+        )
     )
+
     unavailable_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "unavailable" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), -float(n.get("probed_at", 0)))
+        [
+            n for n in nodes
+            if n.get("probe_status") == "unavailable"
+               and not n.get("active")
+        ],
+        key=lambda n: (
+            1 if should_skip_candidate_by_quality(n, now) else 0,
+            -parse_int(n.get("score")),
+            -float(n.get("probed_at", 0)),
+        )
     )
+
     return available_nodes + untested_nodes + unavailable_nodes
 
 active_test_indexes = set()
