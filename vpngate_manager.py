@@ -1712,19 +1712,44 @@ def quality_cooldown_active(node: dict[str, Any]) -> bool:
     return float(node.get("quality_fail_until") or 0) > time.time()
 
 
-def get_auto_switch_candidates(nodes: list[dict[str, Any]], country_code: str = "", attempted_ids: set[str] | None = None) -> list[dict[str, Any]]:
+def get_auto_switch_candidates(
+        nodes: list[dict[str, Any]],
+        country_code: str = "",
+        attempted_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     attempted_ids = attempted_ids or set()
+    target_country = (country_code or "").upper()
 
-    candidates = [
+    base_candidates = [
         n for n in nodes
         if n.get("probe_status") == "available"
-        and not n.get("active")
-        and n.get("id") not in attempted_ids
-           and not should_skip_candidate_by_quality(n)
+           and not n.get("active")
+           and n.get("id") not in attempted_ids
     ]
 
-    if AUTO_SWITCH_SAME_COUNTRY_ONLY and country_code:
-        candidates = [n for n in candidates if get_country_code(n) == country_code]
+    if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
+        base_candidates = [
+            n for n in base_candidates
+            if get_country_code(n) == target_country
+        ]
+
+    candidates = [
+        n for n in base_candidates
+        if not should_skip_candidate_by_quality(n)
+    ]
+
+    skipped_count = len(base_candidates) - len(candidates)
+
+    if skipped_count > 0:
+        print(
+            f"[自动切换] 已跳过 {skipped_count} 个 IPPure 超标或 hard fail 冷却期内节点",
+            flush=True,
+        )
+        log_to_json(
+            "INFO",
+            "Quality",
+            f"自动切换跳过 {skipped_count} 个 IPPure 超标或 hard fail 冷却期内节点",
+        )
 
     candidates.sort(
         key=lambda n: (
@@ -2205,7 +2230,6 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
 
         now = time.time()
 
-
         node["quality_status"] = "passed" if passed else "failed"
         node["quality_checked_at"] = now
         node["quality_fail_reason"] = "" if passed else reason
@@ -2222,10 +2246,12 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
                 else QUALITY_FAIL_COOLDOWN_SECONDS
             )
 
-        node["quality_fail_until"] = now + cooldown
-        node["quality_fail_type"] = "hard" if is_hard_fail else "soft"
-        node["quality_fail_cooldown_seconds"] = cooldown
+            node["quality_fail_until"] = now + cooldown
+            node["quality_fail_type"] = "hard" if is_hard_fail else "soft"
+            node["quality_fail_cooldown_seconds"] = cooldown
+
         # IPPure 基础质量信息
+
         node["exit_ip"] = quality_info.get("ip") or node.get("exit_ip") or ""
         node["ippure_score"] = parse_int(quality_info.get("ippure_score"))
         node["human_ratio"] = parse_int(quality_info.get("human_ratio"))
@@ -2427,12 +2453,17 @@ def maintain_valid_nodes(force: bool = False) -> str:
             is_connecting = False
             return "没有拉取到新节点"
 
+
         with lock:
+            current_nodes = read_json(NODES_FILE, [])
+
             active_node = None
             if active_openvpn_node_id:
-                current_nodes = read_json(NODES_FILE, [])
-                active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
+                active_node = next(
+                    (n for n in current_nodes if n.get("id") == active_openvpn_node_id),
+                    None,
+                )
+
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
 
@@ -2451,7 +2482,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     cached_node = existing_by_id.get(str(cand["id"]))
                     merged.append(merge_cached_quality_fields(cand, cached_node))
                     seen_ids.add(cand["id"])
-
 
             if len(merged) > 1000:
                 merged = merged[:1000]
@@ -2475,17 +2505,38 @@ def maintain_valid_nodes(force: bool = False) -> str:
         print(f"[维护线程] 正在检测优先国家节点，数量 {len(to_test_ids)}: {to_test_ids}", flush=True)
         set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
         test_multiple_nodes(to_test_ids)
-        
+
         is_connecting = False
-        
+
+        should_auto_switch = False
+
         with lock:
             merged = read_json(NODES_FILE, [])
+
             if not active_openvpn_running():
-                available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                if available_candidates:
-                    auto_switch_node()
+                available_candidates = [
+                    n for n in merged
+                    if n.get("probe_status") == "available"
+                       and not should_skip_candidate_by_quality(n)
+                ]
+
+                should_auto_switch = bool(available_candidates)
+
+        if should_auto_switch:
+            print(
+                "[维护线程] 当前没有运行中的 OpenVPN，检测到可用节点，准备自动连接",
+                flush=True,
+            )
+            log_to_json(
+                "INFO",
+                "VPN",
+                "当前没有运行中的 OpenVPN，检测到可用节点，准备自动连接",
+            )
+
+            auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} prioritized nodes."
         set_state(
             last_check_at=time.time(),
@@ -5229,7 +5280,20 @@ def background_proxy_checker() -> None:
                 time.sleep(5)
                 continue
 
+            if not active_openvpn_node_id and not active_openvpn_running():
+                set_state(
+                    proxy_ok=False,
+                    proxy_ip="-",
+                    proxy_latency_ms=0,
+                    proxy_error="当前没有活动 VPN 节点，等待维护线程连接节点",
+                    proxy_fail_count=0,
+                    proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
+                )
+                time.sleep(30)
+                continue
+
             res = check_proxy_health()
+
 
             if res["ok"]:
                 set_state(
