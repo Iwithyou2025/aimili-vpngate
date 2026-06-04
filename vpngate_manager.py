@@ -2552,6 +2552,45 @@ def connect_node_with_quality_check(node_id: str) -> str:
     set_state(last_check_message=f"Connected {node_id}; IP质量达标")
     return result
 
+def connect_saved_node_without_quality_check(node_id: str) -> str:
+    """
+    启动恢复专用：
+    只要求 OpenVPN 连接成功，并且 7928 代理可以访问网络。
+    不执行 IPPure / ipapi / 下载测速，避免服务重启后恢复时间过长。
+    """
+    result = connect_node(node_id)
+
+    set_state(last_check_message="正在验证上次节点的 7928 代理出站能力...")
+
+    res = check_proxy_health()
+
+    if not res.get("ok"):
+        reason = res.get("error", "7928 代理出站检测失败")
+
+        set_state(
+            proxy_ok=False,
+            proxy_ip="-",
+            proxy_latency_ms=0,
+            proxy_error=reason,
+            last_check_message=f"恢复上次节点失败: {reason}",
+        )
+
+        stop_active_openvpn()
+        raise RuntimeError(reason)
+
+    set_state(
+        proxy_ok=True,
+        proxy_ip=res.get("ip", "-"),
+        proxy_latency_ms=res.get("latency_ms", 0),
+        proxy_error="",
+        last_check_message=f"已恢复上次节点: {node_id}",
+    )
+
+    print(f"[启动恢复] 上次节点 7928 出站检测通过: {node_id}", flush=True)
+    log_to_json("INFO", "VPN", f"上次节点 7928 出站检测通过: {node_id}")
+
+    return result
+
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -2724,11 +2763,12 @@ def restore_last_connected_node(max_attempts: int = 2) -> bool:
                 active_node_latency="正在恢复",
             )
 
+     
             print(f"[启动恢复] 第 {attempt}/{max_attempts} 次尝试重连: {node_id}", flush=True)
-            connect_node_with_quality_check(node_id)
+            connect_saved_node_without_quality_check(node_id)
 
-            print(f"[启动恢复] 上次节点已重连并通过质量复检: {node_id}", flush=True)
-            log_to_json("INFO", "VPN", f"上次节点已重连并通过质量复检: {node_id}")
+            print(f"[启动恢复] 已成功恢复上次节点: {node_id}", flush=True)
+            log_to_json("INFO", "VPN", f"已成功恢复上次节点: {node_id}")
             return True
 
         except Exception as exc:
