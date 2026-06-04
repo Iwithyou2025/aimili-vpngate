@@ -1341,10 +1341,10 @@ def stop_active_openvpn() -> None:
         node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
         if node:
             config_to_delete = node.get("config_file")
-            
-    stop_process(active_openvpn_process)
+
     active_openvpn_process = None
     active_openvpn_node_id = ""
+    set_state(connected_at=None)
     kill_existing_openvpn_processes()
     
     if config_to_delete:
@@ -1945,7 +1945,13 @@ def connect_node(node_id: str) -> str:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
-            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
+            set_state(
+                active_openvpn_node_id="",
+                is_connecting=False,
+                active_node_latency="无活动连接",
+                last_check_message=f"连接失败: {message}",
+                connected_at=None,
+            )
             with lock:
                 active_openvpn_node_id = ""
             raise RuntimeError(message)
@@ -1995,7 +2001,13 @@ def connect_node(node_id: str) -> str:
             )
             
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
-        set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
+        set_state(
+            active_openvpn_node_id=node_id,
+            is_connecting=False,
+            last_check_message=f"Connected {node_id}",
+            active_node_latency=latency_str,
+            connected_at=time.time(),
+        )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
     finally:
@@ -4503,6 +4515,7 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              ${state.connected_at ? `<span style="margin-left: 12px;">持续时间: <strong id="conn_duration">-</strong></span>` : ''}
             </div>
           </div>
         </div>
@@ -4531,6 +4544,40 @@ function render(){
       </div>
     `;
   }
+  
+  
+  if (state.connected_at && activeNode && !state.is_connecting) {
+    if (window._durationTimer) clearInterval(window._durationTimer);
+
+    function _fmtDur(s) {
+      s = Math.max(0, Math.floor(s || 0));
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      return d + '天 ' + h + '时 ' + m + '分 ' + sec + '秒';
+    }
+
+    function _updateDur() {
+      const el = document.getElementById('conn_duration');
+      if (!el) {
+        clearInterval(window._durationTimer);
+        window._durationTimer = null;
+        return;
+      }
+
+      el.textContent = _fmtDur(Math.floor(Date.now() / 1000 - Number(state.connected_at)));
+    }
+
+    _updateDur();
+    window._durationTimer = setInterval(_updateDur, 1000);
+  } else {
+    if (window._durationTimer) {
+      clearInterval(window._durationTimer);
+      window._durationTimer = null;
+    }
+  }
+
 
   const shown = getFilteredNodes();
   
@@ -6017,7 +6064,7 @@ def main() -> None:
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
             "is_connecting": True,
             "active_node_latency": "正在准备",
-            "blacklisted_nodes": 0,
+            "connected_at": None,
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
