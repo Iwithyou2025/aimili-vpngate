@@ -2036,8 +2036,6 @@ def connect_node(node_id: str) -> str:
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
 
-        save_last_connected_node(node_id, node)
-
         set_state(
             active_openvpn_node_id=node_id,
             is_connecting=False,
@@ -2528,6 +2526,7 @@ def connect_node_with_quality_check(node_id: str) -> str:
 
     set_state(last_check_message="正在检测出口 IP 质量与 7928 代理下载速度...")
     print("[质量检测] 正在检测出口 IP 质量与 7928 代理下载速度...", flush=True)
+
     try:
         passed, reason, quality_info = check_active_exit_ip_quality(node_id)
     except Exception as exc:
@@ -2542,7 +2541,14 @@ def connect_node_with_quality_check(node_id: str) -> str:
         stop_active_openvpn()
         raise QualityCheckFailed(reason)
 
-    log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标: {quality_info}")
+    # 只有 OpenVPN 连接成功，并且 IPPure / ipapi / 速度检测全部通过后，才保存为上次成功节点
+    nodes = read_json(NODES_FILE, [])
+    node = next((item for item in nodes if item.get("id") == node_id), None)
+    save_last_connected_node(node_id, node)
+
+    print(f"[质量检测] 节点 {node_id} 已通过质量检测，保存为上次成功节点", flush=True)
+    log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标，已保存为上次成功节点: {quality_info}")
+
     set_state(last_check_message=f"Connected {node_id}; IP质量达标")
     return result
 
@@ -2719,10 +2725,10 @@ def restore_last_connected_node(max_attempts: int = 2) -> bool:
             )
 
             print(f"[启动恢复] 第 {attempt}/{max_attempts} 次尝试重连: {node_id}", flush=True)
-            connect_node(node_id)
+            connect_node_with_quality_check(node_id)
 
-            print(f"[启动恢复] 已成功恢复上次节点: {node_id}", flush=True)
-            log_to_json("INFO", "VPN", f"已成功恢复上次节点: {node_id}")
+            print(f"[启动恢复] 上次节点已重连并通过质量复检: {node_id}", flush=True)
+            log_to_json("INFO", "VPN", f"上次节点已重连并通过质量复检: {node_id}")
             return True
 
         except Exception as exc:
@@ -6141,7 +6147,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+                self.send_json({"ok": True, "message": connect_node_with_quality_check(str(payload.get("id") or ""))})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
