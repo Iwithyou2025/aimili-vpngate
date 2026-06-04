@@ -125,6 +125,11 @@ QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
 QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
 QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
 
+# 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 7 天
+QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
+    os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(7 * 24 * 60 * 60))
+)
+
 # 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
 QUALITY_CHECK_SPEED_ENABLED = env_flag("QUALITY_CHECK_SPEED_ENABLED", "1")
 
@@ -1379,13 +1384,136 @@ def preferred_country_priority(node: dict[str, Any]) -> int:
     except ValueError:
         return len(PREFERRED_COUNTRIES)
 
+def is_hard_quality_fail_reason(reason: str) -> bool:
+    """
+    判断是否属于“硬质量失败”。
+    这类失败短时间内重复检测意义不大，因此使用更长冷却期。
+
+    注意：测速低于阈值不放进 hard，避免因为临时带宽波动长期跳过节点。
+    """
+    reason = str(reason or "")
+
+    hard_keywords = [
+        "IPPure 系数",
+        "ipapi.is 风险命中",
+        "IP 类型不是住宅",
+        "IP 来源不是原生",
+        "人机流量比",
+    ]
+
+    return any(keyword in reason for keyword in hard_keywords)
+
+
+def should_skip_candidate_by_quality(node: dict[str, Any], now: float | None = None) -> bool:
+    """
+    维护线程 / 自动切换候选预过滤。
+
+    只跳过：
+    1. hard fail 冷却期内的节点；
+    2. 兼容旧数据：IPPure 超标且仍在冷却期内的节点。
+
+    不跳过测速失败/测速低速等 soft fail，避免临时波动导致候选池过窄。
+    """
+    if not node:
+        return True
+
+    now = now or time.time()
+    quality_fail_until = float(node.get("quality_fail_until") or 0)
+
+    if quality_fail_until <= now:
+        return False
+
+    quality_fail_type = str(node.get("quality_fail_type") or "")
+    quality_fail_reason = str(node.get("quality_fail_reason") or "")
+    ippure_score = parse_int(node.get("ippure_score"))
+
+    if quality_fail_type == "hard":
+        return True
+
+    if "IPPure 系数" in quality_fail_reason:
+        return True
+
+    if ippure_score > QUALITY_MAX_FRAUD_SCORE:
+        return True
+
+    return False
+
+
+QUALITY_CACHE_FIELDS = {
+    "quality_status",
+    "quality_checked_at",
+    "quality_fail_reason",
+    "quality_fail_until",
+    "quality_fail_type",
+    "quality_fail_cooldown_seconds",
+    "exit_ip",
+    "ippure_score",
+    "human_ratio",
+    "native_ip",
+    "is_residential",
+    "quality_source",
+    "ipapi_checked",
+    "ipapi_error",
+    "ipapi_ip",
+    "ipapi_asn",
+    "ipapi_org",
+    "speed_test_checked",
+    "speed_test_error",
+    "speed_test_url",
+    "speed_test_http_code",
+    "speed_test_size_bytes",
+    "speed_test_time_seconds",
+    "download_speed_bps",
+    "download_speed_mbps",
+    "download_speed_mib_s",
+}
+
+
+def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    拉取 VPNGate 新列表时，保留同 ID 节点已有的质量检测缓存。
+    否则每次 fetch_candidates() 都会把 quality_fail_until 等字段冲掉。
+    """
+    if not old_node:
+        return new_node
+
+    merged = dict(new_node)
+
+    for field in QUALITY_CACHE_FIELDS:
+        if field in old_node:
+            merged[field] = old_node.get(field)
+
+    for field in IPAPI_RISK_FIELD_LABELS:
+        if field in old_node:
+            merged[field] = old_node.get(field)
+
+    return merged
 
 def pick_nodes_to_test(nodes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    pending = [
+    now = time.time()
+
+    pending_all = [
         n for n in nodes
         if not n.get("active")
            and n.get("probe_status") == "not_checked"
     ]
+
+    pending = [
+        n for n in pending_all
+        if not should_skip_candidate_by_quality(n, now)
+    ]
+
+    skipped_count = len(pending_all) - len(pending)
+    if skipped_count > 0:
+        print(
+            f"[维护线程] 已跳过 {skipped_count} 个 IPPure 超标或 hard fail 冷却期内节点",
+            flush=True,
+        )
+        log_to_json(
+            "INFO",
+            "Quality",
+            f"维护线程跳过 {skipped_count} 个 IPPure 超标或 hard fail 冷却期内节点",
+        )
 
     pending.sort(
         key=lambda n: (
@@ -1592,7 +1720,7 @@ def get_auto_switch_candidates(nodes: list[dict[str, Any]], country_code: str = 
         if n.get("probe_status") == "available"
         and not n.get("active")
         and n.get("id") not in attempted_ids
-        and not quality_cooldown_active(n)
+           and not should_skip_candidate_by_quality(n)
     ]
 
     if AUTO_SWITCH_SAME_COUNTRY_ONLY and country_code:
@@ -2077,11 +2205,26 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
 
         now = time.time()
 
+
         node["quality_status"] = "passed" if passed else "failed"
         node["quality_checked_at"] = now
         node["quality_fail_reason"] = "" if passed else reason
-        node["quality_fail_until"] = 0 if passed else now + QUALITY_FAIL_COOLDOWN_SECONDS
 
+        if passed:
+            node["quality_fail_until"] = 0
+            node["quality_fail_type"] = ""
+            node["quality_fail_cooldown_seconds"] = 0
+        else:
+            is_hard_fail = is_hard_quality_fail_reason(reason)
+            cooldown = (
+                QUALITY_HARD_FAIL_COOLDOWN_SECONDS
+                if is_hard_fail
+                else QUALITY_FAIL_COOLDOWN_SECONDS
+            )
+
+        node["quality_fail_until"] = now + cooldown
+        node["quality_fail_type"] = "hard" if is_hard_fail else "soft"
+        node["quality_fail_cooldown_seconds"] = cooldown
         # IPPure 基础质量信息
         node["exit_ip"] = quality_info.get("ip") or node.get("exit_ip") or ""
         node["ippure_score"] = parse_int(quality_info.get("ippure_score"))
@@ -2292,16 +2435,24 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
-            
+
+            existing_by_id = {
+                str(n.get("id")): n
+                for n in current_nodes
+                if n.get("id")
+            }
+
             if active_node:
                 merged.append(active_node)
                 seen_ids.add(active_node["id"])
-                
+
             for cand in candidates:
                 if cand["id"] not in seen_ids:
-                    merged.append(cand)
+                    cached_node = existing_by_id.get(str(cand["id"]))
+                    merged.append(merge_cached_quality_fields(cand, cached_node))
                     seen_ids.add(cand["id"])
-                    
+
+
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
