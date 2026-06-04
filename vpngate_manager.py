@@ -184,6 +184,7 @@ NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 PROJECT_UPDATE_CONFIG_FILE = DATA_DIR / "project_update.json"
+LAST_CONNECTED_NODE_FILE = DATA_DIR / "last_connected_node.json"
 PROJECT_AUTO_UPDATE_INTERVAL_SECONDS = max(
     30,
     int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "120"))
@@ -652,6 +653,39 @@ def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
     write_json(STATE_FILE, sanitize_state_for_disk(state))
+
+def save_last_connected_node(node_id: str, node: dict[str, Any] | None = None) -> None:
+    if not node_id:
+        return
+
+    data = {
+        "id": node_id,
+        "saved_at": time.time(),
+    }
+
+    if node:
+        data.update({
+            "country": node.get("country", ""),
+            "country_short": node.get("country_short", ""),
+            "ip": node.get("ip") or node.get("remote_host") or "",
+            "remote_port": node.get("remote_port", ""),
+            "proto": node.get("proto", ""),
+        })
+
+    write_json(LAST_CONNECTED_NODE_FILE, data)
+
+
+def load_last_connected_node_id() -> str:
+    data = read_json(LAST_CONNECTED_NODE_FILE, {})
+    return str(data.get("id") or "")
+
+
+def clear_last_connected_node() -> None:
+    try:
+        if LAST_CONNECTED_NODE_FILE.exists():
+            LAST_CONNECTED_NODE_FILE.unlink()
+    except Exception:
+        pass
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -1999,15 +2033,18 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=0,
                 proxy_error=res.get("error", "未知错误")
             )
-            
+
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
+
+        save_last_connected_node(node_id, node)
+
         set_state(
             active_openvpn_node_id=node_id,
             is_connecting=False,
             last_check_message=f"Connected {node_id}",
             active_node_latency=latency_str,
-            connected_at=time.time(),
         )
+
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
     finally:
@@ -2638,6 +2675,111 @@ def maintain_valid_nodes(force: bool = False) -> str:
         is_connecting = False
         raise e
 
+def restore_last_connected_node(max_attempts: int = 2) -> bool:
+    """
+    服务重启 / GitHub 更新后，优先尝试恢复上次成功连接的节点。
+    连续失败 max_attempts 次后返回 False，由原有维护线程继续拉取和自动切换。
+    """
+    global is_connecting, active_openvpn_node_id
+
+    node_id = load_last_connected_node_id()
+    if not node_id:
+        print("[启动恢复] 没有保存的上次连接节点，跳过快速恢复", flush=True)
+        return False
+
+    nodes = read_json(NODES_FILE, [])
+    node = next((n for n in nodes if n.get("id") == node_id), None)
+
+    if not node:
+        print(f"[启动恢复] 保存的节点 {node_id} 不在 nodes.json 中，跳过快速恢复", flush=True)
+        clear_last_connected_node()
+        return False
+
+    if not node.get("config_text"):
+        print(f"[启动恢复] 保存的节点 {node_id} 缺少 config_text，跳过快速恢复", flush=True)
+        clear_last_connected_node()
+        return False
+
+    print(f"[启动恢复] 准备优先重连上次节点: {node_id}", flush=True)
+    log_to_json("INFO", "VPN", f"准备优先重连上次节点: {node_id}")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # main() 初始化时 is_connecting=True；
+            # 这里必须先置 False，否则 connect_node() 会直接返回 Already connecting。
+            with lock:
+                is_connecting = False
+                active_openvpn_node_id = ""
+
+            set_state(
+                is_connecting=True,
+                active_openvpn_node_id=node_id,
+                last_check_message=f"正在恢复上次连接节点，第 {attempt}/{max_attempts} 次: {node_id}",
+                active_node_latency="正在恢复",
+            )
+
+            print(f"[启动恢复] 第 {attempt}/{max_attempts} 次尝试重连: {node_id}", flush=True)
+            connect_node(node_id)
+
+            print(f"[启动恢复] 已成功恢复上次节点: {node_id}", flush=True)
+            log_to_json("INFO", "VPN", f"已成功恢复上次节点: {node_id}")
+            return True
+
+        except Exception as exc:
+            print(f"[启动恢复] 第 {attempt}/{max_attempts} 次重连失败: {exc}", flush=True)
+            log_to_json("WARNING", "VPN", f"恢复上次节点失败 {attempt}/{max_attempts}: {exc}")
+
+            with lock:
+                is_connecting = False
+                active_openvpn_node_id = ""
+
+            set_state(
+                is_connecting=False,
+                active_openvpn_node_id="",
+                last_check_message=f"恢复上次节点失败 {attempt}/{max_attempts}: {exc}",
+                active_node_latency="无活动连接",
+            )
+
+            if attempt < max_attempts:
+                time.sleep(3)
+
+    print("[启动恢复] 上次节点连续重连失败，清除缓存并交给原有逻辑自动选择节点", flush=True)
+    log_to_json("WARNING", "VPN", "上次节点连续重连失败，清除缓存并交给原有逻辑自动选择节点")
+    clear_last_connected_node()
+
+    return False
+
+
+def startup_restore_then_collector() -> None:
+    """
+    启动后先尝试恢复上次节点。
+    成功：继续进入原 collector_loop 做后续维护。
+    失败：仍然进入原 collector_loop，由旧逻辑拉取节点并自动切换。
+    """
+    global is_connecting
+
+    try:
+        restored = restore_last_connected_node(max_attempts=2)
+
+        if not restored:
+            with lock:
+                is_connecting = False
+
+            set_state(
+                is_connecting=False,
+                active_openvpn_node_id="",
+                last_check_message="未恢复上次节点，交给维护线程按原逻辑选择节点",
+                active_node_latency="等待维护线程",
+            )
+
+    except Exception as exc:
+        print(f"[启动恢复] 恢复流程异常: {exc}", flush=True)
+        log_to_json("ERROR", "VPN", f"启动恢复流程异常: {exc}")
+
+        with lock:
+            is_connecting = False
+
+    collector_loop()
 
 def collector_loop() -> None:
     while True:
@@ -5972,16 +6114,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
             try:
+
                 stop_active_openvpn()
+                clear_last_connected_node()
+
                 with lock:
                     nodes = read_json(NODES_FILE, [])
                     for item in nodes:
                         item["active"] = False
                     write_json(NODES_FILE, nodes)
+
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
+
+                set_state(
+                    active_openvpn_node_id="",
+                    last_check_message="手动断开连接",
+                    active_node_latency="无活动连接",
+                )
+
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -6092,7 +6244,9 @@ def main() -> None:
     else:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    threading.Thread(target=collector_loop, daemon=True).start()
+
+
+    threading.Thread(target=startup_restore_then_collector, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=project_auto_update_loop, daemon=True).start()
