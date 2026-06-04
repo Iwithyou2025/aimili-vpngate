@@ -2041,6 +2041,7 @@ def connect_node(node_id: str) -> str:
             is_connecting=False,
             last_check_message=f"Connected {node_id}",
             active_node_latency=latency_str,
+            connected_at=time.time(),
         )
 
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
@@ -2763,7 +2764,7 @@ def restore_last_connected_node(max_attempts: int = 2) -> bool:
                 active_node_latency="正在恢复",
             )
 
-     
+
             print(f"[启动恢复] 第 {attempt}/{max_attempts} 次尝试重连: {node_id}", flush=True)
             connect_saved_node_without_quality_check(node_id)
 
@@ -4766,7 +4767,7 @@ function render(){
     }
   }
 
-
+ 
   const shown = getFilteredNodes();
   
   $("total").textContent=nodes.length; 
