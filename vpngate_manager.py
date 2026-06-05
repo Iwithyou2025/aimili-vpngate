@@ -686,6 +686,67 @@ def clear_last_connected_node() -> None:
             LAST_CONNECTED_NODE_FILE.unlink()
     except Exception:
         pass
+def format_switch_duration(seconds: Any) -> str:
+    """
+    节点切换耗时展示格式：xx时xx分xx秒
+    """
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+
+    return f"{hours:02d}时{minutes:02d}分{secs:02d}秒"
+
+
+def mark_node_switch_start(reason: str = "") -> None:
+    """
+    记录本轮节点切换开始时间。
+
+    注意：
+    如果已经存在开始时间，不重复覆盖。
+    这样连续切换多个失败节点时，统计的是：
+    第一次发现故障 -> 最终新节点测速达标 的总耗时。
+    """
+    state = read_json(STATE_FILE, {})
+
+    if state.get("node_switch_started_at"):
+        return
+
+    set_state(
+        node_switch_started_at=time.time(),
+        node_switch_reason=reason,
+    )
+
+
+def finish_node_switch_duration(reason: str = "") -> None:
+    """
+    新节点连接成功，并且质量 / 测速达标后，结算本轮切换耗时。
+    结果写入 state.json，所以服务重启后仍然显示上次耗时。
+    """
+    state = read_json(STATE_FILE, {})
+
+    try:
+        started_at = float(state.get("node_switch_started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+
+    if started_at <= 0:
+        return
+
+    finished_at = time.time()
+    duration_seconds = max(0, int(finished_at - started_at))
+
+    set_state(
+        node_switch_started_at=None,
+        last_node_switch_finished_at=finished_at,
+        last_node_switch_duration_seconds=duration_seconds,
+        last_node_switch_duration_text=format_switch_duration(duration_seconds),
+        last_node_switch_reason=reason or state.get("node_switch_reason", ""),
+    )
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -704,6 +765,11 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
+    state.setdefault("node_switch_started_at", None)
+    state.setdefault("last_node_switch_duration_seconds", 0)
+    state.setdefault("last_node_switch_duration_text", "-")
+    state.setdefault("last_node_switch_finished_at", None)
+    state.setdefault("last_node_switch_reason", "")
     state["quality_check_enabled"] = QUALITY_CHECK_ENABLED
     state["quality_max_fraud_score"] = QUALITY_MAX_FRAUD_SCORE
     state["quality_require_residential"] = QUALITY_REQUIRE_RESIDENTIAL
@@ -2549,6 +2615,8 @@ def connect_node_with_quality_check(node_id: str) -> str:
 
     print(f"[质量检测] 节点 {node_id} 已通过质量检测，保存为上次成功节点", flush=True)
     log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标，已保存为上次成功节点: {quality_info}")
+
+    finish_node_switch_duration(f"已切换到 {node_id}，IP质量与测速达标")
 
     set_state(last_check_message=f"Connected {node_id}; IP质量达标")
     return result
@@ -4705,6 +4773,7 @@ function render(){
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
               ${state.connected_at ? `<span style="margin-left: 12px;">持续时间: <strong id="conn_duration">-</strong></span>` : ''}
+              <span style="margin-left: 12px;">连接耗时: <strong>${esc(state.last_node_switch_duration_text || '-')}</strong></span>
             </div>
           </div>
         </div>
@@ -5674,6 +5743,11 @@ def background_proxy_checker() -> None:
                     proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                 )
 
+                if active_openvpn_node_id:
+                    mark_node_switch_start(
+                        f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                    )
+
                 if not active_openvpn_node_id:
                     time.sleep(30)
                     continue
@@ -6184,13 +6258,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
         elif effective_path == "/api/connect":
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                self.send_json({"ok": True, "message": connect_node_with_quality_check(str(payload.get("id") or ""))})
+
+                node_id = str(payload.get("id") or "")
+
+                # 手动点击“切换”也统计：
+                # 从点击切换开始，到新节点 IP 质量 / 测速达标结束。
+                if node_id:
+                    mark_node_switch_start(f"手动切换到 {node_id}")
+
+                self.send_json({
+                    "ok": True,
+                    "message": connect_node_with_quality_check(node_id)
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
         elif effective_path == "/api/test_node":
             try:
                 length = parse_int(self.headers.get("Content-Length"))
