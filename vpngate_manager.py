@@ -1023,37 +1023,14 @@ def touch_ip_uptime_seen_ip(ip: Any, node_id: str = "", reason: str = "") -> Non
 
 def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 10) -> list[dict[str, Any]]:
     """
-    构建最近 10 个 IP 连接时长图表。
+    构建最近 10 个已结束 IP 的连接时长图表。
 
-    包含：
-    - 已结束的 IP 记录；
-    - 当前正在使用的 IP，动态计算到当前时间。
+    注意：
+    - 当前正在连接的 IP 不显示；
+    - 当前 IP 只在后台继续计时；
+    - 等它断开 / 切换 / 不通 / 出口 IP 变化后，才会进入历史图表。
     """
     items = prune_ip_uptime_history(history, max_items)
-
-    current_ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
-
-    try:
-        started_at = float(state.get("current_ip_uptime_started_at") or 0)
-    except (TypeError, ValueError):
-        started_at = 0
-
-    if current_ip and started_at > 0:
-        now = time.time()
-        duration_seconds = max(0, int(now - started_at))
-
-        items.append({
-            "ip": current_ip,
-            "node_id": str(state.get("current_ip_uptime_node_id") or ""),
-            "started_at": started_at,
-            "ended_at": None,
-            "duration_seconds": duration_seconds,
-            "duration_text": format_ip_uptime_duration(duration_seconds),
-            "end_reason": "当前正在连接",
-            "active": True,
-        })
-
-    items = items[-max_items:]
 
     chart: list[dict[str, Any]] = []
 
@@ -1062,16 +1039,14 @@ def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 
         days = round(duration_seconds / 86400, 2)
 
         ip = normalize_uptime_ip(item.get("ip"))
-        active = bool(item.get("active"))
 
         chart.append({
             "index": index,
             "ip": ip,
-            "label": f"{ip}(当前)" if active else ip,
+            "label": ip,
             "days": days,
             "seconds": duration_seconds,
             "text": item.get("duration_text") or format_ip_uptime_duration(duration_seconds),
-            "active": active,
             "reason": item.get("end_reason") or "",
         })
 
@@ -4791,12 +4766,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     
     .ip-uptime-chart-wrap {
-      height: 260px;
+      height: 320px;
+      margin-bottom: 28px;
     }
     
     #ip_uptime_chart {
       width: 100%;
-      height: 260px;
+      height: 320px;
       display: block;
     }
     
@@ -4896,9 +4872,9 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="switch-chart-head switch-chart-head-secondary">
   <div>
-    <div class="switch-chart-title">最近 10 个 IP 连接时长</div>
+    <div class="switch-chart-title">最近 10 个(不含当前连接ip) IP 连接时长</div>
     <div class="switch-chart-subtitle">
-      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；当前 IP 会实时累计。
+      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；当前正在连接的 IP 不显示，结束后再进入统计。
     </div>
   </div>
   <div class="switch-chart-total">
@@ -5587,9 +5563,9 @@ function drawIpUptimeChart(){
   if (countEl) countEl.textContent = data.length;
 
   const wrapper = canvas.parentElement;
-  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 260 };
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 320 };
   const width = Math.max(640, Math.floor(rect.width || 900));
-  const height = Math.max(260, Math.floor(rect.height || 260));
+  const height = Math.max(320, Math.floor(rect.height || 320));
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = Math.floor(width * dpr);
@@ -5601,7 +5577,8 @@ function drawIpUptimeChart(){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const pad = { left: 50, right: 18, top: 18, bottom: 70 };
+  // bottom 加大，专门给倾斜 IP 标签留空间，避免压到下面的节点卡片
+  const pad = { left: 54, right: 22, top: 20, bottom: 100 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const baseY = pad.top + plotH;
@@ -5611,7 +5588,7 @@ function drawIpUptimeChart(){
     ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("暂无 IP 连接时长统计数据", width / 2, height / 2);
+    ctx.fillText("暂无已结束的 IP 连接时长统计数据", width / 2, height / 2);
     return;
   }
 
@@ -5652,17 +5629,9 @@ function drawIpUptimeChart(){
     const barH = Math.max(3, (days / maxY) * plotH);
     const y = baseY - barH;
 
-    const isActive = !!item.active;
-
     const gradient = ctx.createLinearGradient(0, y, 0, baseY);
-
-    if (isActive) {
-      gradient.addColorStop(0, "rgba(245, 158, 11, 0.96)");
-      gradient.addColorStop(1, "rgba(245, 158, 11, 0.48)");
-    } else {
-      gradient.addColorStop(0, "rgba(59, 130, 246, 0.92)");
-      gradient.addColorStop(1, "rgba(59, 130, 246, 0.42)");
-    }
+    gradient.addColorStop(0, "rgba(59, 130, 246, 0.92)");
+    gradient.addColorStop(1, "rgba(59, 130, 246, 0.42)");
 
     ctx.fillStyle = gradient;
 
@@ -5682,10 +5651,11 @@ function drawIpUptimeChart(){
     ctx.textAlign = "center";
     ctx.fillText(formatChartDay(days), x + barW / 2, Math.max(12, y - 12));
 
+    // IP 标签下移一点，并且底部空间已经加大，不会遮挡下面卡片
     ctx.save();
-    ctx.translate(x + barW / 2, height - 28);
+    ctx.translate(x + barW / 2, height - 42);
     ctx.rotate(-Math.PI / 10);
-    ctx.fillStyle = isActive ? "rgba(245, 158, 11, 0.95)" : "rgba(226, 232, 240, 0.70)";
+    ctx.fillStyle = "rgba(226, 232, 240, 0.72)";
     ctx.textAlign = "right";
     ctx.fillText(String(item.label || item.ip || index + 1), 0, 0);
     ctx.restore();
