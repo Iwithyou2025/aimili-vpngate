@@ -821,6 +821,261 @@ def build_switch_duration_chart(history: Any, max_items: int = 20) -> list[dict[
         })
 
     return chart
+def normalize_uptime_ip(ip: Any) -> str:
+    ip = str(ip or "").strip()
+    if not ip or ip in {"-", "0.0.0.0", "unknown", "None"}:
+        return ""
+    return ip
+
+
+def format_ip_uptime_duration(seconds: Any) -> str:
+    """
+    IP 连接时长展示：xx天 xx时 xx分
+    """
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
+
+    return f"{days}天 {hours}时 {minutes}分"
+
+
+def prune_ip_uptime_history(history: Any, max_items: int = 10) -> list[dict[str, Any]]:
+    """
+    只保留最近 max_items 个已结束的 IP 连接记录。
+    当前正在连接的 IP 不放进 history，而是在 build 图表时动态追加。
+    """
+    if not isinstance(history, list):
+        history = []
+
+    cleaned: list[dict[str, Any]] = []
+
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+
+        ip = normalize_uptime_ip(item.get("ip"))
+        if not ip:
+            continue
+
+        try:
+            started_at = float(item.get("started_at", 0) or 0)
+        except (TypeError, ValueError):
+            started_at = 0
+
+        try:
+            ended_at = float(item.get("ended_at", 0) or 0)
+        except (TypeError, ValueError):
+            ended_at = 0
+
+        try:
+            duration_seconds = max(0, int(item.get("duration_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            duration_seconds = 0
+
+        if duration_seconds <= 0 and started_at > 0 and ended_at > 0:
+            duration_seconds = max(0, int(ended_at - started_at))
+
+        cleaned.append({
+            "ip": ip,
+            "node_id": str(item.get("node_id") or ""),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": duration_seconds,
+            "duration_text": item.get("duration_text") or format_ip_uptime_duration(duration_seconds),
+            "end_reason": item.get("end_reason") or "",
+            "active": False,
+        })
+
+    return cleaned[-max_items:]
+
+
+def finish_current_ip_uptime(reason: str = "") -> None:
+    """
+    结束当前 IP 的连接时长统计。
+
+    触发场景：
+    - 节点确认不通
+    - 自动切换
+    - 手动切换
+    - 手动断开
+    - OpenVPN 进程异常退出
+    - 出口 IP 发生变化
+    """
+    state = read_json(STATE_FILE, {})
+
+    ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
+    if not ip:
+        return
+
+    try:
+        started_at = float(state.get("current_ip_uptime_started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+
+    if started_at <= 0:
+        return
+
+    ended_at = time.time()
+    duration_seconds = max(0, int(ended_at - started_at))
+
+    history = state.get("ip_uptime_history", [])
+    if not isinstance(history, list):
+        history = []
+
+    history.append({
+        "ip": ip,
+        "node_id": str(state.get("current_ip_uptime_node_id") or ""),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+        "duration_text": format_ip_uptime_duration(duration_seconds),
+        "end_reason": reason,
+        "active": False,
+    })
+
+    history = prune_ip_uptime_history(history, 10)
+
+    set_state(
+        current_ip_uptime_ip="",
+        current_ip_uptime_node_id="",
+        current_ip_uptime_started_at=None,
+        current_ip_uptime_last_seen_at=None,
+        current_ip_uptime_reason="",
+        ip_uptime_history=history,
+    )
+
+
+def begin_or_continue_ip_uptime(ip: Any, node_id: str = "", reason: str = "") -> None:
+    """
+    开始或续算当前出口 IP 的连接时间。
+
+    关键点：
+    - 如果 IP 没变，不重置 started_at；
+    - 所以服务重启后，只要恢复出来的出口 IP 一样，就会继续累计；
+    - 如果 IP 变了，先结算旧 IP，再从当前时间开始统计新 IP。
+    """
+    ip = normalize_uptime_ip(ip)
+    if not ip:
+        return
+
+    state = read_json(STATE_FILE, {})
+
+    old_ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
+
+    try:
+        old_started_at = float(state.get("current_ip_uptime_started_at") or 0)
+    except (TypeError, ValueError):
+        old_started_at = 0
+
+    now = time.time()
+
+    # IP 没变：只更新时间，不重置开始时间
+    if old_ip == ip and old_started_at > 0:
+        set_state(
+            current_ip_uptime_node_id=node_id or state.get("current_ip_uptime_node_id", ""),
+            current_ip_uptime_last_seen_at=now,
+            current_ip_uptime_reason=reason or state.get("current_ip_uptime_reason", ""),
+        )
+        return
+
+    # IP 变了：旧 IP 先结算
+    if old_ip and old_ip != ip and old_started_at > 0:
+        finish_current_ip_uptime(f"出口 IP 变化: {old_ip} -> {ip}")
+
+    set_state(
+        current_ip_uptime_ip=ip,
+        current_ip_uptime_node_id=node_id,
+        current_ip_uptime_started_at=now,
+        current_ip_uptime_last_seen_at=now,
+        current_ip_uptime_reason=reason,
+    )
+
+
+def touch_ip_uptime_seen_ip(ip: Any, node_id: str = "", reason: str = "") -> None:
+    """
+    后台健康检测看到当前出口 IP 时调用。
+
+    用途：
+    - IP 一样：刷新 last_seen；
+    - IP 不一样：说明同一连接期间出口 IP 变了，结算旧 IP，并记录新 IP。
+    """
+    ip = normalize_uptime_ip(ip)
+    if not ip:
+        return
+
+    state = read_json(STATE_FILE, {})
+    current_ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
+
+    if not current_ip:
+        return
+
+    begin_or_continue_ip_uptime(
+        ip,
+        node_id=node_id,
+        reason=reason or "后台健康检测确认出口 IP",
+    )
+
+
+def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 10) -> list[dict[str, Any]]:
+    """
+    构建最近 10 个 IP 连接时长图表。
+
+    包含：
+    - 已结束的 IP 记录；
+    - 当前正在使用的 IP，动态计算到当前时间。
+    """
+    items = prune_ip_uptime_history(history, max_items)
+
+    current_ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
+
+    try:
+        started_at = float(state.get("current_ip_uptime_started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+
+    if current_ip and started_at > 0:
+        now = time.time()
+        duration_seconds = max(0, int(now - started_at))
+
+        items.append({
+            "ip": current_ip,
+            "node_id": str(state.get("current_ip_uptime_node_id") or ""),
+            "started_at": started_at,
+            "ended_at": None,
+            "duration_seconds": duration_seconds,
+            "duration_text": format_ip_uptime_duration(duration_seconds),
+            "end_reason": "当前正在连接",
+            "active": True,
+        })
+
+    items = items[-max_items:]
+
+    chart: list[dict[str, Any]] = []
+
+    for index, item in enumerate(items, start=1):
+        duration_seconds = max(0, int(item.get("duration_seconds", 0) or 0))
+        days = round(duration_seconds / 86400, 2)
+
+        ip = normalize_uptime_ip(item.get("ip"))
+        active = bool(item.get("active"))
+
+        chart.append({
+            "index": index,
+            "ip": ip,
+            "label": f"{ip}(当前)" if active else ip,
+            "days": days,
+            "seconds": duration_seconds,
+            "text": item.get("duration_text") or format_ip_uptime_duration(duration_seconds),
+            "active": active,
+            "reason": item.get("end_reason") or "",
+        })
+
+    return chart
 
 def build_auto_switch_daily_chart(
         counts: dict[str, Any] | None = None,
@@ -938,6 +1193,24 @@ def get_state() -> dict[str, Any]:
         state["node_switch_duration_history"],
         20,
     )
+    state.setdefault("ip_uptime_history", [])
+    state.setdefault("current_ip_uptime_ip", "")
+    state.setdefault("current_ip_uptime_node_id", "")
+    state.setdefault("current_ip_uptime_started_at", None)
+    state.setdefault("current_ip_uptime_last_seen_at", None)
+    state.setdefault("current_ip_uptime_reason", "")
+
+    state["ip_uptime_history"] = prune_ip_uptime_history(
+        state.get("ip_uptime_history", []),
+        10,
+    )
+
+    state["ip_uptime_chart"] = build_ip_uptime_chart(
+        state["ip_uptime_history"],
+        state,
+        10,
+    )
+
     state.setdefault("auto_switch_daily_counts", {})
     state.setdefault("last_auto_switch_recorded_at", None)
     state.setdefault("last_auto_switch_node_id", "")
@@ -2178,6 +2451,7 @@ def auto_switch_node(
 
     print(f"[自动切换] {msg}", flush=True)
     log_to_json("WARNING", "VPN", msg)
+    finish_current_ip_uptime(msg)
     stop_active_openvpn()
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -2202,10 +2476,16 @@ def auto_switch_node(
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
+
+    previous_node_id = ""
+
     with lock:
         if is_connecting:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
             return "Already connecting"
+
+        previous_node_id = active_openvpn_node_id
+
         is_connecting = True
         active_openvpn_node_id = node_id
         set_state(active_openvpn_node_id=node_id, is_connecting=True, active_node_latency="正在连接", last_check_message="正在初始化连接配置...")
@@ -2216,8 +2496,12 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
-        
+
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
+
+        if previous_node_id and previous_node_id != node_id:
+            finish_current_ip_uptime(f"准备切换节点: {previous_node_id} -> {node_id}")
+
         stop_active_openvpn()
 
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
@@ -2242,6 +2526,7 @@ def connect_node(node_id: str) -> str:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
+            finish_current_ip_uptime(f"连接节点 {node_id} 失败: {message}")
             set_state(
                 active_openvpn_node_id="",
                 is_connecting=False,
@@ -2797,11 +3082,13 @@ def connect_node_with_quality_check(node_id: str) -> str:
         reason = f"IP质量检测异常: {exc}"
         update_node_quality(node_id, {}, False, reason)
         set_state(proxy_quality_ok=False, proxy_quality_error=reason)
+        finish_current_ip_uptime(reason)
         stop_active_openvpn()
         raise QualityCheckFailed(reason) from exc
 
     if not passed:
         log_to_json("WARNING", "Quality", f"节点 {node_id} IP质量不达标: {reason}")
+        finish_current_ip_uptime(f"IP质量或测速不达标: {reason}")
         stop_active_openvpn()
         raise QualityCheckFailed(reason)
 
@@ -2813,7 +3100,21 @@ def connect_node_with_quality_check(node_id: str) -> str:
     print(f"[质量检测] 节点 {node_id} 已通过质量检测，保存为上次成功节点", flush=True)
     log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标，已保存为上次成功节点: {quality_info}")
 
+
     finish_node_switch_duration(f"已切换到 {node_id}，IP质量与测速达标")
+
+    exit_ip = (
+            quality_info.get("ip")
+            or quality_info.get("ipapi_ip")
+            or read_json(STATE_FILE, {}).get("proxy_ip")
+            or ""
+    )
+
+    begin_or_continue_ip_uptime(
+        exit_ip,
+        node_id=node_id,
+        reason="IP质量与测速达标，开始统计连接时间",
+    )
 
     set_state(last_check_message=f"Connected {node_id}; IP质量达标")
     return result
@@ -2840,7 +3141,7 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
             proxy_error=reason,
             last_check_message=f"恢复上次节点失败: {reason}",
         )
-
+        finish_current_ip_uptime(f"启动恢复上次节点失败: {reason}")
         stop_active_openvpn()
         raise RuntimeError(reason)
 
@@ -2850,6 +3151,12 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
         proxy_latency_ms=res.get("latency_ms", 0),
         proxy_error="",
         last_check_message=f"已恢复上次节点: {node_id}",
+    )
+
+    begin_or_continue_ip_uptime(
+        res.get("ip", ""),
+        node_id=node_id,
+        reason="启动恢复上次已达标节点，继续统计连接时间",
     )
 
     print(f"[启动恢复] 上次节点 7928 出站检测通过: {node_id}", flush=True)
@@ -2865,12 +3172,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
     try:
         if force:
             with lock:
+                finish_current_ip_uptime("手动更新节点，关闭当前连接")
                 stop_active_openvpn()
         elif not active_openvpn_running():
             has_active_id = False
             with lock:
                 if active_openvpn_node_id:
                     has_active_id = True
+                    finish_current_ip_uptime("当前 OpenVPN 进程已意外退出")
                     stop_active_openvpn()
             if has_active_id:
                 print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
@@ -4481,6 +4790,16 @@ INDEX_HTML = r"""<!doctype html>
       transform: translateX(22px);
     }
     
+    .ip-uptime-chart-wrap {
+      height: 260px;
+    }
+    
+    #ip_uptime_chart {
+      width: 100%;
+      height: 260px;
+      display: block;
+    }
+    
   </style>
 </head>
 <body>
@@ -4571,6 +4890,24 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="switch-chart-wrap">
   <canvas id="switch_duration_chart"></canvas>
+</div>
+
+<div class="switch-chart-divider"></div>
+
+<div class="switch-chart-head switch-chart-head-secondary">
+  <div>
+    <div class="switch-chart-title">最近 10 个 IP 连接时长</div>
+    <div class="switch-chart-subtitle">
+      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；当前 IP 会实时累计。
+    </div>
+  </div>
+  <div class="switch-chart-total">
+    已记录：<strong id="ip_uptime_count">0</strong> 个 IP
+  </div>
+</div>
+
+<div class="switch-chart-wrap ip-uptime-chart-wrap">
+  <canvas id="ip_uptime_chart"></canvas>
 </div>
 
   <!-- 当前连接活动节点卡片 -->
@@ -5226,6 +5563,135 @@ function drawSwitchDurationChart(){
   });
 }
 
+function formatChartDay(value){
+  const n = Number(value) || 0;
+
+  if (n >= 10) {
+    return String(Math.round(n));
+  }
+
+  if (n >= 1) {
+    return n.toFixed(1).replace(/\.0$/, "");
+  }
+
+  return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function drawIpUptimeChart(){
+  const canvas = $("ip_uptime_chart");
+  if (!canvas) return;
+
+  const data = Array.isArray(state.ip_uptime_chart) ? state.ip_uptime_chart : [];
+
+  const countEl = $("ip_uptime_count");
+  if (countEl) countEl.textContent = data.length;
+
+  const wrapper = canvas.parentElement;
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 260 };
+  const width = Math.max(640, Math.floor(rect.width || 900));
+  const height = Math.max(260, Math.floor(rect.height || 260));
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = "100%";
+  canvas.style.height = height + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const pad = { left: 50, right: 18, top: 18, bottom: 70 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const baseY = pad.top + plotH;
+
+  if (!data.length) {
+    ctx.font = "13px Outfit, sans-serif";
+    ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("暂无 IP 连接时长统计数据", width / 2, height / 2);
+    return;
+  }
+
+  const values = data.map(item => Number(item.days) || 0);
+  const maxValue = Math.max(0, ...values);
+  const maxY = Math.max(1, Math.ceil((maxValue * 1.2 || 1)));
+
+  ctx.font = "12px Outfit, sans-serif";
+  ctx.textBaseline = "middle";
+
+  for (let i = 0; i <= 5; i++) {
+    const value = maxY - (maxY / 5) * i;
+    const y = pad.top + (plotH / 5) * i;
+
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
+    ctx.textAlign = "right";
+    ctx.fillText(formatChartDay(value), pad.left - 10, y);
+  }
+
+  ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+  ctx.textAlign = "left";
+  ctx.fillText("天数", pad.left, 10);
+
+  const slotW = plotW / data.length;
+  const barW = Math.max(14, Math.min(58, slotW * 0.56));
+
+  data.forEach((item, index) => {
+    const days = Number(item.days) || 0;
+
+    const x = pad.left + index * slotW + (slotW - barW) / 2;
+    const barH = Math.max(3, (days / maxY) * plotH);
+    const y = baseY - barH;
+
+    const isActive = !!item.active;
+
+    const gradient = ctx.createLinearGradient(0, y, 0, baseY);
+
+    if (isActive) {
+      gradient.addColorStop(0, "rgba(245, 158, 11, 0.96)");
+      gradient.addColorStop(1, "rgba(245, 158, 11, 0.48)");
+    } else {
+      gradient.addColorStop(0, "rgba(59, 130, 246, 0.92)");
+      gradient.addColorStop(1, "rgba(59, 130, 246, 0.42)");
+    }
+
+    ctx.fillStyle = gradient;
+
+    const radius = 7;
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + barW - radius, y);
+    ctx.quadraticCurveTo(x + barW, y, x + barW, y + radius);
+    ctx.lineTo(x + barW, baseY);
+    ctx.lineTo(x, baseY);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.88)";
+    ctx.textAlign = "center";
+    ctx.fillText(formatChartDay(days), x + barW / 2, Math.max(12, y - 12));
+
+    ctx.save();
+    ctx.translate(x + barW / 2, height - 28);
+    ctx.rotate(-Math.PI / 10);
+    ctx.fillStyle = isActive ? "rgba(245, 158, 11, 0.95)" : "rgba(226, 232, 240, 0.70)";
+    ctx.textAlign = "right";
+    ctx.fillText(String(item.label || item.ip || index + 1), 0, 0);
+    ctx.restore();
+  });
+}
+
 function stableSortNodes() {
   nodes.sort((a, b) => {
     if ((b.score || 0) !== (a.score || 0)) {
@@ -5347,8 +5813,9 @@ function render(){
     }
   }
 
-  drawAutoSwitchChart();
-  drawSwitchDurationChart();
+    drawAutoSwitchChart();
+    drawSwitchDurationChart();
+    drawIpUptimeChart();
   
   const shown = getFilteredNodes();
   
@@ -6056,6 +6523,10 @@ window.addEventListener("resize", () => {
       if (typeof drawSwitchDurationChart === "function") {
         drawSwitchDurationChart();
       }
+
+      if (typeof drawIpUptimeChart === "function") {
+        drawIpUptimeChart();
+      }
     }
   }, 150);
 });
@@ -6276,8 +6747,18 @@ def background_proxy_checker() -> None:
                     proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                 )
 
+                touch_ip_uptime_seen_ip(
+                    res.get("ip", ""),
+                    node_id=active_openvpn_node_id,
+                    reason="后台健康检测确认出口 IP",
+                )
+
                 if active_openvpn_node_id:
                     mark_node_switch_start(
+                        f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                    )
+
+                    finish_current_ip_uptime(
                         f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
                     )
 
@@ -6768,7 +7249,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
             try:
-
+                finish_current_ip_uptime("手动断开连接")
                 stop_active_openvpn()
                 clear_last_connected_node()
 
