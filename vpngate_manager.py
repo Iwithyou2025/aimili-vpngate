@@ -740,14 +740,88 @@ def finish_node_switch_duration(reason: str = "") -> None:
 
     finished_at = time.time()
     duration_seconds = max(0, int(finished_at - started_at))
+    duration_text = format_switch_duration(duration_seconds)
+    duration_reason = reason or state.get("node_switch_reason", "")
+
+    history = state.get("node_switch_duration_history", [])
+    if not isinstance(history, list):
+        history = []
+
+    history.append({
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+        "duration_text": duration_text,
+        "reason": duration_reason,
+    })
+
+    history = prune_switch_duration_history(history, 20)
 
     set_state(
         node_switch_started_at=None,
         last_node_switch_finished_at=finished_at,
         last_node_switch_duration_seconds=duration_seconds,
-        last_node_switch_duration_text=format_switch_duration(duration_seconds),
-        last_node_switch_reason=reason or state.get("node_switch_reason", ""),
+        last_node_switch_duration_text=duration_text,
+        last_node_switch_reason=duration_reason,
+        node_switch_duration_history=history,
     )
+
+
+def prune_switch_duration_history(history: Any, max_items: int = 20) -> list[dict[str, Any]]:
+    """
+    只保留最近 max_items 次切换耗时记录。
+    """
+    if not isinstance(history, list):
+        history = []
+
+    cleaned: list[dict[str, Any]] = []
+
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            duration_seconds = max(0, int(item.get("duration_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            duration_seconds = 0
+
+        try:
+            finished_at = float(item.get("finished_at", 0) or 0)
+        except (TypeError, ValueError):
+            finished_at = 0
+
+        cleaned.append({
+            "finished_at": finished_at,
+            "duration_seconds": duration_seconds,
+            "duration_text": item.get("duration_text") or format_switch_duration(duration_seconds),
+            "reason": item.get("reason") or "",
+        })
+
+    return cleaned[-max_items:]
+
+
+def build_switch_duration_chart(history: Any, max_items: int = 20) -> list[dict[str, Any]]:
+    """
+    构建最近 20 次切换耗时图表数据。
+    横轴：次数，从远到近 1、2、3...
+    竖轴：分钟数。
+    """
+    items = prune_switch_duration_history(history, max_items)
+    chart: list[dict[str, Any]] = []
+
+    for index, item in enumerate(items, start=1):
+        duration_seconds = int(item.get("duration_seconds", 0) or 0)
+        minutes = round(duration_seconds / 60, 2)
+
+        chart.append({
+            "index": index,
+            "label": str(index),
+            "minutes": minutes,
+            "seconds": duration_seconds,
+            "text": item.get("duration_text") or format_switch_duration(duration_seconds),
+        })
+
+    return chart
+
 def build_auto_switch_daily_chart(
         counts: dict[str, Any] | None = None,
         days: int = 15,
@@ -853,6 +927,17 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_node_switch_duration_text", "-")
     state.setdefault("last_node_switch_finished_at", None)
     state.setdefault("last_node_switch_reason", "")
+    state.setdefault("node_switch_duration_history", [])
+
+    state["node_switch_duration_history"] = prune_switch_duration_history(
+        state.get("node_switch_duration_history", []),
+        20,
+    )
+
+    state["switch_duration_chart"] = build_switch_duration_chart(
+        state["node_switch_duration_history"],
+        20,
+    )
     state.setdefault("auto_switch_daily_counts", {})
     state.setdefault("last_auto_switch_recorded_at", None)
     state.setdefault("last_auto_switch_node_id", "")
@@ -3883,6 +3968,21 @@ INDEX_HTML = r"""<!doctype html>
       height: 220px;
       display: block;
     }
+    .switch-chart-divider {
+      height: 1px;
+      background: rgba(148, 163, 184, 0.12);
+      margin: 22px 0 18px;
+    }
+    
+    .switch-chart-head-secondary {
+      margin-top: 0;
+    }
+    
+    #switch_duration_chart {
+      width: 100%;
+      height: 220px;
+      display: block;
+    }
 
     .toolbar {
       background: var(--bg-surface);
@@ -4380,6 +4480,7 @@ INDEX_HTML = r"""<!doctype html>
     .toggle-switch input:checked + .toggle-slider:before {
       transform: translateX(22px);
     }
+    
   </style>
 </head>
 <body>
@@ -4453,6 +4554,24 @@ INDEX_HTML = r"""<!doctype html>
     <canvas id="auto_switch_chart"></canvas>
   </div>
 </section>
+
+<div class="switch-chart-divider"></div>
+
+<div class="switch-chart-head switch-chart-head-secondary">
+  <div>
+    <div class="switch-chart-title">最近 20 次节点切换耗时</div>
+    <div class="switch-chart-subtitle">
+      统计每次节点不可用后，到新节点连接成功并测速达标的耗时；横轴从远到近显示，竖轴单位为分钟。
+    </div>
+  </div>
+  <div class="switch-chart-total">
+    已记录：<strong id="switch_duration_count">0</strong> 次
+  </div>
+</div>
+
+<div class="switch-chart-wrap">
+  <canvas id="switch_duration_chart"></canvas>
+</div>
 
   <!-- 当前连接活动节点卡片 -->
   <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
@@ -4991,6 +5110,121 @@ function drawAutoSwitchChart(){
     ctx.fillText(p.label, p.x, height - 14);
   });
 }
+function formatChartMinute(value){
+  const n = Number(value) || 0;
+
+  if (n >= 10) {
+    return String(Math.round(n));
+  }
+
+  if (n >= 1) {
+    return n.toFixed(1).replace(/\.0$/, "");
+  }
+
+  return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function drawSwitchDurationChart(){
+  const canvas = $("switch_duration_chart");
+  if (!canvas) return;
+
+  const data = Array.isArray(state.switch_duration_chart) ? state.switch_duration_chart : [];
+
+  const countEl = $("switch_duration_count");
+  if (countEl) countEl.textContent = data.length;
+
+  const wrapper = canvas.parentElement;
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 220 };
+  const width = Math.max(640, Math.floor(rect.width || 900));
+  const height = Math.max(220, Math.floor(rect.height || 220));
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = "100%";
+  canvas.style.height = height + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const pad = { left: 48, right: 18, top: 18, bottom: 34 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const baseY = pad.top + plotH;
+
+  if (!data.length) {
+    ctx.font = "13px Outfit, sans-serif";
+    ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("暂无切换耗时统计数据", width / 2, height / 2);
+    return;
+  }
+
+  const values = data.map(item => Number(item.minutes) || 0);
+  const maxValue = Math.max(0, ...values);
+  const maxY = Math.max(1, Math.ceil((maxValue * 1.2 || 1) * 10) / 10);
+
+  ctx.font = "12px Outfit, sans-serif";
+  ctx.textBaseline = "middle";
+
+  for (let i = 0; i <= 4; i++) {
+    const value = maxY - (maxY / 4) * i;
+    const y = pad.top + (plotH / 4) * i;
+
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
+    ctx.textAlign = "right";
+    ctx.fillText(formatChartMinute(value), pad.left - 10, y);
+  }
+
+  ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+  ctx.textAlign = "left";
+  ctx.fillText("分钟", pad.left, 10);
+
+  const gap = 8;
+  const barW = Math.max(10, Math.min(42, (plotW - gap * (data.length - 1)) / data.length));
+
+  data.forEach((item, index) => {
+    const minutes = Number(item.minutes) || 0;
+
+    const x = pad.left + index * ((plotW) / data.length) + ((plotW / data.length) - barW) / 2;
+    const barH = Math.max(2, (minutes / maxY) * plotH);
+    const y = baseY - barH;
+
+    const gradient = ctx.createLinearGradient(0, y, 0, baseY);
+    gradient.addColorStop(0, "rgba(99, 102, 241, 0.92)");
+    gradient.addColorStop(1, "rgba(99, 102, 241, 0.42)");
+
+    ctx.fillStyle = gradient;
+
+    const radius = 7;
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + barW - radius, y);
+    ctx.quadraticCurveTo(x + barW, y, x + barW, y + radius);
+    ctx.lineTo(x + barW, baseY);
+    ctx.lineTo(x, baseY);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.88)";
+    ctx.textAlign = "center";
+    ctx.fillText(formatChartMinute(minutes), x + barW / 2, Math.max(12, y - 12));
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.70)";
+    ctx.fillText(String(item.label || index + 1), x + barW / 2, height - 14);
+  });
+}
 
 function stableSortNodes() {
   nodes.sort((a, b) => {
@@ -5114,6 +5348,7 @@ function render(){
   }
 
   drawAutoSwitchChart();
+  drawSwitchDurationChart();
   
   const shown = getFilteredNodes();
   
@@ -5813,7 +6048,15 @@ window.addEventListener("resize", () => {
   }
 
   window._switchChartResizeTimer = setTimeout(() => {
-    drawAutoSwitchChart();
+    if (typeof state !== "undefined") {
+      if (typeof drawAutoSwitchChart === "function") {
+        drawAutoSwitchChart();
+      }
+
+      if (typeof drawSwitchDurationChart === "function") {
+        drawSwitchDurationChart();
+      }
+    }
   }, 150);
 });
 
