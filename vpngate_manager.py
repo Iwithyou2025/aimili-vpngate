@@ -22,6 +22,7 @@ from typing import Any
 import concurrent.futures
 import sys
 import uuid
+from datetime import date, timedelta
 
 # Force socket to resolve IPv4 only to avoid slow AAAA (IPv6) DNS resolution timeouts (e.g. in WSL)
 _orig_getaddrinfo = socket.getaddrinfo
@@ -747,6 +748,88 @@ def finish_node_switch_duration(reason: str = "") -> None:
         last_node_switch_duration_text=format_switch_duration(duration_seconds),
         last_node_switch_reason=reason or state.get("node_switch_reason", ""),
     )
+def build_auto_switch_daily_chart(
+        counts: dict[str, Any] | None = None,
+        days: int = 15,
+) -> list[dict[str, Any]]:
+    """
+    生成最近 15 个完整自然日的自动切换统计。
+    注意：截止到昨日，不包含今天。
+    """
+    counts = counts or {}
+    today = date.today()
+    chart: list[dict[str, Any]] = []
+
+    for offset in range(days, 0, -1):
+        day = today - timedelta(days=offset)
+        key = day.isoformat()
+
+        try:
+            count = max(0, int(counts.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            count = 0
+
+        chart.append({
+            "date": key,
+            "label": f"{day.month}/{day.day}",
+            "count": count,
+        })
+
+    return chart
+
+
+def prune_auto_switch_daily_counts(counts: dict[str, Any]) -> dict[str, int]:
+    """
+    只保留今天 + 最近 15 个完整自然日。
+    前端只展示截止昨日的 15 日；今天的数据先保留，明天再进入图表。
+    """
+    today = date.today()
+    keep = {
+        (today - timedelta(days=offset)).isoformat()
+        for offset in range(0, 16)
+    }
+
+    pruned: dict[str, int] = {}
+
+    for key in sorted(keep):
+        try:
+            value = max(0, int(counts.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            value = 0
+
+        if value > 0:
+            pruned[key] = value
+
+    return pruned
+
+
+def record_auto_node_switch(node_id: str = "", reason: str = "") -> None:
+    """
+    记录自动更换节点次数。
+    手动 /api/connect 不调用此函数，所以不会被统计。
+    """
+    state = read_json(STATE_FILE, {})
+
+    counts = state.get("auto_switch_daily_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+
+    today_key = date.today().isoformat()
+
+    try:
+        current = max(0, int(counts.get(today_key, 0) or 0))
+    except (TypeError, ValueError):
+        current = 0
+
+    counts[today_key] = current + 1
+    counts = prune_auto_switch_daily_counts(counts)
+
+    set_state(
+        auto_switch_daily_counts=counts,
+        last_auto_switch_recorded_at=time.time(),
+        last_auto_switch_node_id=node_id,
+        last_auto_switch_reason=reason,
+    )
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -770,6 +853,20 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_node_switch_duration_text", "-")
     state.setdefault("last_node_switch_finished_at", None)
     state.setdefault("last_node_switch_reason", "")
+    state.setdefault("auto_switch_daily_counts", {})
+    state.setdefault("last_auto_switch_recorded_at", None)
+    state.setdefault("last_auto_switch_node_id", "")
+    state.setdefault("last_auto_switch_reason", "")
+
+    counts = state.get("auto_switch_daily_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+
+    state["auto_switch_daily_counts"] = prune_auto_switch_daily_counts(counts)
+    state["auto_switch_chart"] = build_auto_switch_daily_chart(
+        state["auto_switch_daily_counts"]
+    )
+
     state["quality_check_enabled"] = QUALITY_CHECK_ENABLED
     state["quality_max_fraud_score"] = QUALITY_MAX_FRAUD_SCORE
     state["quality_require_residential"] = QUALITY_REQUIRE_RESIDENTIAL
@@ -1941,9 +2038,10 @@ def get_auto_switch_candidates(
 
 
 def auto_switch_node(
-    attempt: int = 0,
-    country_code: str = "",
-    attempted_ids: set[str] | None = None,
+        attempt: int = 0,
+        country_code: str = "",
+        attempted_ids: set[str] | None = None,
+        record_switch: bool = False,
 ) -> None:
     attempted_ids = attempted_ids or set()
 
@@ -1969,12 +2067,23 @@ def auto_switch_node(
 
         try:
             connect_node_with_quality_check(next_node["id"])
+            if record_switch:
+                record_auto_node_switch(
+                    str(next_node.get("id") or ""),
+                    "自动切换成功",
+                )
             return
+
         except Exception as e:
             err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，继续尝试下一个"
             print(f"[自动切换] {err_msg}", flush=True)
             log_to_json("WARNING", "VPN", err_msg)
-            auto_switch_node(attempt + 1, target_country, attempted_ids)
+            auto_switch_node(
+                attempt + 1,
+                target_country,
+                attempted_ids,
+                record_switch=record_switch,
+                )
             return
 
     if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
@@ -1996,7 +2105,10 @@ def auto_switch_node(
         try:
             maintain_valid_nodes(force=False)
             # 补齐后仍优先在原国家内继续尝试
-            auto_switch_node(country_code=target_country)
+            auto_switch_node(
+                country_code=target_country,
+                record_switch=record_switch,
+            )
         except Exception as e:
             print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
 
@@ -2678,7 +2790,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if has_active_id:
                 print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                 is_connecting = False
-                auto_switch_node()
+                auto_switch_node(record_switch=True)
                 is_connecting = True
 
         try:
@@ -3711,6 +3823,66 @@ INDEX_HTML = r"""<!doctype html>
       color: #a5b4fc;
       text-decoration: underline;
     }
+    
+    .switch-chart-section {
+      background: var(--bg-surface);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    
+    .switch-chart-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    
+    .switch-chart-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+    
+    .switch-chart-subtitle {
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    
+    .switch-chart-total {
+      font-size: 13px;
+      color: var(--text-secondary);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px;
+      padding: 8px 12px;
+      white-space: nowrap;
+    }
+    
+    .switch-chart-total strong {
+      color: var(--text-primary);
+      font-size: 18px;
+      margin: 0 3px;
+    }
+    
+    .switch-chart-wrap {
+      position: relative;
+      width: 100%;
+      height: 220px;
+    }
+    
+    #auto_switch_chart {
+      width: 100%;
+      height: 220px;
+      display: block;
+    }
 
     .toolbar {
       background: var(--bg-surface);
@@ -4264,33 +4436,23 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-  <section class="ad-section">
-    <div class="ad-card">
-      <div class="ad-title">
-        <span class="ad-badge">推荐</span> <strong>购买高性价比 VPS 搭建节点或用作客户端</strong>
-      </div>
-      <div class="ad-links">
-        <div class="ad-item">
-          <span class="ad-tag tag-normal">普通用户推荐</span>
-          <span class="ad-desc">RackNerd - 超低折扣价格，日常使用实惠方便，海外多机房可选，推荐普通家庭或低频用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-opt">网络优化推荐</span>
-          <span class="ad-desc">VMiss - 专线优化网络 (CN2 GIA/9929/CMIN2 等顶级线路)，低延迟不丢包，推荐高网络要求用户。</span>
-          <a href="https://app.vmiss.com/aff.php?aff=4619" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-        <div class="ad-item">
-          <span class="ad-tag tag-premium">高端企业推荐</span>
-          <span class="ad-desc">BandwagonHost (搬瓦工) - 直连三网顶级专线，经典高带宽 CN2 GIA 线路，超凡稳定速度。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="ad-btn">点击进入官网</a>
-        </div>
-      </div>
-      <div class="ad-footer">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
+ <section class="switch-chart-section">
+  <div class="switch-chart-head">
+    <div>
+      <div class="switch-chart-title">每日自动更换节点次数</div>
+      <div class="switch-chart-subtitle">
+        统计范围：每日 00:00 ~ 24:00；仅统计自动切换，不统计手动切换；数据截止昨日，显示最近 15 日。
       </div>
     </div>
-  </section>
+    <div class="switch-chart-total">
+      15日合计：<strong id="auto_switch_total">0</strong> 次
+    </div>
+  </div>
+
+  <div class="switch-chart-wrap">
+    <canvas id="auto_switch_chart"></canvas>
+  </div>
+</section>
 
   <!-- 当前连接活动节点卡片 -->
   <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
@@ -4715,6 +4877,121 @@ function getFilteredNodes() {
   });
 }
 
+function drawAutoSwitchChart(){
+  const canvas = $("auto_switch_chart");
+  if (!canvas) return;
+
+  const data = Array.isArray(state.auto_switch_chart) ? state.auto_switch_chart : [];
+  const total = data.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
+
+  const totalEl = $("auto_switch_total");
+  if (totalEl) totalEl.textContent = total;
+
+  const wrapper = canvas.parentElement;
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 220 };
+  const width = Math.max(640, Math.floor(rect.width || 900));
+  const height = Math.max(220, Math.floor(rect.height || 220));
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = "100%";
+  canvas.style.height = height + "px";
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const pad = { left: 42, right: 18, top: 16, bottom: 34 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const baseY = pad.top + plotH;
+
+  const counts = data.map(item => Number(item.count) || 0);
+  const maxCount = Math.max(0, ...counts);
+  const maxY = Math.max(5, Math.ceil((maxCount * 1.15 || 5) / 5) * 5);
+
+  ctx.font = "12px Outfit, sans-serif";
+  ctx.textBaseline = "middle";
+
+  for (let i = 0; i <= 4; i++) {
+    const value = Math.round(maxY - (maxY / 4) * i);
+    const y = pad.top + (plotH / 4) * i;
+
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(width - pad.right, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
+    ctx.textAlign = "right";
+    ctx.fillText(String(value), pad.left - 10, y);
+  }
+
+  const points = data.map((item, index) => {
+    const x = data.length === 1
+      ? pad.left + plotW / 2
+      : pad.left + (plotW / (data.length - 1)) * index;
+
+    const y = baseY - ((Number(item.count) || 0) / maxY) * plotH;
+
+    return {
+      x,
+      y,
+      count: Number(item.count) || 0,
+      label: item.label || item.date || ""
+    };
+  });
+
+  if (!points.length) {
+    ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+    ctx.textAlign = "center";
+    ctx.fillText("暂无自动切换统计数据", width / 2, height / 2);
+    return;
+  }
+
+  const gradient = ctx.createLinearGradient(0, pad.top, 0, baseY);
+  gradient.addColorStop(0, "rgba(99, 102, 241, 0.88)");
+  gradient.addColorStop(1, "rgba(99, 102, 241, 0.28)");
+
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, baseY);
+  points.forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.lineTo(points[points.length - 1].x, baseY);
+  ctx.closePath();
+  ctx.fillStyle = gradient;
+  ctx.fill();
+
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    if (i === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  });
+  ctx.strokeStyle = "rgba(129, 140, 248, 1)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  points.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(99, 102, 241, 1)";
+    ctx.fill();
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(248, 250, 252, 0.95)";
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.88)";
+    ctx.textAlign = "center";
+    ctx.fillText(String(p.count), p.x, Math.max(10, p.y - 16));
+
+    ctx.fillStyle = "rgba(226, 232, 240, 0.70)";
+    ctx.fillText(p.label, p.x, height - 14);
+  });
+}
+
 function stableSortNodes() {
   nodes.sort((a, b) => {
     if ((b.score || 0) !== (a.score || 0)) {
@@ -4836,7 +5113,8 @@ function render(){
     }
   }
 
- 
+  drawAutoSwitchChart();
+  
   const shown = getFilteredNodes();
   
   $("total").textContent=nodes.length; 
@@ -5527,6 +5805,18 @@ async function logoutAdmin() {
   }
 }
 
+
+
+window.addEventListener("resize", () => {
+  if (window._switchChartResizeTimer) {
+    clearTimeout(window._switchChartResizeTimer);
+  }
+
+  window._switchChartResizeTimer = setTimeout(() => {
+    drawAutoSwitchChart();
+  }, 150);
+});
+
 // 页面加载时自动初始化数据
 load();
 
@@ -5782,7 +6072,7 @@ def background_proxy_checker() -> None:
                         active_node["probed_at"] = time.time()
                         write_json(NODES_FILE, nodes)
 
-                auto_switch_node()
+                auto_switch_node(record_switch=True)
 
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
