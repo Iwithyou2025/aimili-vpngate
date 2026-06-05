@@ -5324,7 +5324,7 @@ function render(){
       const h = Math.floor((s % 86400) / 3600);
       const m = Math.floor((s % 3600) / 60);
       const sec = s % 60;
-      return d + '天 ' + h + '时 ' + m + '分 ' + sec + '秒';
+      return d +  '天 ' + h +  '时 ' + m +  '分 ' + sec +  '秒';
     }
 
     function _updateDur() {
