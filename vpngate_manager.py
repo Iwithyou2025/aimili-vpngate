@@ -3695,7 +3695,7 @@ INDEX_HTML = r"""<!doctype html>
     
     .active-card-meta {
       display: flex;
-      gap: 16px;
+      gap: 20px;
       font-size: 13px;
       color: var(--text-secondary);
       flex-wrap: wrap;
