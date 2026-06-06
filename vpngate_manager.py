@@ -5968,7 +5968,7 @@ function drawSwitchDurationChart(){
 
     // 柱底：切换完成后的系统时间
     ctx.save();
-    ctx.translate(x + barW / 2 + 20, height - 56);
+    ctx.translate(x + barW / 2 + 25, height - 56);
     ctx.rotate(-Math.PI / 5);
     ctx.fillStyle = "rgba(226, 232, 240, 0.70)";
     ctx.textAlign = "right";
