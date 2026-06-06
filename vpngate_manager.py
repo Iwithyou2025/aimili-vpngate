@@ -163,6 +163,23 @@ QUALITY_SPEED_HTTP_TIMEOUT_SECONDS = max(
 # 默认 0：测速异常只记录，不误杀节点
 QUALITY_SPEED_STRICT = env_flag("QUALITY_SPEED_STRICT", "0")
 
+# 使用 Ookla speedtest CLI 通过 tun0 测速
+SPEEDTEST_CMD = os.environ.get("SPEEDTEST_CMD", "speedtest")
+SPEEDTEST_INTERFACE = os.environ.get("SPEEDTEST_INTERFACE", "tun0")
+
+SPEEDTEST_TIMEOUT_SECONDS = max(
+    30,
+    int(os.environ.get("SPEEDTEST_TIMEOUT_SECONDS", "90"))
+)
+
+# speedtest 不存在时，是否自动安装
+SPEEDTEST_AUTO_INSTALL = env_flag("SPEEDTEST_AUTO_INSTALL", "1")
+
+SPEEDTEST_INSTALL_TIMEOUT_SECONDS = max(
+    60,
+    int(os.environ.get("SPEEDTEST_INSTALL_TIMEOUT_SECONDS", "240"))
+)
+
 PROXY_HEALTH_CONFIRM_TIMES = max(
     1,
     int(os.environ.get("PROXY_HEALTH_CONFIRM_TIMES", "2"))
@@ -2994,104 +3011,322 @@ def fetch_ipapi_quality() -> dict[str, Any]:
 
     return parse_ipapi_quality(raw)
 
+def strip_ansi(text: str) -> str:
+    """
+    去掉 speedtest 输出里的 ANSI 颜色控制字符。
+    """
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text or ""))
+
+
+def parse_data_used_to_bytes(value: str, unit: str) -> int:
+    """
+    把 speedtest 输出里的 data used 转成 bytes。
+    例如：
+    98.7 MB -> 103494451
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0
+
+    unit = str(unit or "").upper()
+
+    if unit == "KB":
+        return int(n * 1024)
+
+    if unit == "MB":
+        return int(n * 1024 * 1024)
+
+    if unit == "GB":
+        return int(n * 1024 * 1024 * 1024)
+
+    if unit == "B":
+        return int(n)
+
+    return 0
+
+
+def convert_speed_to_mbps(value: str, unit: str) -> float:
+    """
+    把 speedtest 输出的速度统一转为 Mbps。
+    常见单位：
+    Kbps / Mbps / Gbps
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    unit = str(unit or "").lower()
+
+    if unit == "kbps":
+        return n / 1000
+
+    if unit == "mbps":
+        return n
+
+    if unit == "gbps":
+        return n * 1000
+
+    return 0.0
+
+
+def check_speedtest_available() -> bool:
+    try:
+        res = subprocess.run(
+            ["which", SPEEDTEST_CMD],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def install_speedtest_cli() -> None:
+    """
+    自动安装 Ookla speedtest CLI。
+
+    注意：
+    - 项目本身只支持 Ubuntu，所以这里按 Ubuntu packagecloud 源安装；
+    - 如果系统不是 root 运行，会直接失败；
+    - 正常情况下建议在 install.sh 里安装，这里只是兜底。
+    """
+    if check_speedtest_available():
+        return
+
+    if not SPEEDTEST_AUTO_INSTALL:
+        raise RuntimeError("speedtest 未安装，且 SPEEDTEST_AUTO_INSTALL=0，跳过自动安装")
+
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise RuntimeError("speedtest 未安装，当前进程不是 root，无法自动安装")
+
+    print("[测速] speedtest 未安装，正在自动安装 Ookla speedtest CLI...", flush=True)
+    log_to_json("INFO", "Speed", "speedtest 未安装，正在自动安装 Ookla speedtest CLI")
+
+    install_cmd = r"""
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -qq
+apt-get install -y curl gnupg ca-certificates lsb-release
+
+curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
+  | gpg --dearmor -o /usr/share/keyrings/ookla-speedtest.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/ookla-speedtest.gpg] https://packagecloud.io/ookla/speedtest-cli/ubuntu/ $(lsb_release -cs) main" \
+  > /etc/apt/sources.list.d/ookla-speedtest.list
+
+apt-get update -qq
+apt-get install -y speedtest
+"""
+
+    res = subprocess.run(
+        ["bash", "-lc", install_cmd],
+        capture_output=True,
+        text=True,
+        timeout=SPEEDTEST_INSTALL_TIMEOUT_SECONDS,
+    )
+
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"安装 speedtest 失败: returncode={res.returncode}, stderr={res.stderr.strip()}"
+        )
+
+    if not check_speedtest_available():
+        raise RuntimeError("speedtest 安装后仍不可用")
+
+    print("[测速] speedtest 安装完成", flush=True)
+    log_to_json("INFO", "Speed", "speedtest 安装完成")
+
+def ensure_speedtest_interface_exists(interface: str) -> None:
+    """
+    确认测速网卡存在。
+    默认要求 tun0 已经创建成功，否则不进行测速。
+    """
+    iface = str(interface or "").strip()
+    if not iface:
+        raise RuntimeError("speedtest 测速接口为空")
+
+    iface_path = Path("/sys/class/net") / iface
+
+    if not iface_path.exists():
+        raise RuntimeError(f"speedtest 测速接口 {iface} 不存在，请确认 OpenVPN 已成功创建 tun0")
+
 def fetch_proxy_speed_quality() -> dict[str, Any]:
     """
-    通过 127.0.0.1:7928 下载测速文件前 N 字节，检测当前出口下载速度。
-    注意：
-    - curl=0：完整完成测速
-    - curl=28：超时，但如果已经下载到数据，也可以用 speed_download 判断速度
+    使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
+
+    返回字段保持兼容原来的 curl 测速逻辑：
+    - speed_test_checked
+    - speed_test_url
+    - speed_test_http_code
+    - speed_test_size_bytes
+    - speed_test_time_seconds
+    - download_speed_bps
+    - download_speed_mbps
+    - download_speed_mib_s
+
+    这样 evaluate_ip_quality() / update_node_quality() 不需要大改。
     """
-    range_end = max(0, QUALITY_SPEED_TEST_BYTES - 1)
-    test_mb = QUALITY_SPEED_TEST_BYTES / 1024 / 1024
+    install_speedtest_cli()
+    ensure_speedtest_interface_exists(SPEEDTEST_INTERFACE)
+
 
     print(
-        f"[测速] 开始检测 7928 出口下载速度，下载前 {test_mb:.0f}MB: {QUALITY_SPEED_TEST_URL}",
+        f"[测速] 开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度...",
         flush=True,
     )
     log_to_json(
         "INFO",
         "Speed",
-        f"开始检测 7928 出口下载速度，下载前 {test_mb:.0f}MB",
+        f"开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度",
     )
 
     cmd = [
-        "curl", "-4", "-L", "-sS",
-        *get_internal_curl_proxy_args("http", "127.0.0.1"),
-        "--range", f"0-{range_end}",
-        "--connect-timeout", str(QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS),
-        "--max-time", str(QUALITY_SPEED_HTTP_TIMEOUT_SECONDS),
-        "-o", "/dev/null",
-        "-w", "\n%{http_code}\n%{size_download}\n%{time_total}\n%{speed_download}\n",
-        QUALITY_SPEED_TEST_URL,
+        SPEEDTEST_CMD,
+        "--interface", SPEEDTEST_INTERFACE,
+        "--accept-license",
+        "--accept-gdpr",
+        "--progress=yes",
     ]
 
-    res = subprocess.run(
+    started_at = time.time()
+
+    process = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=QUALITY_SPEED_HTTP_TIMEOUT_SECONDS + 5,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
     )
 
-    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    download_mbps = None
+    data_used_bytes = 0
+    last_lines: list[str] = []
 
-    # curl 即使超时，也会输出 -w 里的测速信息，所以先尝试解析
-    if len(lines) >= 4:
-        http_code = lines[-4]
-        size_download = parse_int(parse_float(lines[-3]))
-        time_total = parse_float(lines[-2])
-        speed_download = parse_int(parse_float(lines[-1]))
+    try:
+        assert process.stdout is not None
 
-        # 200 / 206 都算有效；curl=28 只要有下载数据，也算有效测速结果
-        if http_code in {"200", "206"} and size_download > 0 and speed_download > 0:
-            speed_mib_s = speed_download / 1024 / 1024
-            speed_mbps = speed_download * 8 / 1000 / 1000
+        for raw_line in process.stdout:
+            line = strip_ansi(raw_line).strip()
 
-            if res.returncode == 28:
-                print(
-                    f"[测速] 7928 出口测速超时但已获得有效速度: "
-                    f"{speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-                    f"已下载 {size_download}/{QUALITY_SPEED_TEST_BYTES} bytes, "
-                    f"耗时 {time_total:.2f}s",
-                    flush=True,
-                )
-                log_to_json(
-                    "WARNING",
-                    "Speed",
-                    f"测速超时但已获得有效速度: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-                    f"已下载 {size_download}/{QUALITY_SPEED_TEST_BYTES} bytes, 耗时 {time_total:.2f}s",
-                )
-            else:
-                print(
-                    f"[测速] 7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-                    f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
-                    flush=True,
-                )
-                log_to_json(
-                    "INFO",
-                    "Speed",
-                    f"7928 出口测速完成: {speed_mib_s:.2f} MB/s | {speed_mbps:.2f} Mbps, "
-                    f"下载 {size_download} bytes, 耗时 {time_total:.2f}s",
+            if line:
+                last_lines.append(line)
+                last_lines = last_lines[-20:]
+
+            # speedtest 有时会用 \r 刷新进度，所以这里再拆一次
+            for part in re.split(r"[\r\n]+", line):
+                part = part.strip()
+                if not part:
+                    continue
+
+                # 例：
+                # Download:    67.45 Mbps (data used: 98.7 MB)
+                match = re.search(
+                    r"Download:\s+([\d.]+)\s+([KMG]bps)\s+\(data used:\s+([\d.]+)\s+([KMG]?B)\)",
+                    part,
+                    re.IGNORECASE,
                 )
 
-            return {
-                "speed_test_checked": True,
-                "speed_test_url": QUALITY_SPEED_TEST_URL,
-                "speed_test_http_code": http_code,
-                "speed_test_size_bytes": size_download,
-                "speed_test_time_seconds": time_total,
-                "download_speed_bps": speed_download,
-                "download_speed_mbps": round(speed_mbps, 2),
-                "download_speed_mib_s": round(speed_mib_s, 2),
-                "speed_test_timeout": res.returncode == 28,
-            }
+                if not match:
+                    # 兼容没有 data used 的输出
+                    match_simple = re.search(
+                        r"Download:\s+([\d.]+)\s+([KMG]bps)",
+                        part,
+                        re.IGNORECASE,
+                    )
 
-    # 走到这里，才是真正无法测速
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"测速请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+                    if match_simple:
+                        download_mbps = convert_speed_to_mbps(
+                            match_simple.group(1),
+                            match_simple.group(2),
+                        )
+                        data_used_bytes = 0
+                    continue
+
+                download_mbps = convert_speed_to_mbps(match.group(1), match.group(2))
+                data_used_bytes = parse_data_used_to_bytes(match.group(3), match.group(4))
+
+            if download_mbps and download_mbps > 0:
+                # 已拿到下载结果，不继续做上传，减少测速耗时和流量消耗
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                break
+
+            if time.time() - started_at > SPEEDTEST_TIMEOUT_SECONDS:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"speedtest 超时，超过 {SPEEDTEST_TIMEOUT_SECONDS}s 未获取下载速度"
+                )
+
+        if download_mbps is None or download_mbps <= 0:
+            try:
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+            raise RuntimeError(
+                "未能从 speedtest 输出中获取下载速度，最近输出: "
+                + " | ".join(last_lines[-8:])
+            )
+
+        time_total = time.time() - started_at
+
+        # Mbps 是 megabit/s，转换为 byte/s
+        speed_bps = int(download_mbps * 1000 * 1000 / 8)
+        speed_mib_s = speed_bps / 1024 / 1024
+
+        print(
+            f"[测速] speedtest 下载测速完成: "
+            f"{speed_mib_s:.2f} MB/s | {download_mbps:.2f} Mbps, "
+            f"数据量 {data_used_bytes} bytes, 耗时 {time_total:.2f}s",
+            flush=True,
+        )
+        log_to_json(
+            "INFO",
+            "Speed",
+            f"speedtest 下载测速完成: {speed_mib_s:.2f} MB/s | {download_mbps:.2f} Mbps, "
+            f"数据量 {data_used_bytes} bytes, 耗时 {time_total:.2f}s",
         )
 
-    raise RuntimeError(f"测速返回格式异常: stdout={res.stdout[:200]!r}")
+        return {
+            "speed_test_checked": True,
+            "speed_test_url": f"speedtest://interface/{SPEEDTEST_INTERFACE}",
+            "speed_test_http_code": "speedtest",
+            "speed_test_size_bytes": data_used_bytes,
+            "speed_test_time_seconds": round(time_total, 2),
+            "download_speed_bps": speed_bps,
+            "download_speed_mbps": round(download_mbps, 2),
+            "download_speed_mib_s": round(speed_mib_s, 2),
+            "speed_test_timeout": False,
+        }
+
+    finally:
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     score = parse_int(info.get("ippure_score"))
@@ -3254,7 +3489,7 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
 
     # 4. 只有前面的 IP 质量通过后，才进行 7928 出口测速
     if passed and QUALITY_CHECK_SPEED_ENABLED:
-        set_state(last_check_message="正在通过 7928 代理进行出口下载测速...")
+        set_state(last_check_message=f"正在通过 {SPEEDTEST_INTERFACE} 使用 speedtest 进行出口下载测速...")
 
         try:
             speed_info = fetch_proxy_speed_quality()

@@ -44,8 +44,24 @@ GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
 echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
 apt-get update -q || true
-echo -e "  -> 正在运行 apt-get install 安装基础依赖包 (openvpn, curl, git, iptables, iproute2, psmisc, python3)..."
-apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+echo -e "  -> 正在运行 apt-get install 安装基础依赖包 (openvpn, curl, git, iptables, iproute2, psmisc, python3, gnupg, lsb-release)..."
+apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 gnupg lsb-release
+
+echo -e "  -> 正在检查 Ookla speedtest CLI..."
+if ! command -v speedtest >/dev/null 2>&1; then
+    echo -e "  -> 未检测到 speedtest，正在安装 Ookla speedtest CLI..."
+
+    curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
+      | gpg --dearmor -o /usr/share/keyrings/ookla-speedtest.gpg
+
+    echo "deb [signed-by=/usr/share/keyrings/ookla-speedtest.gpg] https://packagecloud.io/ookla/speedtest-cli/ubuntu/ $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/ookla-speedtest.list
+
+    apt-get update -q || true
+    apt-get install -y speedtest
+else
+    echo -e "${GREEN}  -> speedtest 已安装，跳过。${PLAIN}"
+fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
