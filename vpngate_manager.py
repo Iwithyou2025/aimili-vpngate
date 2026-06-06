@@ -3299,6 +3299,26 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
 
 
 def connect_node_with_quality_check(node_id: str) -> str:
+    """
+    连接节点并执行 IP 质量 / 速度检测。
+
+    修复点：
+    - 如果是从一个已有活动节点切换到另一个节点，但外层没有提前 mark_node_switch_start，
+      这里自动补一条开始时间；
+    - 避免节点已经切换成功，但“最近 10 次节点切换耗时”图表没有新增记录。
+    """
+    previous_node_id = active_openvpn_node_id
+
+    state = read_json(STATE_FILE, {})
+    if (
+            previous_node_id
+            and previous_node_id != node_id
+            and not state.get("node_switch_started_at")
+    ):
+        mark_node_switch_start(
+            f"切换节点: {previous_node_id} -> {node_id}"
+        )
+
     result = connect_node(node_id)
 
     set_state(last_check_message="正在检测出口 IP 质量与 7928 代理下载速度...")
@@ -3400,6 +3420,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
     try:
         if force:
             with lock:
+                if active_openvpn_node_id:
+                    mark_node_switch_start(
+                        f"手动检测补齐 / 更新节点，准备从 {active_openvpn_node_id} 切换"
+                    )
+
                 finish_current_ip_uptime("手动更新节点，关闭当前连接")
                 stop_active_openvpn()
         elif not active_openvpn_running():
@@ -3407,6 +3432,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
             with lock:
                 if active_openvpn_node_id:
                     has_active_id = True
+
+                    mark_node_switch_start(
+                        f"当前 OpenVPN 进程已意外退出，准备从 {active_openvpn_node_id} 自动切换"
+                    )
+
                     finish_current_ip_uptime("当前 OpenVPN 进程已意外退出")
                     stop_active_openvpn()
             if has_active_id:
