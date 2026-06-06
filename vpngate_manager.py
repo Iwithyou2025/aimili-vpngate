@@ -5031,84 +5031,88 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
- <section class="switch-chart-section">
-  <div class="switch-chart-head">
-    <div>
-      <div class="switch-chart-title">每日自动更换节点次数</div>
-      <div class="switch-chart-subtitle">
-        统计范围：每日 00:00 ~ 24:00；仅统计自动切换，不统计手动切换；数据截止昨日，显示最近 15 日。
+    <section class="switch-chart-section">
+      <div class="switch-chart-head">
+        <div>
+          <div class="switch-chart-title">每日自动更换节点次数</div>
+          <div class="switch-chart-subtitle">
+            统计范围：每日 00:00 ~ 24:00；仅统计自动切换，不统计手动切换；数据截止昨日，显示最近 15 日。
+          </div>
+        </div>
+        <div class="switch-chart-total">
+          15日合计：<strong id="auto_switch_total">0</strong> 次
+        </div>
       </div>
-    </div>
-    <div class="switch-chart-total">
-      15日合计：<strong id="auto_switch_total">0</strong> 次
-    </div>
-  </div>
-
-  <div class="switch-chart-wrap">
-    <canvas id="auto_switch_chart"></canvas>
-  </div>
-</section>
-
-<div class="switch-chart-divider"></div>
-
-<div class="switch-chart-head switch-chart-head-secondary">
-  <div>
-    <div class="switch-chart-title">最近 20 次节点切换耗时</div>
-    <div class="switch-chart-subtitle">
-      统计每次节点不可用后，到新节点连接成功并测速达标的耗时；横轴从远到近显示，竖轴单位为分钟。
-    </div>
-  </div>
-  <div class="switch-chart-total">
-    已记录：<strong id="switch_duration_count">0</strong> 次
-  </div>
-</div>
-
-<div class="switch-chart-wrap">
-  <canvas id="switch_duration_chart"></canvas>
-</div>
-
-<div class="switch-chart-divider"></div>
-
-<div class="switch-chart-divider"></div>
-
-<div class="switch-chart-head switch-chart-head-secondary">
-  <div>
-    <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 持续时长</div>
-    <div class="switch-chart-subtitle">
-      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
-      当前正在连接的 IP 不显示，结束后再进入统计。
-    </div>
-  </div>
-
-<div class="switch-chart-head switch-chart-head-secondary">
-  <div>
-    <div class="switch-chart-title">最近 10 次节点切换耗时</div>
-    <div class="switch-chart-subtitle">
-      柱子底部为节点切换完成后的系统时间；柱子顶部为本次切换耗时；纵轴使用对数轴，避免秒级、分钟级、小时级、天级混合时显示失真。
-    </div>
-  </div>
-
-  <div class="ip-uptime-tools">
-    <div class="ip-uptime-legend">
-      <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
-      <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤1小时）</span>
-      <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤1天）</span>
-      <span class="legend-item"><i class="legend-dot legend-red"></i>异常（超1天）</span>
-    </div>
-
-    <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
-      刷新数据
-    </button>
-
-    <div class="switch-chart-total">
-      已记录：<strong id="switch_duration_count">0</strong> 次
-    </div>
-  </div>
-</div>
-
-<div class="switch-chart-wrap switch-duration-chart-wrap">
-  <canvas id="switch_duration_chart"></canvas>
-</div>
+    
+      <div class="switch-chart-wrap">
+        <canvas id="auto_switch_chart"></canvas>
+      </div>
+    
+      <div class="switch-chart-divider"></div>
+    
+      <div class="switch-chart-head switch-chart-head-secondary">
+        <div>
+          <div class="switch-chart-title">最近 10 次节点切换耗时</div>
+          <div class="switch-chart-subtitle">
+            柱子底部为节点切换完成后的系统时间；柱子顶部为本次切换耗时；纵轴使用对数轴，避免秒级、分钟级、小时级、天级混合时显示失真。
+          </div>
+        </div>
+    
+        <div class="ip-uptime-tools">
+          <div class="ip-uptime-legend">
+            <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
+            <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤1小时）</span>
+            <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤1天）</span>
+            <span class="legend-item"><i class="legend-dot legend-red"></i>异常（超1天）</span>
+          </div>
+    
+          <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
+            刷新数据
+          </button>
+    
+          <div class="switch-chart-total">
+            已记录：<strong id="switch_duration_count">0</strong> 次
+          </div>
+        </div>
+      </div>
+    
+      <div class="switch-chart-wrap switch-duration-chart-wrap">
+        <canvas id="switch_duration_chart"></canvas>
+      </div>
+    
+      <div class="switch-chart-divider"></div>
+    
+      <div class="switch-chart-head switch-chart-head-secondary">
+        <div>
+          <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 持续时长</div>
+          <div class="switch-chart-subtitle">
+            从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
+            当前正在连接的 IP 不显示，结束后再进入统计。
+          </div>
+        </div>
+    
+        <div class="ip-uptime-tools">
+          <div class="ip-uptime-legend">
+            <span class="legend-item"><i class="legend-dot legend-green"></i>较长（稳）</span>
+            <span class="legend-item"><i class="legend-dot legend-blue"></i>中等</span>
+            <span class="legend-item"><i class="legend-dot legend-orange"></i>偏短</span>
+            <span class="legend-item"><i class="legend-dot legend-red"></i>较短（不稳）</span>
+          </div>
+    
+          <button id="refresh_ip_uptime_btn" type="button" class="chart-refresh-btn">
+            刷新数据
+          </button>
+    
+          <div class="switch-chart-total">
+            已记录：<strong id="ip_uptime_count">0</strong> 个 IP
+          </div>
+        </div>
+      </div>
+    
+      <div class="switch-chart-wrap ip-uptime-chart-wrap">
+        <canvas id="ip_uptime_chart"></canvas>
+      </div>
+    </section>
 
   <!-- 当前连接活动节点卡片 -->
   <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
