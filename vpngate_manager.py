@@ -820,7 +820,7 @@ def build_switch_duration_chart(history: Any, max_items: int = 10) -> list[dict[
 
         if finished_at > 0:
             finished_label = time.strftime(
-                "%Y-%m-%d %H:%M:%S",
+                "%m-%d %H:%M:%S",
                 time.localtime(finished_at),
             )
         else:
