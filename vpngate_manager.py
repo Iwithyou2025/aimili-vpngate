@@ -5058,14 +5058,13 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
     
-        <div class="ip-uptime-tools">
-          <div class="ip-uptime-legend">
-            <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
-            <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤1小时）</span>
-            <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤1天）</span>
-            <span class="legend-item"><i class="legend-dot legend-red"></i>异常（超1天）</span>
-          </div>
-    
+        <div class="ip-uptime-legend">
+          <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
+          <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤5分钟）</span>
+          <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤10分钟）</span>
+          <span class="legend-item"><i class="legend-dot legend-red"></i>异常（>10分钟）</span>
+        </div>
+            
           <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
             刷新数据
           </button>
