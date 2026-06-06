@@ -970,6 +970,19 @@ def prune_ip_uptime_history(history: Any, max_items: int = 10) -> list[dict[str,
             item_started = float(item.get("started_at", 0) or 0)
             item_ended = float(item.get("ended_at", 0) or 0)
 
+            # 只有短时间内连续出现的相同 IP 才合并。
+            # 例如：连通性检测失败后，又连回同一个 IP。
+            # 如果隔了很久，比如几小时 / 几天后又出现同一个 IP，则算新的历史记录。
+            same_ip_gap_seconds = (
+                item_started - prev_ended
+                if prev_ended > 0 and item_started > 0
+                else 0
+            )
+
+            if same_ip_gap_seconds > 30 * 60:
+                merged.append(item)
+                continue
+
             valid_starts = [v for v in [prev_started, item_started] if v > 0]
             valid_ends = [v for v in [prev_ended, item_ended] if v > 0]
 
@@ -1001,7 +1014,7 @@ def prune_ip_uptime_history(history: Any, max_items: int = 10) -> list[dict[str,
     return merged[-max_items:]
 
 
-def finish_current_ip_uptime(reason: str = "") -> None:
+def finish_current_ip_uptime(reason: str = "", ended_at: float | None = None) -> None:
     """
     结束当前 IP 的连接时长统计。
 
@@ -1027,8 +1040,10 @@ def finish_current_ip_uptime(reason: str = "") -> None:
     if started_at <= 0:
         return
 
-    ended_at = time.time()
-    duration_seconds = max(0, int(ended_at - started_at))
+    if ended_at is None:
+        ended_at = time.time()
+
+    duration_seconds = max(0, int(float(ended_at) - started_at))
 
     history = state.get("ip_uptime_history", [])
     if not isinstance(history, list):
@@ -1053,9 +1068,38 @@ def finish_current_ip_uptime(reason: str = "") -> None:
         current_ip_uptime_started_at=None,
         current_ip_uptime_last_seen_at=None,
         current_ip_uptime_reason="",
+        current_ip_uptime_pending_ended_at=None,
+        current_ip_uptime_pending_end_reason="",
         ip_uptime_history=history,
     )
 
+def mark_current_ip_uptime_pending_end(reason: str = "") -> None:
+    """
+    标记当前 IP 疑似结束，但暂不写入历史。
+
+    用途：
+    - 节点确认不通后，先不要立刻把当前 IP 写入历史；
+    - 等新节点连接成功后，如果出口 IP 还是同一个，则继续累计；
+    - 如果出口 IP 变了，再把旧 IP 写入历史。
+    """
+    state = read_json(STATE_FILE, {})
+
+    ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
+    if not ip:
+        return
+
+    try:
+        started_at = float(state.get("current_ip_uptime_started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+
+    if started_at <= 0:
+        return
+
+    set_state(
+        current_ip_uptime_pending_ended_at=time.time(),
+        current_ip_uptime_pending_end_reason=reason,
+    )
 
 def begin_or_continue_ip_uptime(ip: Any, node_id: str = "", reason: str = "") -> None:
     """
@@ -1063,8 +1107,8 @@ def begin_or_continue_ip_uptime(ip: Any, node_id: str = "", reason: str = "") ->
 
     关键点：
     - 如果 IP 没变，不重置 started_at；
-    - 所以服务重启后，只要恢复出来的出口 IP 一样，就会继续累计；
-    - 如果 IP 变了，先结算旧 IP，再从当前时间开始统计新 IP。
+    - 如果之前只是连通性检测失败，但又连回同一个 IP，则继续累计；
+    - 如果 IP 变了，旧 IP 才真正结算进历史，新 IP 从当前时间重新计时。
     """
     ip = normalize_uptime_ip(ip)
     if not ip:
@@ -1079,27 +1123,46 @@ def begin_or_continue_ip_uptime(ip: Any, node_id: str = "", reason: str = "") ->
     except (TypeError, ValueError):
         old_started_at = 0
 
+    try:
+        pending_ended_at = float(state.get("current_ip_uptime_pending_ended_at") or 0)
+    except (TypeError, ValueError):
+        pending_ended_at = 0
+
+    pending_reason = str(state.get("current_ip_uptime_pending_end_reason") or "")
+
     now = time.time()
 
-    # IP 没变：只更新时间，不重置开始时间
+    # IP 没变：说明之前只是连通性检测失败，后面又连回了同一个出口 IP
+    # 不写入历史，继续沿用原来的 started_at
     if old_ip == ip and old_started_at > 0:
         set_state(
             current_ip_uptime_node_id=node_id or state.get("current_ip_uptime_node_id", ""),
             current_ip_uptime_last_seen_at=now,
             current_ip_uptime_reason=reason or state.get("current_ip_uptime_reason", ""),
+            current_ip_uptime_pending_ended_at=None,
+            current_ip_uptime_pending_end_reason="",
         )
         return
 
-    # IP 变了：旧 IP 先结算
+    # IP 变了：旧 IP 才真正结算进历史
     if old_ip and old_ip != ip and old_started_at > 0:
-        finish_current_ip_uptime(f"出口 IP 变化: {old_ip} -> {ip}")
+        finish_current_ip_uptime(
+            pending_reason or f"出口 IP 变化: {old_ip} -> {ip}",
+            ended_at=pending_ended_at if pending_ended_at > 0 else now,
+            )
 
+    # 关键：开始统计新 IP
+    # 包括两种情况：
+    # 1. 之前没有 old_ip；
+    # 2. old_ip 已经结算，当前 ip 是新的出口 IP。
     set_state(
         current_ip_uptime_ip=ip,
         current_ip_uptime_node_id=node_id,
         current_ip_uptime_started_at=now,
         current_ip_uptime_last_seen_at=now,
         current_ip_uptime_reason=reason,
+        current_ip_uptime_pending_ended_at=None,
+        current_ip_uptime_pending_end_reason="",
     )
 
 
@@ -2691,7 +2754,7 @@ def connect_node(node_id: str) -> str:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
-            finish_current_ip_uptime(f"连接节点 {node_id} 失败: {message}")
+            mark_current_ip_uptime_pending_end(f"连接节点 {node_id} 失败: {message}")
             set_state(
                 active_openvpn_node_id="",
                 is_connecting=False,
@@ -3247,13 +3310,13 @@ def connect_node_with_quality_check(node_id: str) -> str:
         reason = f"IP质量检测异常: {exc}"
         update_node_quality(node_id, {}, False, reason)
         set_state(proxy_quality_ok=False, proxy_quality_error=reason)
-        finish_current_ip_uptime(reason)
+        mark_current_ip_uptime_pending_end(reason)
         stop_active_openvpn()
         raise QualityCheckFailed(reason) from exc
 
     if not passed:
         log_to_json("WARNING", "Quality", f"节点 {node_id} IP质量不达标: {reason}")
-        finish_current_ip_uptime(f"IP质量或测速不达标: {reason}")
+        mark_current_ip_uptime_pending_end(f"IP质量或测速不达标: {reason}")
         stop_active_openvpn()
         raise QualityCheckFailed(reason)
 
@@ -7509,7 +7572,7 @@ def background_proxy_checker() -> None:
                         f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
                     )
 
-                    finish_current_ip_uptime(
+                    mark_current_ip_uptime_pending_end(
                         f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
                     )
 
