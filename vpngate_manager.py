@@ -1201,15 +1201,23 @@ def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 
         items,
         key=lambda x: float(x.get("ended_at", 0) or 0)
     )
-    # 过滤掉当前正在连接的 IP
-    current_ip = normalize_uptime_ip(state.get("current_ip_uptime_ip"))
-    if current_ip:
-        # 只移除最后一条（最新的）与当前 IP 相同的记录，保留更早的历史
-        for i in range(len(items) - 1, -1, -1):
-            if normalize_uptime_ip(items[i].get("ip")) == current_ip:
-                items = items[:i] + items[i + 1:]
-                break
-                
+
+    # 当前正在连接的 IP 不应该作为“最近一条历史记录”显示。
+    # 只判断最后一条，不全量删除，避免误删几天前出现过的同 IP 历史。
+    current_ip = normalize_uptime_ip(
+        state.get("current_ip_uptime_ip")
+        or state.get("proxy_ip")
+        or ""
+    )
+
+    if current_ip and items:
+        latest_ip = normalize_uptime_ip(items[-1].get("ip"))
+        if latest_ip == current_ip:
+            items = items[:-1]
+
+    # 隐藏尾部当前 IP 后，再保留最近 max_items 条
+    items = items[-max_items:]
+    
     chart: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
