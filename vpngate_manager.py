@@ -5837,22 +5837,25 @@ function buildIpUptimeVisualScale(secondsList){
  * 偏长 -> 橙色
  * 最长 -> 红色
  */
+ 
 function getIpUptimeLevelByRank(seconds, sortedSeconds){
   const current = Math.max(0, Number(seconds) || 0);
-  const list = Array.isArray(sortedSeconds) ? sortedSeconds : [];
+  const list = Array.isArray(sortedSeconds)
+    ? sortedSeconds.map(v => Math.max(0, Number(v) || 0)).sort((a, b) => a - b)
+    : [];
 
   if (!list.length) {
     return {
-      colorTop: "rgba(38, 162, 105, 0.96)",
-      colorBottom: "rgba(38, 162, 105, 0.48)",
-      textColor: "rgba(52, 211, 153, 0.98)"
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
     };
   }
 
   const min = list[0];
   const max = list[list.length - 1];
 
-  // 所有数据完全一样时，客观上无法区分长短
+  // 所有数据完全一样时，没有长短差异，统一显示中等蓝色
   if (max <= min) {
     return {
       colorTop: "rgba(59, 130, 246, 0.96)",
@@ -5870,25 +5873,21 @@ function getIpUptimeLevelByRank(seconds, sortedSeconds){
   }
 
   // 相对位置：0 = 最短，1 = 最长
-  const rankRatio = (lessCount + Math.max(0, equalCount - 1) / 2) / Math.max(1, list.length - 1);
+  const rankRatio = (
+    lessCount + Math.max(0, equalCount - 1) / 2
+  ) / Math.max(1, list.length - 1);
 
+  // 最短 / 较短 -> 红色，不稳定
   if (rankRatio <= 0.25) {
     return {
-      colorTop: "rgba(38, 162, 105, 0.96)",
-      colorBottom: "rgba(38, 162, 105, 0.48)",
-      textColor: "rgba(52, 211, 153, 0.98)"
+      colorTop: "rgba(239, 68, 68, 0.96)",
+      colorBottom: "rgba(239, 68, 68, 0.48)",
+      textColor: "rgba(248, 113, 113, 0.98)"
     };
   }
 
+  // 偏短 -> 橙色
   if (rankRatio <= 0.50) {
-    return {
-      colorTop: "rgba(59, 130, 246, 0.96)",
-      colorBottom: "rgba(59, 130, 246, 0.48)",
-      textColor: "rgba(96, 165, 250, 0.98)"
-    };
-  }
-
-  if (rankRatio <= 0.75) {
     return {
       colorTop: "rgba(245, 158, 11, 0.96)",
       colorBottom: "rgba(245, 158, 11, 0.48)",
@@ -5896,10 +5895,20 @@ function getIpUptimeLevelByRank(seconds, sortedSeconds){
     };
   }
 
+  // 中等 -> 蓝色
+  if (rankRatio <= 0.75) {
+    return {
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
+    };
+  }
+
+  // 最长 / 较长 -> 绿色，稳定
   return {
-    colorTop: "rgba(239, 68, 68, 0.96)",
-    colorBottom: "rgba(239, 68, 68, 0.48)",
-    textColor: "rgba(248, 113, 113, 0.98)"
+    colorTop: "rgba(38, 162, 105, 0.96)",
+    colorBottom: "rgba(38, 162, 105, 0.48)",
+    textColor: "rgba(52, 211, 153, 0.98)"
   };
 }
 
@@ -5945,39 +5954,7 @@ function formatIpUptimeTopLabel(seconds){
 }
 
 
-function getIpUptimeLevel(hours){
-  const h = Number(hours) || 0;
 
-  if (h >= 24) {
-    return {
-      colorTop: "rgba(38, 162, 105, 0.96)",
-      colorBottom: "rgba(38, 162, 105, 0.48)",
-      textColor: "rgba(52, 211, 153, 0.98)"
-    };
-  }
-
-  if (h >= 12) {
-    return {
-      colorTop: "rgba(59, 130, 246, 0.96)",
-      colorBottom: "rgba(59, 130, 246, 0.48)",
-      textColor: "rgba(96, 165, 250, 0.98)"
-    };
-  }
-
-  if (h >= 6) {
-    return {
-      colorTop: "rgba(245, 158, 11, 0.96)",
-      colorBottom: "rgba(245, 158, 11, 0.48)",
-      textColor: "rgba(251, 191, 36, 0.98)"
-    };
-  }
-
-  return {
-    colorTop: "rgba(239, 68, 68, 0.96)",
-    colorBottom: "rgba(239, 68, 68, 0.48)",
-    textColor: "rgba(248, 113, 113, 0.98)"
-  };
-}
 
 async function refreshIpUptimeChartData(){
   const btn = $("refresh_ip_uptime_btn");
