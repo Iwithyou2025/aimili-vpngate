@@ -903,8 +903,13 @@ def round_ip_uptime_hours(seconds: Any) -> float:
 
 def prune_ip_uptime_history(history: Any, max_items: int = 10) -> list[dict[str, Any]]:
     """
-    只保留最近 max_items 个已结束的 IP 连接记录。
-    当前正在连接的 IP 不放进 history，而是在 build 图表时动态追加。
+    清理 IP 持续时长历史。
+
+    修复点：
+    - 按 ended_at 从旧到新排序；
+    - 如果连续两条记录 IP 相同，则合并成一条；
+    - 避免图表里出现连续两个相同 IP；
+    - 最终只保留最近 max_items 条。
     """
     if not isinstance(history, list):
         history = []
@@ -948,7 +953,52 @@ def prune_ip_uptime_history(history: Any, max_items: int = 10) -> list[dict[str,
             "active": False,
         })
 
-    return cleaned[-max_items:]
+    cleaned = sorted(
+        cleaned,
+        key=lambda x: float(x.get("ended_at", 0) or 0)
+    )
+
+    merged: list[dict[str, Any]] = []
+
+    for item in cleaned:
+        if merged and merged[-1].get("ip") == item.get("ip"):
+            prev = merged[-1]
+
+            prev_started = float(prev.get("started_at", 0) or 0)
+            prev_ended = float(prev.get("ended_at", 0) or 0)
+
+            item_started = float(item.get("started_at", 0) or 0)
+            item_ended = float(item.get("ended_at", 0) or 0)
+
+            valid_starts = [v for v in [prev_started, item_started] if v > 0]
+            valid_ends = [v for v in [prev_ended, item_ended] if v > 0]
+
+            new_started_at = min(valid_starts) if valid_starts else 0
+            new_ended_at = max(valid_ends) if valid_ends else 0
+
+            if new_started_at > 0 and new_ended_at > 0:
+                new_duration_seconds = max(0, int(new_ended_at - new_started_at))
+            else:
+                new_duration_seconds = (
+                        int(prev.get("duration_seconds", 0) or 0)
+                        + int(item.get("duration_seconds", 0) or 0)
+                )
+
+            prev.update({
+                "node_id": item.get("node_id") or prev.get("node_id", ""),
+                "started_at": new_started_at,
+                "ended_at": new_ended_at,
+                "duration_seconds": new_duration_seconds,
+                "duration_text": format_ip_uptime_duration(new_duration_seconds),
+                "end_reason": item.get("end_reason") or prev.get("end_reason", ""),
+                "active": False,
+            })
+
+            continue
+
+        merged.append(item)
+
+    return merged[-max_items:]
 
 
 def finish_current_ip_uptime(reason: str = "") -> None:
@@ -2608,9 +2658,15 @@ def connect_node(node_id: str) -> str:
 
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
 
-        if previous_node_id and previous_node_id != node_id:
-            finish_current_ip_uptime(f"准备切换节点: {previous_node_id} -> {node_id}")
-
+        # 不要在“节点 ID 变化”时结算 IP 持续时长。
+        # IP 持续时长只应该在以下情况结算：
+        # 1. 当前 IP 确认不可用
+        # 2. 手动断开
+        # 3. 更新节点导致连接关闭
+        # 4. OpenVPN 异常退出
+        # 5. 新节点质量检测通过后，发现出口 IP 真的变了
+        #
+        # 如果节点变了但出口 IP 没变，应该继续累计同一个 IP 的持续时长。
         stop_active_openvpn()
 
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
@@ -7368,6 +7424,7 @@ def background_proxy_checker() -> None:
             res = check_proxy_health()
 
 
+
             if res["ok"]:
                 set_state(
                     proxy_ok=True,
@@ -7376,6 +7433,12 @@ def background_proxy_checker() -> None:
                     proxy_error="",
                     proxy_fail_count=0,
                     proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
+                )
+
+                touch_ip_uptime_seen_ip(
+                    res.get("ip", ""),
+                    node_id=active_openvpn_node_id,
+                    reason="后台健康检测确认出口 IP",
                 )
 
                 log_to_json(
@@ -7411,6 +7474,12 @@ def background_proxy_checker() -> None:
                         proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                     )
 
+                    touch_ip_uptime_seen_ip(
+                        final_res.get("ip", ""),
+                        node_id=active_openvpn_node_id,
+                        reason="追加检测恢复正常，确认出口 IP",
+                    )
+
                     print(
                         "[代理检测] 追加检测已恢复正常，判定为临时抖动，不切换节点",
                         flush=True,
@@ -7434,11 +7503,7 @@ def background_proxy_checker() -> None:
                     proxy_fail_threshold=PROXY_HEALTH_CONFIRM_TIMES,
                 )
 
-                touch_ip_uptime_seen_ip(
-                    res.get("ip", ""),
-                    node_id=active_openvpn_node_id,
-                    reason="后台健康检测确认出口 IP",
-                )
+
 
                 if active_openvpn_node_id:
                     mark_node_switch_start(
