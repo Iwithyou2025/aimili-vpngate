@@ -5100,9 +5100,6 @@ INDEX_HTML = r"""<!doctype html>
             刷新数据
           </button>
     
-          <div class="switch-chart-total">
-            已记录：<strong id="ip_uptime_count">0</strong> 个 IP
-          </div>
         </div>
       </div>
     
