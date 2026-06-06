@@ -172,6 +172,16 @@ SPEEDTEST_TIMEOUT_SECONDS = max(
     int(os.environ.get("SPEEDTEST_TIMEOUT_SECONDS", "90"))
 )
 
+SPEEDTEST_RETRY_TIMES = max(
+    1,
+    int(os.environ.get("SPEEDTEST_RETRY_TIMES", "3"))
+)
+
+SPEEDTEST_RETRY_DELAY_SECONDS = max(
+    0,
+    int(os.environ.get("SPEEDTEST_RETRY_DELAY_SECONDS", "3"))
+)
+
 # speedtest 不存在时，是否自动安装
 SPEEDTEST_AUTO_INSTALL = env_flag("SPEEDTEST_AUTO_INSTALL", "1")
 
@@ -3209,35 +3219,43 @@ def ensure_speedtest_interface_ready(interface: str) -> None:
     if res.returncode != 0 or "inet " not in res.stdout:
         raise RuntimeError(f"speedtest 测速接口 {iface} 没有 IPv4 地址，请确认 OpenVPN 已完成初始化")
 
-def fetch_proxy_speed_quality() -> dict[str, Any]:
+def is_retryable_speedtest_error(message: str) -> bool:
     """
-    使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
+    判断 speedtest 错误是否适合重试。
 
-    返回字段保持兼容原来的 curl 测速逻辑：
-    - speed_test_checked
-    - speed_test_url
-    - speed_test_http_code
-    - speed_test_size_bytes
-    - speed_test_time_seconds
-    - download_speed_bps
-    - download_speed_mbps
-    - download_speed_mib_s
-
-    这样 evaluate_ip_quality() / update_node_quality() 不需要大改。
+    重点处理：
+    - Cannot open socket
+    - Download: FAILED
     """
-    install_speedtest_cli()
-    ensure_speedtest_interface_ready(SPEEDTEST_INTERFACE)
+    s = str(message or "").lower()
 
-    speedtest_env = build_speedtest_env()
+    retry_keywords = [
+        "cannot open socket",
+        "download: failed",
+        "download failed",
+        "unable to connect",
+        "connection timed out",
+        "timed out",
+        "network is unreachable",
+        "temporary failure",
+    ]
 
+    return any(k in s for k in retry_keywords)
+
+def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts: int) -> dict[str, Any]:
+    """
+    单次 speedtest 测速。
+    失败时抛 RuntimeError，由 fetch_proxy_speed_quality() 负责判断是否重试。
+    """
     print(
-        f"[测速] 开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度...",
+        f"[测速] 开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度..."
+        f" 第 {attempt}/{max_attempts} 次",
         flush=True,
     )
     log_to_json(
         "INFO",
         "Speed",
-        f"开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度",
+        f"开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度，第 {attempt}/{max_attempts} 次",
     )
 
     cmd = [
@@ -3276,14 +3294,13 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                 last_lines.append(line)
                 last_lines = last_lines[-20:]
 
-            # speedtest 有时会用 \r 刷新进度，所以这里再拆一次
             for part in re.split(r"[\r\n]+", line):
                 part = part.strip()
                 if not part:
                     continue
 
-                # 例：
-                # Download:    67.45 Mbps (data used: 98.7 MB)
+                # 只接受完整下载结果：
+                # Download: 67.45 Mbps (data used: 98.7 MB)
                 match = re.search(
                     r"Download:\s+([\d.]+)\s+([KMG]bps)\s+\(data used:\s+([\d.]+)\s+([KMG]?B)\)",
                     part,
@@ -3297,7 +3314,6 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                 data_used_bytes = parse_data_used_to_bytes(match.group(3), match.group(4))
 
             if download_mbps and download_mbps > 0 and data_used_bytes > 0:
-                # 已拿到下载结果，不继续做上传，减少测速耗时和流量消耗
                 try:
                     process.terminate()
                     process.wait(timeout=3)
@@ -3313,11 +3329,13 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                     process.kill()
                 except Exception:
                     pass
+
                 raise RuntimeError(
-                    f"speedtest 超时，超过 {SPEEDTEST_TIMEOUT_SECONDS}s 未获取下载速度"
+                    f"speedtest 超时，超过 {SPEEDTEST_TIMEOUT_SECONDS}s 未获取下载速度，最近输出: "
+                    + " | ".join(last_lines[-8:])
                 )
 
-        if download_mbps is None or download_mbps <= 0:
+        if download_mbps is None or download_mbps <= 0 or data_used_bytes <= 0:
             try:
                 process.wait(timeout=3)
             except Exception:
@@ -3327,13 +3345,12 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                     pass
 
             raise RuntimeError(
-                "未能从 speedtest 输出中获取下载速度，最近输出: "
+                "未能从 speedtest 输出中获取完整下载速度，最近输出: "
                 + " | ".join(last_lines[-8:])
             )
 
         time_total = time.time() - started_at
 
-        # Mbps 是 megabit/s，转换为 byte/s
         speed_bps = int(download_mbps * 1000 * 1000 / 8)
         speed_mib_s = speed_bps / 1024 / 1024
 
@@ -3372,6 +3389,57 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                     process.kill()
                 except Exception:
                     pass
+
+
+def fetch_proxy_speed_quality() -> dict[str, Any]:
+    """
+    使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
+
+    增强：
+    - Cannot open socket / Download: FAILED 自动重试；
+    - 只接受包含 data used 的完整下载结果；
+    - 数据量为 0 不算测速完成。
+    """
+    install_speedtest_cli()
+    ensure_speedtest_interface_ready(SPEEDTEST_INTERFACE)
+
+    speedtest_env = build_speedtest_env()
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, SPEEDTEST_RETRY_TIMES + 1):
+        try:
+            return run_speedtest_once(
+                speedtest_env=speedtest_env,
+                attempt=attempt,
+                max_attempts=SPEEDTEST_RETRY_TIMES,
+            )
+
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc)
+
+            can_retry = is_retryable_speedtest_error(msg)
+            is_last = attempt >= SPEEDTEST_RETRY_TIMES
+
+            if not can_retry or is_last:
+                raise
+
+            print(
+                f"[测速] speedtest 第 {attempt}/{SPEEDTEST_RETRY_TIMES} 次失败，可重试错误: {msg}，"
+                f"{SPEEDTEST_RETRY_DELAY_SECONDS}s 后重试...",
+                flush=True,
+            )
+            log_to_json(
+                "WARNING",
+                "Speed",
+                f"speedtest 第 {attempt}/{SPEEDTEST_RETRY_TIMES} 次失败，可重试错误: {msg}，"
+                f"{SPEEDTEST_RETRY_DELAY_SECONDS}s 后重试",
+            )
+
+            time.sleep(SPEEDTEST_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError(f"speedtest 测速失败: {last_error}")
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     score = parse_int(info.get("ippure_score"))
