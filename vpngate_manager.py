@@ -808,6 +808,10 @@ def build_switch_duration_chart(history: Any, max_items: int = 10) -> list[dict[
     - 柱高由前端根据真实 seconds 绘制
     """
     items = prune_switch_duration_history(history, max_items)
+    items = sorted(
+        items,
+        key=lambda x: float(x.get("finished_at", 0) or 0)
+    )
     chart: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
@@ -1080,6 +1084,10 @@ def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 
     图表单位改为：小时
     """
     items = prune_ip_uptime_history(history, max_items)
+    items = sorted(
+        items,
+        key=lambda x: float(x.get("ended_at", 0) or 0)
+    )
 
     chart: list[dict[str, Any]] = []
 
