@@ -1217,7 +1217,7 @@ def build_ip_uptime_chart(history: Any, state: dict[str, Any], max_items: int = 
 
     # 隐藏尾部当前 IP 后，再保留最近 max_items 条
     items = items[-max_items:]
-    
+
     chart: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
@@ -2683,7 +2683,7 @@ def auto_switch_node(
             return
 
     if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
-        msg = f"{target_country} 国家内没有更多符合条件的可切换节点，已停止自动切换"
+        msg = f"{target_country} 国家内暂无更多符合条件的可切换节点，正在拉取新节点，稍后继续尝试切换"
     else:
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点"
 
