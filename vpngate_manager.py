@@ -5724,7 +5724,7 @@ function formatSwitchDurationAxisLabel(seconds){
 function getSwitchDurationLevel(seconds){
   const s = Math.max(0, Number(seconds) || 0);
 
-  // 快速：≤ 1分钟
+  // 绿色：≤ 1 分钟
   if (s <= 60) {
     return {
       colorTop: "rgba(38, 162, 105, 0.96)",
@@ -5733,8 +5733,8 @@ function getSwitchDurationLevel(seconds){
     };
   }
 
-  // 中等：≤ 1小时
-  if (s <= 3600) {
+  // 蓝色：> 1 分钟 且 ≤ 5 分钟
+  if (s <= 5 * 60) {
     return {
       colorTop: "rgba(59, 130, 246, 0.96)",
       colorBottom: "rgba(59, 130, 246, 0.48)",
@@ -5742,8 +5742,8 @@ function getSwitchDurationLevel(seconds){
     };
   }
 
-  // 偏慢：≤ 1天
-  if (s <= 86400) {
+  // 橙色：> 5 分钟 且 ≤ 10 分钟
+  if (s <= 10 * 60) {
     return {
       colorTop: "rgba(245, 158, 11, 0.96)",
       colorBottom: "rgba(245, 158, 11, 0.48)",
@@ -5751,7 +5751,8 @@ function getSwitchDurationLevel(seconds){
     };
   }
 
-  // 异常：超过 1天
+  // 红色：> 10 分钟
+  // 30 分钟以上自然也属于红色
   return {
     colorTop: "rgba(239, 68, 68, 0.96)",
     colorBottom: "rgba(239, 68, 68, 0.48)",
