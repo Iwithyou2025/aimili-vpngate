@@ -1167,6 +1167,83 @@ def record_auto_node_switch(node_id: str = "", reason: str = "") -> None:
         last_auto_switch_node_id=node_id,
         last_auto_switch_reason=reason,
     )
+def init_state_on_start() -> None:
+    """
+    服务启动时初始化 state.json。
+
+    只重置运行态字段，不覆盖历史统计数据：
+    - auto_switch_daily_counts
+    - node_switch_duration_history
+    - ip_uptime_history
+    - current_ip_uptime_xxx
+    """
+    old_state = read_json(STATE_FILE, {})
+    if not isinstance(old_state, dict):
+        old_state = {}
+
+    # 防止历史版本遗留敏感字段
+    for key in SENSITIVE_STATE_KEYS:
+        old_state.pop(key, None)
+
+    # 这些是启动时需要刷新的运行态字段
+    runtime_updates = {
+        "api_url": API_URL,
+        "target_valid_nodes": TARGET_VALID_NODES,
+        "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
+        "check_interval_seconds": CHECK_INTERVAL_SECONDS,
+        "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+
+        "active_openvpn_node_id": "",
+        "last_fetch_status": "starting",
+        "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
+        "is_connecting": True,
+        "active_node_latency": "正在准备",
+        "connected_at": None,
+
+        # 启动后不要继承“正在切换中”的状态，避免重启后算出异常超长切换耗时
+        "node_switch_started_at": None,
+        "node_switch_reason": "",
+    }
+
+    old_state.update(runtime_updates)
+
+    # 这些统计字段只补默认值，不覆盖已有数据
+    old_state.setdefault("auto_switch_daily_counts", {})
+    old_state.setdefault("last_auto_switch_recorded_at", None)
+    old_state.setdefault("last_auto_switch_node_id", "")
+    old_state.setdefault("last_auto_switch_reason", "")
+
+    old_state.setdefault("node_switch_duration_history", [])
+    old_state.setdefault("last_node_switch_duration_seconds", 0)
+    old_state.setdefault("last_node_switch_duration_text", "-")
+    old_state.setdefault("last_node_switch_finished_at", None)
+    old_state.setdefault("last_node_switch_reason", "")
+
+    old_state.setdefault("ip_uptime_history", [])
+    old_state.setdefault("current_ip_uptime_ip", "")
+    old_state.setdefault("current_ip_uptime_node_id", "")
+    old_state.setdefault("current_ip_uptime_started_at", None)
+    old_state.setdefault("current_ip_uptime_last_seen_at", None)
+    old_state.setdefault("current_ip_uptime_reason", "")
+
+    # 顺手裁剪，避免文件无限变大
+    old_state["node_switch_duration_history"] = prune_switch_duration_history(
+        old_state.get("node_switch_duration_history", []),
+        20,
+    )
+
+    old_state["ip_uptime_history"] = prune_ip_uptime_history(
+        old_state.get("ip_uptime_history", []),
+        10,
+    )
+
+    counts = old_state.get("auto_switch_daily_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+
+    old_state["auto_switch_daily_counts"] = prune_auto_switch_daily_counts(counts)
+
+    write_json(STATE_FILE, sanitize_state_for_disk(old_state))
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -7569,22 +7646,7 @@ def main() -> None:
     sys.stdout = tee
     sys.stderr = tee
 
-    write_json(
-        STATE_FILE,
-        {
-            "api_url": API_URL,
-            "target_valid_nodes": TARGET_VALID_NODES,
-            "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
-            "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-            "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
-            "active_openvpn_node_id": "",
-            "last_fetch_status": "starting",
-            "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
-            "is_connecting": True,
-            "active_node_latency": "正在准备",
-            "connected_at": None,
-        },
-    )
+    init_state_on_start()
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     
     # Wait for the gateway to officially start
