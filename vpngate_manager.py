@@ -5871,7 +5871,7 @@ function drawSwitchDurationChart(){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const pad = { left: 82, right: 28, top: 34, bottom: 120 };
+  const pad = { left: 82, right: 28, top: 34, bottom: 135 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const baseY = pad.top + plotH;
@@ -5965,8 +5965,8 @@ function drawSwitchDurationChart(){
 
     // 柱底：切换完成后的系统时间
     ctx.save();
-    ctx.translate(x + barW / 2, height - 44);
-    ctx.rotate(-Math.PI / 4);
+    ctx.translate(x + barW / 2, height - 56);
+    ctx.rotate(-Math.PI / 5);
     ctx.fillStyle = "rgba(226, 232, 240, 0.70)";
     ctx.textAlign = "right";
     ctx.fillText(String(item.label || item.finished_label || index + 1), 0, 0);
