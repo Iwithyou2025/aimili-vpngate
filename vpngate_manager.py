@@ -187,8 +187,8 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 PROJECT_UPDATE_CONFIG_FILE = DATA_DIR / "project_update.json"
 LAST_CONNECTED_NODE_FILE = DATA_DIR / "last_connected_node.json"
 PROJECT_AUTO_UPDATE_INTERVAL_SECONDS = max(
-    30,
-    int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "120"))
+    3,
+    int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "3"))
 )
 lock = threading.RLock()
 
@@ -766,7 +766,7 @@ def finish_node_switch_duration(reason: str = "") -> None:
     )
 
 
-def prune_switch_duration_history(history: Any, max_items: int = 20) -> list[dict[str, Any]]:
+def prune_switch_duration_history(history: Any, max_items: int = 10) -> list[dict[str, Any]]:
     """
     只保留最近 max_items 次切换耗时记录。
     """
@@ -799,28 +799,44 @@ def prune_switch_duration_history(history: Any, max_items: int = 20) -> list[dic
     return cleaned[-max_items:]
 
 
-def build_switch_duration_chart(history: Any, max_items: int = 20) -> list[dict[str, Any]]:
+def build_switch_duration_chart(history: Any, max_items: int = 10) -> list[dict[str, Any]]:
     """
-    构建最近 20 次切换耗时图表数据。
-    横轴：次数，从远到近 1、2、3...
-    竖轴：分钟数。
+    构建最近 10 次节点切换耗时图表数据。
+
+    - 柱子底部 label：节点切换完成时的系统时间
+    - 柱子顶部 text：节点切换耗时
+    - 柱高由前端根据真实 seconds 绘制
     """
     items = prune_switch_duration_history(history, max_items)
     chart: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
-        duration_seconds = int(item.get("duration_seconds", 0) or 0)
-        minutes = round(duration_seconds / 60, 2)
+        duration_seconds = max(0, int(item.get("duration_seconds", 0) or 0))
+
+        try:
+            finished_at = float(item.get("finished_at", 0) or 0)
+        except (TypeError, ValueError):
+            finished_at = 0
+
+        if finished_at > 0:
+            finished_label = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(finished_at),
+            )
+        else:
+            finished_label = "-"
 
         chart.append({
             "index": index,
-            "label": str(index),
-            "minutes": minutes,
+            "label": finished_label,
+            "finished_at": finished_at,
             "seconds": duration_seconds,
             "text": item.get("duration_text") or format_switch_duration(duration_seconds),
+            "reason": item.get("reason") or "",
         })
 
     return chart
+
 def normalize_uptime_ip(ip: Any) -> str:
     ip = str(ip or "").strip()
     if not ip or ip in {"-", "0.0.0.0", "unknown", "None"}:
@@ -1229,7 +1245,7 @@ def init_state_on_start() -> None:
     # 顺手裁剪，避免文件无限变大
     old_state["node_switch_duration_history"] = prune_switch_duration_history(
         old_state.get("node_switch_duration_history", []),
-        20,
+        10,
     )
 
     old_state["ip_uptime_history"] = prune_ip_uptime_history(
@@ -1271,12 +1287,12 @@ def get_state() -> dict[str, Any]:
 
     state["node_switch_duration_history"] = prune_switch_duration_history(
         state.get("node_switch_duration_history", []),
-        20,
+        10,
     )
 
     state["switch_duration_chart"] = build_switch_duration_chart(
         state["node_switch_duration_history"],
-        20,
+        10,
     )
     state.setdefault("ip_uptime_history", [])
     state.setdefault("current_ip_uptime_ip", "")
@@ -4372,9 +4388,14 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 0;
     }
     
+    .switch-duration-chart-wrap {
+      height: 390px;
+      margin-bottom: 24px;
+    }
+    
     #switch_duration_chart {
       width: 100%;
-      height: 220px;
+      height: 390px;
       display: block;
     }
 
@@ -5059,25 +5080,34 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+<div class="switch-chart-head switch-chart-head-secondary">
+  <div>
+    <div class="switch-chart-title">最近 10 次节点切换耗时</div>
+    <div class="switch-chart-subtitle">
+      柱子底部为节点切换完成后的系统时间；柱子顶部为本次切换耗时；纵轴使用对数轴，避免秒级、分钟级、小时级、天级混合时显示失真。
+    </div>
+  </div>
+
+  <div class="ip-uptime-tools">
     <div class="ip-uptime-legend">
-      <span class="legend-item"><i class="legend-dot legend-green"></i>较长（稳）</span>
-      <span class="legend-item"><i class="legend-dot legend-blue"></i>中等</span>
-      <span class="legend-item"><i class="legend-dot legend-orange"></i>偏短</span>
-      <span class="legend-item"><i class="legend-dot legend-red"></i>较短（不稳）</span>
+      <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
+      <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤1小时）</span>
+      <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤1天）</span>
+      <span class="legend-item"><i class="legend-dot legend-red"></i>异常（超1天）</span>
     </div>
 
-    <button id="refresh_ip_uptime_btn" type="button" class="chart-refresh-btn">
+    <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
       刷新数据
     </button>
 
     <div class="switch-chart-total">
-      已记录：<strong id="ip_uptime_count">0</strong> 个 IP
+      已记录：<strong id="switch_duration_count">0</strong> 次
     </div>
   </div>
 </div>
 
-<div class="switch-chart-wrap ip-uptime-chart-wrap">
-  <canvas id="ip_uptime_chart"></canvas>
+<div class="switch-chart-wrap switch-duration-chart-wrap">
+  <canvas id="switch_duration_chart"></canvas>
 </div>
 
   <!-- 当前连接活动节点卡片 -->
@@ -5617,18 +5647,200 @@ function drawAutoSwitchChart(){
     ctx.fillText(p.label, p.x, height - 14);
   });
 }
-function formatChartMinute(value){
-  const n = Number(value) || 0;
 
-  if (n >= 10) {
-    return String(Math.round(n));
+
+function getSwitchDurationSeconds(item){
+  const seconds = Number(item && item.seconds);
+
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds;
   }
 
-  if (n >= 1) {
-    return n.toFixed(1).replace(/\.0$/, "");
+  const minutes = Number(item && item.minutes);
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return minutes * 60;
   }
 
-  return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+  return 0;
+}
+
+function formatSwitchDurationTopLabel(seconds){
+  let total = Math.max(0, Math.floor(Number(seconds) || 0));
+
+  const days = Math.floor(total / 86400);
+  total %= 86400;
+
+  const hours = Math.floor(total / 3600);
+  total %= 3600;
+
+  const minutes = Math.floor(total / 60);
+  const secs = total % 60;
+
+  if (days > 0) {
+    return minutes > 0
+      ? `${days}天${hours}小时${minutes}分`
+      : `${days}天${hours}小时`;
+  }
+
+  if (hours > 0) {
+    return minutes > 0
+      ? `${hours}小时${minutes}分`
+      : `${hours}小时`;
+  }
+
+  if (minutes > 0) {
+    return secs > 0
+      ? `${minutes}分${secs}秒`
+      : `${minutes}分钟`;
+  }
+
+  return `${Math.max(1, secs)}秒`;
+}
+
+function formatSwitchDurationAxisLabel(seconds){
+  const s = Math.max(1, Number(seconds) || 1);
+
+  if (s < 60) {
+    return `${Math.round(s)}秒`;
+  }
+
+  if (s < 3600) {
+    return `${Math.round(s / 60)}分钟`;
+  }
+
+  if (s < 86400) {
+    const h = s / 3600;
+    return `${Number.isInteger(h) ? h : h.toFixed(1).replace(/\.0$/, "")}小时`;
+  }
+
+  const d = s / 86400;
+  return `${Number.isInteger(d) ? d : d.toFixed(1).replace(/\.0$/, "")}天`;
+}
+
+function getSwitchDurationLevel(seconds){
+  const s = Math.max(0, Number(seconds) || 0);
+
+  // 快速：≤ 1分钟
+  if (s <= 60) {
+    return {
+      colorTop: "rgba(38, 162, 105, 0.96)",
+      colorBottom: "rgba(38, 162, 105, 0.48)",
+      textColor: "rgba(52, 211, 153, 0.98)"
+    };
+  }
+
+  // 中等：≤ 1小时
+  if (s <= 3600) {
+    return {
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
+    };
+  }
+
+  // 偏慢：≤ 1天
+  if (s <= 86400) {
+    return {
+      colorTop: "rgba(245, 158, 11, 0.96)",
+      colorBottom: "rgba(245, 158, 11, 0.48)",
+      textColor: "rgba(251, 191, 36, 0.98)"
+    };
+  }
+
+  // 异常：超过 1天
+  return {
+    colorTop: "rgba(239, 68, 68, 0.96)",
+    colorBottom: "rgba(239, 68, 68, 0.48)",
+    textColor: "rgba(248, 113, 113, 0.98)"
+  };
+}
+
+/**
+ * 切换耗时图表专用视觉缩放。
+ *
+ * 关键点：
+ * - 使用真实 seconds，不使用四舍五入后的 minutes / hours
+ * - 使用对数缩放，避免 10秒、10分钟、10小时、10天混在一起时小值看不见
+ * - 全是秒级 / 分钟级时，也能体现柱高差异
+ */
+function buildSwitchDurationVisualScale(secondsList){
+  const values = secondsList
+    .map(v => Math.max(0, Number(v) || 0))
+    .filter(v => v > 0);
+
+  if (!values.length) {
+    return {
+      minAxis: 1,
+      maxAxis: 60,
+      minVisual: Math.log10(1),
+      maxVisual: Math.log10(60),
+      toVisualRatio: () => 0,
+      visualToSeconds: () => 1,
+    };
+  }
+
+  const minData = Math.min(...values);
+  const maxData = Math.max(...values);
+
+  let minAxis = Math.max(1, minData * 0.7);
+  let maxAxis = Math.max(10, maxData * 1.25);
+
+  // 如果数据跨度很小，给一点额外空间，避免柱子全挤在顶部
+  if (maxAxis / minAxis < 2) {
+    minAxis = Math.max(1, minData * 0.5);
+    maxAxis = Math.max(maxData * 1.8, minAxis * 2);
+  }
+
+  const minVisual = Math.log10(minAxis);
+  const maxVisual = Math.log10(maxAxis);
+
+  const toVisualRatio = (seconds) => {
+    const s = Math.max(minAxis, Number(seconds) || minAxis);
+    const v = Math.log10(s);
+    return Math.max(0, Math.min(1, (v - minVisual) / Math.max(0.0001, maxVisual - minVisual)));
+  };
+
+  const visualToSeconds = (ratio) => {
+    const r = Math.max(0, Math.min(1, Number(ratio) || 0));
+    const v = minVisual + (maxVisual - minVisual) * r;
+    return Math.pow(10, v);
+  };
+
+  return {
+    minAxis,
+    maxAxis,
+    minVisual,
+    maxVisual,
+    toVisualRatio,
+    visualToSeconds,
+  };
+}
+
+async function refreshSwitchDurationChartData(){
+  const btn = $("refresh_switch_duration_btn");
+
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "刷新中...";
+    }
+
+    const r = await fetch("./api/nodes");
+    const d = await r.json();
+
+    nodes = d.nodes || [];
+    state = d.state || {};
+
+    stableSortNodes();
+    render();
+  } catch (e) {
+    console.error("刷新节点切换耗时图失败:", e);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "刷新数据";
+    }
+  }
 }
 
 function drawSwitchDurationChart(){
@@ -5641,9 +5853,9 @@ function drawSwitchDurationChart(){
   if (countEl) countEl.textContent = data.length;
 
   const wrapper = canvas.parentElement;
-  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 220 };
-  const width = Math.max(640, Math.floor(rect.width || 900));
-  const height = Math.max(220, Math.floor(rect.height || 220));
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 390 };
+  const width = Math.max(760, Math.floor(rect.width || 900));
+  const height = Math.max(390, Math.floor(rect.height || 390));
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = Math.floor(width * dpr);
@@ -5655,7 +5867,7 @@ function drawSwitchDurationChart(){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const pad = { left: 48, right: 18, top: 18, bottom: 34 };
+  const pad = { left: 82, right: 28, top: 34, bottom: 120 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const baseY = pad.top + plotH;
@@ -5669,16 +5881,19 @@ function drawSwitchDurationChart(){
     return;
   }
 
-  const values = data.map(item => Number(item.minutes) || 0);
-  const maxValue = Math.max(0, ...values);
-  const maxY = Math.max(1, Math.ceil((maxValue * 1.2 || 1) * 10) / 10);
+  // 关键：柱高使用真实 seconds，不使用 minutes 的四舍五入值
+  const secondValues = data.map(item => getSwitchDurationSeconds(item));
+  const scale = buildSwitchDurationVisualScale(secondValues);
 
   ctx.font = "12px Outfit, sans-serif";
   ctx.textBaseline = "middle";
 
-  for (let i = 0; i <= 4; i++) {
-    const value = maxY - (maxY / 4) * i;
-    const y = pad.top + (plotH / 4) * i;
+  // 横向网格线 + 对数轴刻度
+  const gridSteps = 4;
+  for (let i = 0; i <= gridSteps; i++) {
+    const ratio = 1 - (i / gridSteps);
+    const axisSeconds = scale.visualToSeconds(ratio);
+    const y = pad.top + (plotH / gridSteps) * i;
 
     ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
     ctx.lineWidth = 1;
@@ -5687,28 +5902,38 @@ function drawSwitchDurationChart(){
     ctx.lineTo(width - pad.right, y);
     ctx.stroke();
 
-    ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
+    ctx.fillStyle = "rgba(226, 232, 240, 0.72)";
     ctx.textAlign = "right";
-    ctx.fillText(formatChartMinute(value), pad.left - 10, y);
+    ctx.fillText(formatSwitchDurationAxisLabel(axisSeconds), pad.left - 12, y);
   }
 
+  // 纵轴说明
+  ctx.save();
+  ctx.translate(24, pad.top + plotH / 2);
+  ctx.rotate(-Math.PI / 2);
   ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
-  ctx.textAlign = "left";
-  ctx.fillText("分钟", pad.left, 10);
+  ctx.textAlign = "center";
+  ctx.fillText("耗时（对数轴）", 0, 0);
+  ctx.restore();
 
-  const gap = 8;
-  const barW = Math.max(10, Math.min(42, (plotW - gap * (data.length - 1)) / data.length));
+  const slotW = plotW / data.length;
+  const barW = Math.max(18, Math.min(54, slotW * 0.50));
 
   data.forEach((item, index) => {
-    const minutes = Number(item.minutes) || 0;
+    const seconds = getSwitchDurationSeconds(item);
 
-    const x = pad.left + index * ((plotW) / data.length) + ((plotW / data.length) - barW) / 2;
-    const barH = Math.max(2, (minutes / maxY) * plotH);
+    // 关键：柱高根据真实 seconds 的对数比例计算
+    const ratio = scale.toVisualRatio(seconds);
+    const barH = Math.max(4, ratio * plotH);
+    const x = pad.left + index * slotW + (slotW - barW) / 2;
     const y = baseY - barH;
 
+    // 关键：颜色根据真实 seconds 阈值判断
+    const level = getSwitchDurationLevel(seconds);
+
     const gradient = ctx.createLinearGradient(0, y, 0, baseY);
-    gradient.addColorStop(0, "rgba(99, 102, 241, 0.92)");
-    gradient.addColorStop(1, "rgba(99, 102, 241, 0.42)");
+    gradient.addColorStop(0, level.colorTop);
+    gradient.addColorStop(1, level.colorBottom);
 
     ctx.fillStyle = gradient;
 
@@ -5724,13 +5949,33 @@ function drawSwitchDurationChart(){
     ctx.closePath();
     ctx.fill();
 
-    ctx.fillStyle = "rgba(226, 232, 240, 0.88)";
+    // 柱顶：切换耗时
+    ctx.font = "12px Outfit, sans-serif";
+    ctx.fillStyle = level.textColor;
     ctx.textAlign = "center";
-    ctx.fillText(formatChartMinute(minutes), x + barW / 2, Math.max(12, y - 12));
+    ctx.fillText(
+      formatSwitchDurationTopLabel(seconds),
+      x + barW / 2,
+      Math.max(12, y - 14)
+    );
 
+    // 柱底：切换完成后的系统时间
+    ctx.save();
+    ctx.translate(x + barW / 2, height - 44);
+    ctx.rotate(-Math.PI / 4);
     ctx.fillStyle = "rgba(226, 232, 240, 0.70)";
-    ctx.fillText(String(item.label || index + 1), x + barW / 2, height - 14);
+    ctx.textAlign = "right";
+    ctx.fillText(String(item.label || item.finished_label || index + 1), 0, 0);
+    ctx.restore();
   });
+
+  // 底部基线
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.24)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, baseY);
+  ctx.lineTo(width - pad.right, baseY);
+  ctx.stroke();
 }
 
 
@@ -6932,8 +7177,15 @@ async function logoutAdmin() {
 
 document.addEventListener("click", (e) => {
   const target = e.target;
+
+  if (target && target.id === "refresh_switch_duration_btn") {
+    refreshSwitchDurationChartData();
+    return;
+  }
+
   if (target && target.id === "refresh_ip_uptime_btn") {
     refreshIpUptimeChartData();
+    return;
   }
 });
 
