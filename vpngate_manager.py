@@ -5514,6 +5514,36 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
+
+let proxyAuthVisible = false;
+
+function maskProxySecret(value){
+  const s = String(value || "");
+
+  if (!s) return "未配置";
+  if (s === "未配置") return s;
+
+  // 太短的全部脱敏
+  if (s.length <= 6) {
+    return "•".repeat(s.length);
+  }
+
+  // 保留前 4 位和后 4 位，中间脱敏
+  return `${s.slice(0, 4)}••••${s.slice(-4)}`;
+}
+
+function getProxyAuthDisplay(value){
+  const s = String(value || "未配置");
+  return proxyAuthVisible ? s : maskProxySecret(s);
+}
+
+function toggleProxyAuthVisible(){
+  proxyAuthVisible = !proxyAuthVisible;
+  render();
+}
+
+
+
 let currentPage = 1;
 const pageSize = 11;
 let currentPageNodes = [];
@@ -6664,20 +6694,34 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  const proxyAuthInfo = state.proxy_auth_enabled
-  ? `<span class="proxy-auth-info">
-       <span class="proxy-auth-user">
-         ● 代理用户名：<strong class="mono">${esc(state.proxy_username || "未配置")}</strong>
-         <button type="button" class="copy-auth-btn" onclick="copyProxyField('username', this)">复制</button>
-       </span>
-       <span class="proxy-auth-pass">
-         ● 代理密码：<strong class="mono">${esc(state.proxy_password || "未配置")}</strong>
-         <button type="button" class="copy-auth-btn" onclick="copyProxyField('password', this)">复制</button>
-       </span>
-     </span>`
-  : `<span class="proxy-auth-info">
-       <span style="color:#fb7185;">● 代理认证：未开启</span>
-     </span>`;
+    const proxyAuthInfo = state.proxy_auth_enabled
+      ? `<span class="proxy-auth-info">
+           <span class="proxy-auth-user">
+             ● 代理用户名：
+             <strong class="mono" title="${proxyAuthVisible ? "当前显示明文" : "当前已脱敏"}">
+               ${esc(getProxyAuthDisplay(state.proxy_username || "未配置"))}
+             </strong>
+             <button type="button" class="copy-auth-btn" onclick="copyProxyField('username', this)">复制</button>
+           </span>
+    
+           <span class="proxy-auth-pass">
+             ● 代理密码：
+             <strong class="mono" title="${proxyAuthVisible ? "当前显示明文" : "当前已脱敏"}">
+               ${esc(getProxyAuthDisplay(state.proxy_password || "未配置"))}
+             </strong>
+             <button type="button" class="copy-auth-btn" onclick="copyProxyField('password', this)">复制</button>
+           </span>
+    
+           <button type="button"
+             class="copy-auth-btn"
+             onclick="toggleProxyAuthVisible()"
+             title="${proxyAuthVisible ? "切换为脱敏显示" : "显示代理账号密码明文"}">
+             ${proxyAuthVisible ? "隐藏" : "显示"}
+           </button>
+         </span>`
+      : `<span class="proxy-auth-info">
+           <span style="color:#fb7185;">● 代理认证：未开启</span>
+         </span>`;
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
 
