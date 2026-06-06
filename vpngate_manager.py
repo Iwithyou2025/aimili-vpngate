@@ -5052,14 +5052,13 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="switch-chart-head switch-chart-head-secondary">
   <div>
-    <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 连接时长</div>
+    <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 持续时长</div>
     <div class="switch-chart-subtitle">
       从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
       当前正在连接的 IP 不显示，结束后再进入统计。
     </div>
   </div>
 
-  <div class="ip-uptime-tools">
     <div class="ip-uptime-legend">
       <span class="legend-item"><i class="legend-dot legend-green"></i>较长（稳）</span>
       <span class="legend-item"><i class="legend-dot legend-blue"></i>中等</span>
@@ -5949,7 +5948,6 @@ function formatIpUptimeTopLabel(seconds){
 function getIpUptimeLevel(hours){
   const h = Number(hours) || 0;
 
-  // 你可以按自己想法调整阈值
   if (h >= 24) {
     return {
       colorTop: "rgba(38, 162, 105, 0.96)",
