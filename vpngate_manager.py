@@ -5734,25 +5734,176 @@ function drawSwitchDurationChart(){
   });
 }
 
-function formatChartHour(value){
-  const n = Number(value) || 0;
 
-  if (Number.isInteger(n)) {
-    return String(n);
-  }
-
-  return n.toFixed(1).replace(/\.0$/, "");
-}
 
 function formatChartHour(value){
   const n = Number(value) || 0;
 
-  if (Number.isInteger(n)) {
-    return `${n}h`;
+  if (n >= 100) {
+    return `${Math.round(n)}h`;
   }
 
-  return `${n.toFixed(1).replace(/\.0$/, "")}h`;
+  if (n >= 10) {
+    return `${Math.round(n * 10) / 10}h`;
+  }
+
+  if (n >= 1) {
+    return `${n.toFixed(1).replace(/\.0$/, "")}h`;
+  }
+
+  return `${n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}h`;
 }
+
+function formatAxisSecondsAsHours(seconds){
+  const h = Math.max(0, Number(seconds) || 0) / 3600;
+  return formatChartHour(h);
+}
+
+function getIpUptimeSeconds(item){
+  const seconds = Number(item && item.seconds);
+
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds;
+  }
+
+  const hours = Number(item && item.hours);
+  if (Number.isFinite(hours) && hours > 0) {
+    return hours * 3600;
+  }
+
+  return 0;
+}
+
+/**
+ * 自适应视觉缩放：
+ * - 数据跨度不大：线性缩放
+ * - 数据跨度很大：对数缩放
+ *
+ * 目的：
+ * - 全是分钟级时，2分钟、8分钟、26分钟能看出差异
+ * - 分钟/小时/天数混合时，分钟级不会被天数级完全压扁
+ * - 全是天数时，也能保持差异
+ */
+function buildIpUptimeVisualScale(secondsList){
+  const values = secondsList
+    .map(v => Math.max(0, Number(v) || 0))
+    .filter(v => v > 0);
+
+  const maxSeconds = values.length ? Math.max(...values) : 1;
+  const minSeconds = values.length ? Math.min(...values) : 1;
+
+  const ratio = maxSeconds / Math.max(1, minSeconds);
+
+  // 跨度超过 10 倍时，用对数压缩，避免小值全部贴地
+  const useLogScale = ratio >= 10;
+
+  const toVisual = (seconds) => {
+    const s = Math.max(0, Number(seconds) || 0);
+
+    if (useLogScale) {
+      // 以分钟为单位做 log，分钟级差异会更明显
+      return Math.log1p(s / 60);
+    }
+
+    return s;
+  };
+
+  const fromVisual = (visual) => {
+    const v = Math.max(0, Number(visual) || 0);
+
+    if (useLogScale) {
+      return Math.expm1(v) * 60;
+    }
+
+    return v;
+  };
+
+  const maxVisual = Math.max(1, toVisual(maxSeconds) * 1.15);
+
+  return {
+    useLogScale,
+    maxSeconds,
+    minSeconds,
+    maxVisual,
+    toVisual,
+    fromVisual,
+  };
+}
+
+/**
+ * 颜色按当前这批数据的相对排名分级，而不是按固定小时阈值。
+ *
+ * 最短 -> 绿色
+ * 中等 -> 蓝色
+ * 偏长 -> 橙色
+ * 最长 -> 红色
+ */
+function getIpUptimeLevelByRank(seconds, sortedSeconds){
+  const current = Math.max(0, Number(seconds) || 0);
+  const list = Array.isArray(sortedSeconds) ? sortedSeconds : [];
+
+  if (!list.length) {
+    return {
+      colorTop: "rgba(38, 162, 105, 0.96)",
+      colorBottom: "rgba(38, 162, 105, 0.48)",
+      textColor: "rgba(52, 211, 153, 0.98)"
+    };
+  }
+
+  const min = list[0];
+  const max = list[list.length - 1];
+
+  // 所有数据完全一样时，客观上无法区分长短
+  if (max <= min) {
+    return {
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
+    };
+  }
+
+  let lessCount = 0;
+  let equalCount = 0;
+
+  for (const v of list) {
+    if (v < current) lessCount++;
+    if (v === current) equalCount++;
+  }
+
+  // 相对位置：0 = 最短，1 = 最长
+  const rankRatio = (lessCount + Math.max(0, equalCount - 1) / 2) / Math.max(1, list.length - 1);
+
+  if (rankRatio <= 0.25) {
+    return {
+      colorTop: "rgba(38, 162, 105, 0.96)",
+      colorBottom: "rgba(38, 162, 105, 0.48)",
+      textColor: "rgba(52, 211, 153, 0.98)"
+    };
+  }
+
+  if (rankRatio <= 0.50) {
+    return {
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
+    };
+  }
+
+  if (rankRatio <= 0.75) {
+    return {
+      colorTop: "rgba(245, 158, 11, 0.96)",
+      colorBottom: "rgba(245, 158, 11, 0.48)",
+      textColor: "rgba(251, 191, 36, 0.98)"
+    };
+  }
+
+  return {
+    colorTop: "rgba(239, 68, 68, 0.96)",
+    colorBottom: "rgba(239, 68, 68, 0.48)",
+    textColor: "rgba(248, 113, 113, 0.98)"
+  };
+}
+
 function formatIpUptimeTopLabel(seconds){
   let total = Number(seconds) || 0;
   total = Math.max(0, Math.floor(total));
@@ -5895,9 +6046,10 @@ function drawIpUptimeChart(){
     return;
   }
 
-  const values = data.map(item => Number(item.hours) || 0);
-  const maxValue = Math.max(0, ...values);
-  const maxY = Math.max(1, Math.ceil((maxValue * 1.15 || 1) * 2) / 2);
+  // 关键：柱高和颜色都使用真实 seconds，不使用后端四舍五入后的 item.hours
+  const secondValues = data.map(item => getIpUptimeSeconds(item));
+  const sortedSeconds = [...secondValues].sort((a, b) => a - b);
+  const scale = buildIpUptimeVisualScale(secondValues);
 
   ctx.font = "12px Outfit, sans-serif";
   ctx.textBaseline = "middle";
@@ -5905,8 +6057,10 @@ function drawIpUptimeChart(){
   // 横向网格线 + 纵轴刻度
   const gridSteps = 5;
   for (let i = 0; i <= gridSteps; i++) {
-    const value = maxY - (maxY / gridSteps) * i;
+    const visualValue = scale.maxVisual - (scale.maxVisual / gridSteps) * i;
     const y = pad.top + (plotH / gridSteps) * i;
+
+    const axisSeconds = scale.fromVisual(visualValue);
 
     ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
     ctx.lineWidth = 1;
@@ -5917,7 +6071,7 @@ function drawIpUptimeChart(){
 
     ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
     ctx.textAlign = "right";
-    ctx.fillText(formatChartHour(value), pad.left - 12, y);
+    ctx.fillText(formatAxisSecondsAsHours(axisSeconds), pad.left - 12, y);
   }
 
   // 纵轴标题
@@ -5929,13 +6083,17 @@ function drawIpUptimeChart(){
   const barW = Math.max(18, Math.min(58, slotW * 0.52));
 
   data.forEach((item, index) => {
-    const hours = Number(item.hours) || 0;
+    const seconds = getIpUptimeSeconds(item);
 
+    const visualValue = scale.toVisual(seconds);
     const x = pad.left + index * slotW + (slotW - barW) / 2;
-    const barH = Math.max(3, (hours / maxY) * plotH);
+
+    // 关键：柱高按真实 seconds 的视觉值计算
+    const barH = Math.max(3, (visualValue / scale.maxVisual) * plotH);
     const y = baseY - barH;
 
-    const level = getIpUptimeLevel(hours);
+    // 关键：颜色按当前 10 条数据里的相对排名计算
+    const level = getIpUptimeLevelByRank(seconds, sortedSeconds);
 
     const gradient = ctx.createLinearGradient(0, y, 0, baseY);
     gradient.addColorStop(0, level.colorTop);
@@ -5955,9 +6113,9 @@ function drawIpUptimeChart(){
     ctx.closePath();
     ctx.fill();
 
-    // 柱顶值
-    const labelText = formatIpUptimeTopLabel(item.seconds);
-    
+    // 柱顶值：继续显示真实时长，比如 2分钟 / 13小时51分 / 3天16小时48分
+    const labelText = formatIpUptimeTopLabel(seconds);
+
     ctx.font = "12px Outfit, sans-serif";
     ctx.fillStyle = level.textColor;
     ctx.textAlign = "center";
