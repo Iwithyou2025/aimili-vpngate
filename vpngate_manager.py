@@ -3154,6 +3154,61 @@ def ensure_speedtest_interface_exists(interface: str) -> None:
     if not iface_path.exists():
         raise RuntimeError(f"speedtest 测速接口 {iface} 不存在，请确认 OpenVPN 已成功创建 tun0")
 
+def build_speedtest_env() -> dict[str, str]:
+    """
+    给 Ookla speedtest CLI 补齐运行环境。
+
+    修复：
+    systemd 服务环境下 HOME / USER / LOGNAME 等变量可能为空，
+    speedtest CLI 可能因此崩溃：
+    basic_string::_M_construct null not valid
+    """
+    env = os.environ.copy()
+
+    env.setdefault("HOME", "/root")
+    env.setdefault("USER", "root")
+    env.setdefault("LOGNAME", "root")
+    env.setdefault("LANG", "C.UTF-8")
+    env.setdefault("LC_ALL", "C.UTF-8")
+
+    # 给 speedtest 写配置 / 缓存用，避免 HOME 异常
+    config_home = DATA_DIR / ".config"
+    cache_home = DATA_DIR / ".cache"
+
+    try:
+        config_home.mkdir(parents=True, exist_ok=True)
+        cache_home.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    env.setdefault("XDG_CONFIG_HOME", str(config_home))
+    env.setdefault("XDG_CACHE_HOME", str(cache_home))
+
+    return env
+
+
+def ensure_speedtest_interface_ready(interface: str) -> None:
+    """
+    确认 tun0 已存在并且已有 IPv4 地址。
+    """
+    iface = str(interface or "").strip()
+    if not iface:
+        raise RuntimeError("speedtest 测速接口为空")
+
+    iface_path = Path("/sys/class/net") / iface
+    if not iface_path.exists():
+        raise RuntimeError(f"speedtest 测速接口 {iface} 不存在，请确认 OpenVPN 已成功创建 tun0")
+
+    res = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", iface],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    if res.returncode != 0 or "inet " not in res.stdout:
+        raise RuntimeError(f"speedtest 测速接口 {iface} 没有 IPv4 地址，请确认 OpenVPN 已完成初始化")
+
 def fetch_proxy_speed_quality() -> dict[str, Any]:
     """
     使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
@@ -3171,8 +3226,9 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
     这样 evaluate_ip_quality() / update_node_quality() 不需要大改。
     """
     install_speedtest_cli()
-    ensure_speedtest_interface_exists(SPEEDTEST_INTERFACE)
+    ensure_speedtest_interface_ready(SPEEDTEST_INTERFACE)
 
+    speedtest_env = build_speedtest_env()
 
     print(
         f"[测速] 开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度...",
@@ -3202,6 +3258,8 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=speedtest_env,
+        cwd=str(DATA_DIR),
     )
 
     download_mbps = None
@@ -3508,8 +3566,8 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["speed_test_checked"] = False
             quality_info["speed_test_error"] = str(exc)
 
-            print(f"[测速] 7928 出口测速失败: {exc}", flush=True)
-            log_to_json("WARNING", "Speed", f"7928 出口测速失败: {exc}")
+            print(f"[测速] speedtest tun0 出口测速失败: {exc}", flush=True)
+            log_to_json("WARNING", "Speed", f"speedtest tun0 出口测速失败: {exc}")
 
         # 5. 加入测速结果后，再完整判断一次
         passed, reason = evaluate_ip_quality(quality_info)
