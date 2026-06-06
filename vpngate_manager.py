@@ -3245,7 +3245,7 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
         "--interface", SPEEDTEST_INTERFACE,
         "--accept-license",
         "--accept-gdpr",
-        "--progress=yes",
+        "--progress=no",
     ]
 
     started_at = time.time()
@@ -3291,25 +3291,12 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                 )
 
                 if not match:
-                    # 兼容没有 data used 的输出
-                    match_simple = re.search(
-                        r"Download:\s+([\d.]+)\s+([KMG]bps)",
-                        part,
-                        re.IGNORECASE,
-                    )
-
-                    if match_simple:
-                        download_mbps = convert_speed_to_mbps(
-                            match_simple.group(1),
-                            match_simple.group(2),
-                        )
-                        data_used_bytes = 0
                     continue
 
                 download_mbps = convert_speed_to_mbps(match.group(1), match.group(2))
                 data_used_bytes = parse_data_used_to_bytes(match.group(3), match.group(4))
 
-            if download_mbps and download_mbps > 0:
+            if download_mbps and download_mbps > 0 and data_used_bytes > 0:
                 # 已拿到下载结果，不继续做上传，减少测速耗时和流量消耗
                 try:
                     process.terminate()
