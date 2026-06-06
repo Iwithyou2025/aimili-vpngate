@@ -4809,6 +4809,74 @@ INDEX_HTML = r"""<!doctype html>
       display: block;
     }
     
+        .ip-uptime-tools {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    
+    .ip-uptime-legend {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    
+    .legend-green { background: #26a269; }
+    .legend-blue { background: #3b82f6; }
+    .legend-orange { background: #f59e0b; }
+    .legend-red { background: #ef4444; }
+    
+    .chart-refresh-btn {
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.04);
+      color: var(--text-primary);
+      border-radius: 10px;
+      padding: 9px 16px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all .2s ease;
+    }
+    
+    .chart-refresh-btn:hover {
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.22);
+    }
+    
+    .chart-refresh-btn:disabled {
+      opacity: .65;
+      cursor: not-allowed;
+    }
+    
+    .ip-uptime-chart-wrap {
+      height: 390px;
+      margin-bottom: 24px;
+    }
+    
+    #ip_uptime_chart {
+      width: 100%;
+      height: 390px;
+      display: block;
+    }
+    
   </style>
 </head>
 <body>
@@ -4903,15 +4971,32 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="switch-chart-divider"></div>
 
+<div class="switch-chart-divider"></div>
+
 <div class="switch-chart-head switch-chart-head-secondary">
   <div>
-    <div class="switch-chart-title">最近 10 个(不含当前连接ip) IP 连接时长</div>
+    <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 连接时长</div>
     <div class="switch-chart-subtitle">
-      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；当前正在连接的 IP 不显示，结束后再进入统计。
+      从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
+      当前正在连接的 IP 不显示，结束后再进入统计。
     </div>
   </div>
-  <div class="switch-chart-total">
-    已记录：<strong id="ip_uptime_count">0</strong> 个 IP
+
+  <div class="ip-uptime-tools">
+    <div class="ip-uptime-legend">
+      <span class="legend-item"><i class="legend-dot legend-green"></i>较长（稳）</span>
+      <span class="legend-item"><i class="legend-dot legend-blue"></i>中等</span>
+      <span class="legend-item"><i class="legend-dot legend-orange"></i>偏短</span>
+      <span class="legend-item"><i class="legend-dot legend-red"></i>较短（不稳）</span>
+    </div>
+
+    <button id="refresh_ip_uptime_btn" type="button" class="chart-refresh-btn">
+      刷新数据
+    </button>
+
+    <div class="switch-chart-total">
+      已记录：<strong id="ip_uptime_count">0</strong> 个 IP
+    </div>
   </div>
 </div>
 
@@ -5582,6 +5667,119 @@ function formatChartHour(value){
   return n.toFixed(1).replace(/\.0$/, "");
 }
 
+function formatChartHour(value){
+  const n = Number(value) || 0;
+
+  if (Number.isInteger(n)) {
+    return `${n}h`;
+  }
+
+  return `${n.toFixed(1).replace(/\.0$/, "")}h`;
+}
+function formatIpUptimeTopLabel(seconds){
+  let total = Number(seconds) || 0;
+  total = Math.max(0, Math.floor(total));
+
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  let minutes = Math.round((total % 3600) / 60);
+
+  // 处理四舍五入后 minutes = 60 的情况
+  let finalDays = days;
+  let finalHours = hours;
+  let finalMinutes = minutes;
+
+  if (finalMinutes >= 60) {
+    finalMinutes = 0;
+    finalHours += 1;
+  }
+
+  if (finalHours >= 24) {
+    finalDays += Math.floor(finalHours / 24);
+    finalHours = finalHours % 24;
+  }
+
+  // 不足 1 小时：显示分钟
+  if (finalDays === 0 && finalHours === 0) {
+    return `${Math.max(1, finalMinutes)}分钟`;
+  }
+
+  // 不足 1 天：显示 xx小时xx分
+  if (finalDays === 0) {
+    return finalMinutes > 0
+      ? `${finalHours}小时${finalMinutes}分`
+      : `${finalHours}小时`;
+  }
+
+  // 超过 1 天：显示 x天x小时x分
+  return finalMinutes > 0
+    ? `${finalDays}天${finalHours}小时${finalMinutes}分`
+    : `${finalDays}天${finalHours}小时`;
+}
+
+
+function getIpUptimeLevel(hours){
+  const h = Number(hours) || 0;
+
+  // 你可以按自己想法调整阈值
+  if (h >= 24) {
+    return {
+      colorTop: "rgba(38, 162, 105, 0.96)",
+      colorBottom: "rgba(38, 162, 105, 0.48)",
+      textColor: "rgba(52, 211, 153, 0.98)"
+    };
+  }
+
+  if (h >= 12) {
+    return {
+      colorTop: "rgba(59, 130, 246, 0.96)",
+      colorBottom: "rgba(59, 130, 246, 0.48)",
+      textColor: "rgba(96, 165, 250, 0.98)"
+    };
+  }
+
+  if (h >= 6) {
+    return {
+      colorTop: "rgba(245, 158, 11, 0.96)",
+      colorBottom: "rgba(245, 158, 11, 0.48)",
+      textColor: "rgba(251, 191, 36, 0.98)"
+    };
+  }
+
+  return {
+    colorTop: "rgba(239, 68, 68, 0.96)",
+    colorBottom: "rgba(239, 68, 68, 0.48)",
+    textColor: "rgba(248, 113, 113, 0.98)"
+  };
+}
+
+async function refreshIpUptimeChartData(){
+  const btn = $("refresh_ip_uptime_btn");
+
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "刷新中...";
+    }
+
+    const r = await fetch("./api/nodes");
+    const d = await r.json();
+
+    nodes = d.nodes || [];
+    state = d.state || {};
+
+    stableSortNodes();
+    render();
+  } catch (e) {
+    console.error("刷新 IP 连接时长图失败:", e);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "刷新数据";
+    }
+  }
+}
+
 function drawIpUptimeChart(){
   const canvas = $("ip_uptime_chart");
   if (!canvas) return;
@@ -5592,9 +5790,9 @@ function drawIpUptimeChart(){
   if (countEl) countEl.textContent = data.length;
 
   const wrapper = canvas.parentElement;
-  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 320 };
-  const width = Math.max(640, Math.floor(rect.width || 900));
-  const height = Math.max(320, Math.floor(rect.height || 320));
+  const rect = wrapper ? wrapper.getBoundingClientRect() : { width: 900, height: 390 };
+  const width = Math.max(760, Math.floor(rect.width || 900));
+  const height = Math.max(390, Math.floor(rect.height || 390));
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = Math.floor(width * dpr);
@@ -5606,7 +5804,7 @@ function drawIpUptimeChart(){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const pad = { left: 54, right: 22, top: 20, bottom: 100 };
+  const pad = { left: 68, right: 24, top: 28, bottom: 110 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const baseY = pad.top + plotH;
@@ -5622,14 +5820,16 @@ function drawIpUptimeChart(){
 
   const values = data.map(item => Number(item.hours) || 0);
   const maxValue = Math.max(0, ...values);
-  const maxY = Math.max(1, Math.ceil((maxValue * 1.2 || 1) * 2) / 2);
+  const maxY = Math.max(1, Math.ceil((maxValue * 1.15 || 1) * 2) / 2);
 
   ctx.font = "12px Outfit, sans-serif";
   ctx.textBaseline = "middle";
 
-  for (let i = 0; i <= 5; i++) {
-    const value = maxY - (maxY / 5) * i;
-    const y = pad.top + (plotH / 5) * i;
+  // 横向网格线 + 纵轴刻度
+  const gridSteps = 5;
+  for (let i = 0; i <= gridSteps; i++) {
+    const value = maxY - (maxY / gridSteps) * i;
+    const y = pad.top + (plotH / gridSteps) * i;
 
     ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
     ctx.lineWidth = 1;
@@ -5640,15 +5840,16 @@ function drawIpUptimeChart(){
 
     ctx.fillStyle = "rgba(226, 232, 240, 0.75)";
     ctx.textAlign = "right";
-    ctx.fillText(formatChartHour(value), pad.left - 10, y);
+    ctx.fillText(formatChartHour(value), pad.left - 12, y);
   }
 
+  // 纵轴标题
   ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
   ctx.textAlign = "left";
-  ctx.fillText("小时", pad.left, 10);
+  ctx.fillText("小时", pad.left, 12);
 
   const slotW = plotW / data.length;
-  const barW = Math.max(14, Math.min(58, slotW * 0.56));
+  const barW = Math.max(18, Math.min(58, slotW * 0.52));
 
   data.forEach((item, index) => {
     const hours = Number(item.hours) || 0;
@@ -5657,13 +5858,15 @@ function drawIpUptimeChart(){
     const barH = Math.max(3, (hours / maxY) * plotH);
     const y = baseY - barH;
 
-    const gradient = ctx.createLinearGradient(0, y, 0, baseY);
-    gradient.addColorStop(0, "rgba(59, 130, 246, 0.92)");
-    gradient.addColorStop(1, "rgba(59, 130, 246, 0.42)");
+    const level = getIpUptimeLevel(hours);
 
+    const gradient = ctx.createLinearGradient(0, y, 0, baseY);
+    gradient.addColorStop(0, level.colorTop);
+    gradient.addColorStop(1, level.colorBottom);
     ctx.fillStyle = gradient;
 
     const radius = 7;
+
     ctx.beginPath();
     ctx.moveTo(x + radius, y);
     ctx.lineTo(x + barW - radius, y);
@@ -5675,18 +5878,31 @@ function drawIpUptimeChart(){
     ctx.closePath();
     ctx.fill();
 
-    ctx.fillStyle = "rgba(226, 232, 240, 0.88)";
+    // 柱顶值
+    const labelText = formatIpUptimeTopLabel(item.seconds);
+    
+    ctx.font = "12px Outfit, sans-serif";
+    ctx.fillStyle = level.textColor;
     ctx.textAlign = "center";
-    ctx.fillText(formatChartHour(hours), x + barW / 2, Math.max(12, y - 12));
+    ctx.fillText(labelText, x + barW / 2, Math.max(12, y - 14));
 
+    // 底部 IP 标签
     ctx.save();
     ctx.translate(x + barW / 2, height - 42);
     ctx.rotate(-Math.PI / 10);
-    ctx.fillStyle = "rgba(226, 232, 240, 0.72)";
+    ctx.fillStyle = "rgba(226, 232, 240, 0.74)";
     ctx.textAlign = "right";
     ctx.fillText(String(item.label || item.ip || index + 1), 0, 0);
     ctx.restore();
   });
+
+  // 底部基线
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.22)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, baseY);
+  ctx.lineTo(width - pad.right, baseY);
+  ctx.stroke();
 }
 
 function stableSortNodes() {
@@ -6504,7 +6720,12 @@ async function logoutAdmin() {
   }
 }
 
-
+document.addEventListener("click", (e) => {
+  const target = e.target;
+  if (target && target.id === "refresh_ip_uptime_btn") {
+    refreshIpUptimeChartData();
+  }
+});
 
 window.addEventListener("resize", () => {
   if (window._switchChartResizeTimer) {
