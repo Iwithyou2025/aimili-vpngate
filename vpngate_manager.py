@@ -754,7 +754,7 @@ def finish_node_switch_duration(reason: str = "") -> None:
         "reason": duration_reason,
     })
 
-    history = prune_switch_duration_history(history, 20)
+    history = prune_switch_duration_history(history, 10)
 
     set_state(
         node_switch_started_at=None,
@@ -5114,28 +5114,27 @@ INDEX_HTML = r"""<!doctype html>
     
       <div class="switch-chart-divider"></div>
     
-      <div class="switch-chart-head switch-chart-head-secondary">
-        <div>
-          <div class="switch-chart-title">最近 10 次节点切换耗时</div>
-          <div class="switch-chart-subtitle">
-            柱子底部为节点切换完成后的系统时间；柱子顶部为本次切换耗时；纵轴使用对数轴，避免秒级、分钟级、小时级、天级混合时显示失真。
-          </div>
+    <div class="switch-chart-head switch-chart-head-secondary">
+      <div>
+        <div class="switch-chart-title">最近 10 次节点切换耗时</div>
+        <div class="switch-chart-subtitle">
+          柱子底部为节点切换完成后的系统时间；柱子顶部为本次切换耗时；纵轴使用对数轴，避免秒级、分钟级、小时级、天级混合时显示失真。
         </div>
+      </div>
     
+      <div class="ip-uptime-tools">
         <div class="ip-uptime-legend">
           <span class="legend-item"><i class="legend-dot legend-green"></i>快速（≤1分钟）</span>
           <span class="legend-item"><i class="legend-dot legend-blue"></i>中等（≤5分钟）</span>
           <span class="legend-item"><i class="legend-dot legend-orange"></i>偏慢（≤10分钟）</span>
           <span class="legend-item"><i class="legend-dot legend-red"></i>异常（>10分钟）</span>
         </div>
-            
-          <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
-            刷新数据
-          </button>
     
- 
-        </div>
+        <button id="refresh_switch_duration_btn" type="button" class="chart-refresh-btn">
+          刷新数据
+        </button>
       </div>
+    </div>
     
       <div class="switch-chart-wrap switch-duration-chart-wrap">
         <canvas id="switch_duration_chart"></canvas>
@@ -6138,12 +6137,12 @@ function buildIpUptimeVisualScale(secondsList){
 }
 
 /**
- * 颜色按当前这批数据的相对排名分级，而不是按固定小时阈值。
+ * IP 持续时长颜色按当前这批数据的相对排名分级。
  *
- * 最短 -> 绿色
+ * 最短 -> 红色，不稳定
+ * 偏短 -> 橙色
  * 中等 -> 蓝色
- * 偏长 -> 橙色
- * 最长 -> 红色
+ * 最长 -> 绿色，稳定
  */
  
 function getIpUptimeLevelByRank(seconds, sortedSeconds){
