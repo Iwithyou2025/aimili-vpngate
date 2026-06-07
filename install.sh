@@ -155,6 +155,56 @@ ensure_proxy_auth_env() {
     chmod 600 "$ENV_FILE" || true
 }
 
+ensure_openvpn_ca_bundle() {
+    local cert_dir="${INSTALL_DIR}/certs"
+    local bundle="${cert_dir}/vpngate-ca-bundle.pem"
+    local tmp_dir
+
+    mkdir -p "$cert_dir"
+    tmp_dir="$(mktemp -d)"
+
+    echo -e "${YELLOW}正在准备 OpenVPN CA bundle，用于兼容 Let's Encrypt YR 证书链...${PLAIN}"
+
+    update-ca-certificates >/dev/null 2>&1 || true
+
+    local urls=(
+      "root-yr.pem|https://letsencrypt.org/certs/gen-y/root-yr.pem"
+      "int-yr1.pem|https://letsencrypt.org/certs/gen-y/int-yr1.pem"
+      "int-yr2.pem|https://letsencrypt.org/certs/gen-y/int-yr2.pem"
+      "int-yr3.pem|https://letsencrypt.org/certs/gen-y/int-yr3.pem"
+    )
+
+    local item name url
+    for item in "${urls[@]}"; do
+        name="${item%%|*}"
+        url="${item#*|}"
+
+        if curl -fsSL --connect-timeout 8 --max-time 20 "$url" -o "${tmp_dir}/${name}"; then
+            echo -e "${GREEN}  -> 已下载 ${name}${PLAIN}"
+        else
+            echo -e "${YELLOW}  -> 警告: 下载 ${name} 失败，继续处理。${PLAIN}"
+        fi
+    done
+
+    if [ -f "${tmp_dir}/root-yr.pem" ] && ls "${tmp_dir}"/int-yr*.pem >/dev/null 2>&1; then
+        {
+            cat "${tmp_dir}/root-yr.pem"
+            cat "${tmp_dir}"/int-yr*.pem
+            [ -f /etc/ssl/certs/ca-certificates.crt ] && cat /etc/ssl/certs/ca-certificates.crt
+        } > "${bundle}.tmp"
+
+        mv "${bundle}.tmp" "$bundle"
+        chmod 644 "$bundle" || true
+
+        ensure_env_var_nonempty "OPENVPN_CA_BUNDLE" "$bundle"
+
+        echo -e "${GREEN}  -> OpenVPN CA bundle 已生成: ${bundle}${PLAIN}"
+    else
+        echo -e "${YELLOW}  -> 警告: 未能完整生成 YR CA bundle，部分 VPNGate 节点可能出现 TLS 证书链失败。${PLAIN}"
+    fi
+
+    rm -rf "$tmp_dir"
+}
 
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
@@ -195,7 +245,8 @@ fi
 echo -e "\n${YELLOW}正在初始化代理认证配置...${PLAIN}"
 ensure_proxy_auth_env
 echo -e "${GREEN} -> 代理认证配置已准备完成: ${ENV_FILE}${PLAIN}"
-
+echo -e "\n${YELLOW}正在初始化 OpenVPN CA bundle...${PLAIN}"
+ensure_openvpn_ca_bundle
 echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
 echo -e "  -> 正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
 cat > /lib/systemd/system/aimilivpn.service <<EOF

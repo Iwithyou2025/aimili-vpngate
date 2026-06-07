@@ -208,6 +208,23 @@ AUTO_SWITCH_MAX_ATTEMPTS = int(os.environ.get("AUTO_SWITCH_MAX_ATTEMPTS", "0")) 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
+
+SYSTEM_CA_BUNDLE = Path(os.environ.get("SYSTEM_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"))
+
+OPENVPN_CA_BUNDLE = Path(
+    os.environ.get(
+        "OPENVPN_CA_BUNDLE",
+        str(ROOT_DIR / "certs" / "vpngate-ca-bundle.pem"),
+    )
+).resolve()
+
+LE_GENY_CA_URLS = [
+    ("root-yr.pem", "https://letsencrypt.org/certs/gen-y/root-yr.pem"),
+    ("int-yr1.pem", "https://letsencrypt.org/certs/gen-y/int-yr1.pem"),
+    ("int-yr2.pem", "https://letsencrypt.org/certs/gen-y/int-yr2.pem"),
+    ("int-yr3.pem", "https://letsencrypt.org/certs/gen-y/int-yr3.pem"),
+]
+
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
@@ -253,10 +270,83 @@ IPAPI_REJECT_CONFIG = {
     "is_vpn": lambda: QUALITY_REJECT_IPAPI_VPN,
     "is_abuser": lambda: QUALITY_REJECT_IPAPI_ABUSER,
 }
+def ensure_openvpn_ca_bundle() -> None:
+    """
+    生成 OpenVPN 专用 CA bundle。
+
+    用途：
+    - 兼容部分 VPNGate 节点使用 Let's Encrypt YR1 / YR2 / YR3 证书链；
+    - 避免 OpenVPN 报：
+      VERIFY ERROR: unable to get local issuer certificate
+    """
+    try:
+        if OPENVPN_CA_BUNDLE.is_file() and OPENVPN_CA_BUNDLE.stat().st_size > 0:
+            return
+
+        OPENVPN_CA_BUNDLE.parent.mkdir(parents=True, exist_ok=True)
+
+        parts: list[bytes] = []
+        got_root_yr = False
+        got_intermediate = False
+
+        for filename, url in LE_GENY_CA_URLS:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "AimiliVPN/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    data = resp.read()
+
+                if b"BEGIN CERTIFICATE" not in data:
+                    print(f"[CA] 跳过异常证书内容: {filename}", flush=True)
+                    continue
+
+                parts.append(data)
+
+                if filename == "root-yr.pem":
+                    got_root_yr = True
+                elif filename.startswith("int-yr"):
+                    got_intermediate = True
+
+                print(f"[CA] 已下载 Let's Encrypt 证书: {filename}", flush=True)
+
+            except Exception as e:
+                print(f"[CA] 下载 {filename} 失败: {e}", flush=True)
+
+        if SYSTEM_CA_BUNDLE.is_file():
+            try:
+                parts.append(SYSTEM_CA_BUNDLE.read_bytes())
+            except Exception as e:
+                print(f"[CA] 读取系统 CA bundle 失败: {e}", flush=True)
+
+        if got_root_yr and got_intermediate and parts:
+            tmp = OPENVPN_CA_BUNDLE.with_suffix(".tmp")
+            tmp.write_bytes(b"\n".join(parts) + b"\n")
+            tmp.replace(OPENVPN_CA_BUNDLE)
+
+            try:
+                OPENVPN_CA_BUNDLE.chmod(0o644)
+            except OSError:
+                pass
+
+            print(f"[CA] OpenVPN CA bundle 已生成: {OPENVPN_CA_BUNDLE}", flush=True)
+        else:
+            print(
+                "[CA] 警告: 未能生成完整的 Let's Encrypt YR CA bundle，"
+                "部分 VPNGate 节点可能出现证书链验证失败。",
+                flush=True,
+            )
+
+    except Exception as e:
+        print(f"[CA] 初始化 OpenVPN CA bundle 失败: {e}", flush=True)
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     CONFIG_DIR.mkdir(exist_ok=True)
+
+    ensure_openvpn_ca_bundle()
+
     if not AUTH_FILE.exists():
         AUTH_FILE.write_text(f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", encoding="utf-8")
         try:
@@ -1957,6 +2047,10 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         command.extend(["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
     else:
         command.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
+
+    # 使用项目生成的 CA bundle，修复 Let's Encrypt YR1 / Root YR 链验证失败问题。
+    if OPENVPN_CA_BUNDLE.is_file():
+        command.extend(["--ca", str(OPENVPN_CA_BUNDLE)])
 
     command.extend(["--verb", "3"])
     
