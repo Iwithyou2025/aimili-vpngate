@@ -1757,6 +1757,7 @@ def init_state_on_start() -> None:
         "node_switch_reason": "",
         "is_maintaining": False,
         "maintenance_message": "",
+        "maintenance_updated_at": None,
     }
 
     old_state.update(runtime_updates)
@@ -1817,9 +1818,32 @@ def get_state() -> dict[str, Any]:
 
     state.setdefault("is_maintaining", False)
     state.setdefault("maintenance_message", "")
+    state.setdefault("maintenance_updated_at", None)
     state.setdefault("connection_stage", "connected" if state.get("connected_at") else "idle")
     state.setdefault("quality_checking_node_id", "")
     state.setdefault("last_check_message", "")
+
+    # 防止后台维护状态异常残留。
+    # 如果已经有确认连接，并且维护状态超过 180 秒没更新，就自动清理。
+    try:
+        maintenance_updated_at = float(state.get("maintenance_updated_at") or 0)
+    except Exception:
+        maintenance_updated_at = 0
+
+    if (
+            state.get("is_maintaining")
+            and maintenance_updated_at > 0
+            and time.time() - maintenance_updated_at > 180
+            and has_confirmed_active_vpn_connection()
+    ):
+        state["is_maintaining"] = False
+        state["maintenance_message"] = ""
+        state["maintenance_updated_at"] = None
+        set_state(
+            is_maintaining=False,
+            maintenance_message="",
+            maintenance_updated_at=None,
+        )
 
     state.setdefault("blacklisted_nodes", 0)
     state.setdefault("node_switch_started_at", None)
@@ -2637,27 +2661,61 @@ def set_maintenance_progress(message: str) -> None:
     """
     后台维护进度。
 
-    如果当前已经有可用 VPN 连接，不要把 is_connecting 改成 True，
-    否则 UI 会误显示“正在连接 / 测试中”。
+    已有确认连接时：
+    - 只更新 maintenance_message
+    - 不改 last_check_message
+    - 不改 is_connecting
+
+    没有确认连接时：
+    - 作为主连接/初始化进度显示
     """
     if has_confirmed_active_vpn_connection():
         set_state(
             is_maintaining=True,
             maintenance_message=message,
+            maintenance_updated_at=time.time(),
         )
     else:
         set_state(
             is_connecting=True,
+            is_maintaining=False,
+            maintenance_message="",
+            maintenance_updated_at=None,
             last_check_message=message,
         )
 
 
-def finish_maintenance_progress() -> None:
+def finish_maintenance_progress(final_message: str = "") -> None:
+    """
+    结束后台维护状态。
+
+    已有确认连接时：
+    - 清理后台维护提示
+    - 保留主状态，例如“已恢复上次节点 / Connected ...”
+
+    没有确认连接时：
+    - 用 final_message 更新主状态
+    """
     if has_confirmed_active_vpn_connection():
         set_state(
             is_maintaining=False,
             maintenance_message="",
+            maintenance_updated_at=None,
         )
+    else:
+        payload = {
+            "is_connecting": False,
+            "is_maintaining": False,
+            "maintenance_message": "",
+            "maintenance_updated_at": None,
+        }
+
+        if final_message:
+            payload["last_check_message"] = final_message
+
+        set_state(**payload)
+
+
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     now = time.time()
@@ -3057,17 +3115,10 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     updated_nodes_map = {}
     total = len(to_test)
-
     if total == 0:
-        set_state(
-
-            last_check_message="没有需要检测的优先国家节点，准备进入下一步...",
-        )
+        set_maintenance_progress("没有需要检测的优先国家节点，准备进入下一步...")
     else:
-        set_state(
-
-            last_check_message=f"正在并发检测优先国家节点，进度 0/{total}...",
-        )
+        set_maintenance_progress(f"正在并发检测优先国家节点，进度 0/{total}...")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, total)) as executor:
         futures = {
@@ -3090,6 +3141,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 status = res.get("probe_status")
                 msg = res.get("probe_message") or ""
 
+                # 这个是完整日志，写到终端 / journalctl，方便排查真实原因
                 progress_msg = (
                     f"节点检测进度 {done_count}/{total}: "
                     f"{nid} => {status} / {msg}"
@@ -3097,10 +3149,14 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
                 print(f"[维护线程] {progress_msg}", flush=True)
 
-                set_state(
-
-                    last_check_message=progress_msg,
+                # 这个是页面显示的短提示，不把完整失败原因刷到主状态栏
+                ui_status = "可用" if status == "available" else "不可用"
+                ui_progress_msg = (
+                    f"节点检测进度 {done_count}/{total}: "
+                    f"{nid} => {ui_status}"
                 )
+
+                set_maintenance_progress(ui_progress_msg)
 
             except Exception as e:
                 err_msg = f"Test exception: {e}"
@@ -3112,6 +3168,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "latency_ms": 0,
                 }
 
+                # 这个是完整日志，写到终端 / journalctl
                 progress_msg = (
                     f"节点检测进度 {done_count}/{total}: "
                     f"{nid} => exception: {e}"
@@ -3119,10 +3176,15 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
                 print(f"[维护线程] {progress_msg}", flush=True)
 
-                set_state(
-
-                    last_check_message=progress_msg,
+                # 页面只显示检测异常，不显示完整 Python 异常
+                ui_progress_msg = (
+                    f"节点检测进度 {done_count}/{total}: "
+                    f"{nid} => 检测异常"
                 )
+
+                set_maintenance_progress(ui_progress_msg)
+
+
 
     with lock:
         current_nodes = read_json(NODES_FILE, [])
@@ -4433,7 +4495,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         if not candidates:
             is_connecting = False
-            return "没有拉取到新节点"
+            msg = "拉取完成：没有拉取到新节点"
+            finish_maintenance_progress(msg)
+            return msg
 
 
         with lock:
@@ -4521,9 +4585,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
 
-        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} prioritized nodes."
+        message = (
+            f"拉取完成：获取 {len(candidates)} 个节点，"
+            f"检测 {len(to_test_ids)} 个优先节点，"
+            f"当前可用 {valid_nodes_count} 个。"
+        )
+
+        finish_maintenance_progress(message)
+
         if has_confirmed_active_vpn_connection():
-            finish_maintenance_progress()
             set_state(
                 last_check_at=time.time(),
                 active_openvpn_node_id=resolve_active_openvpn_node_id(),
@@ -4538,9 +4608,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 active_openvpn_node_id=active_openvpn_node_id,
                 valid_nodes=valid_nodes_count,
             )
+
         return message
     except Exception as e:
-        is_connecting = False
+        finish_maintenance_progress(f"节点维护异常: {e}")
         raise e
 
 def restore_last_connected_node(max_attempts: int = 2) -> bool:
