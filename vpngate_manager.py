@@ -2604,7 +2604,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     with lock:
         nodes = read_json(NODES_FILE, [])
         to_test = [n for n in nodes if n.get("id") in node_ids]
-        
+
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
@@ -2613,24 +2613,31 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
         fallback_ping = parse_int(n_info.get("ping"))
-        
+
         temp_path = Path(config_file)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             temp_path.write_text(config_text, encoding="utf-8")
         except Exception:
             pass
-            
+
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         dev_name = f"tun{idx + 1}"
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        
+
+        ok, message, _ = run_openvpn_until_ready(
+            config_file,
+            keep_alive=False,
+            route_nopull=True,
+            timeout=12,
+            dev=dev_name,
+        )
+
         try:
             if temp_path.exists():
                 temp_path.unlink()
         except Exception:
             pass
-            
+
         temp_node = {
             "id": node_id,
             "latency_ms": latency,
@@ -2644,6 +2651,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "ip_type": "",
             "quality": "",
         }
+
         if ok:
             ip_to_enrich = {
                 "ip": n_info.get("ip"),
@@ -2657,46 +2665,88 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             }
             vpn_utils.enrich_ip_info([ip_to_enrich])
             temp_node.update(ip_to_enrich)
+
         return temp_node
 
     updated_nodes_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
-        futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
-    total = len(futures)
-    done_count = 0
+    total = len(to_test)
 
-    for future in concurrent.futures.as_completed(futures):
-        nid = futures[future]
-        done_count += 1
+    if total == 0:
+        set_state(
+            is_connecting=True,
+            last_check_message="没有需要检测的优先国家节点，准备进入下一步...",
+        )
+    else:
+        set_state(
+            is_connecting=True,
+            last_check_message=f"正在并发检测优先国家节点，进度 0/{total}...",
+        )
 
-        try:
-            res = future.result()
-            updated_nodes_map[nid] = res
-            print(
-                f"[维护线程] 节点检测进度 {done_count}/{total}: {nid} => {res.get('probe_status')} / {res.get('probe_message')}",
-                flush=True,
-            )
-        except Exception as e:
-            updated_nodes_map[nid] = {
-                "id": nid,
-                "probe_status": "unavailable",
-                "probe_message": f"Test exception: {e}",
-                "latency_ms": 0
-            }
-            print(
-                f"[维护线程] 节点检测进度 {done_count}/{total}: {nid} => exception: {e}",
-                flush=True,
-            )
-                
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, total)) as executor:
+        futures = {
+            executor.submit(test_worker, (idx, n)): n["id"]
+            for idx, n in enumerate(to_test)
+        }
+
+        done_count = 0
+
+        # 注意：这个 for 必须放在 with 里面。
+        # 否则 ThreadPoolExecutor 退出时会先等待全部任务完成，导致看不到实时进度。
+        for future in concurrent.futures.as_completed(futures):
+            nid = futures[future]
+            done_count += 1
+
+            try:
+                res = future.result()
+                updated_nodes_map[nid] = res
+
+                status = res.get("probe_status")
+                msg = res.get("probe_message") or ""
+
+                progress_msg = (
+                    f"节点检测进度 {done_count}/{total}: "
+                    f"{nid} => {status} / {msg}"
+                )
+
+                print(f"[维护线程] {progress_msg}", flush=True)
+
+                set_state(
+                    is_connecting=True,
+                    last_check_message=progress_msg,
+                )
+
+            except Exception as e:
+                err_msg = f"Test exception: {e}"
+
+                updated_nodes_map[nid] = {
+                    "id": nid,
+                    "probe_status": "unavailable",
+                    "probe_message": err_msg,
+                    "latency_ms": 0,
+                }
+
+                progress_msg = (
+                    f"节点检测进度 {done_count}/{total}: "
+                    f"{nid} => exception: {e}"
+                )
+
+                print(f"[维护线程] {progress_msg}", flush=True)
+
+                set_state(
+                    is_connecting=True,
+                    last_check_message=progress_msg,
+                )
+
     with lock:
         current_nodes = read_json(NODES_FILE, [])
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
+
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
-        
+
     return list(updated_nodes_map.values())
 
 def get_active_country_code(nodes: list[dict[str, Any]], preferred_node_id: str = "") -> str:
@@ -3978,7 +4028,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
             to_test_ids = [n["id"] for n in to_test]
 
         print(f"[维护线程] 正在检测优先国家节点，数量 {len(to_test_ids)}: {to_test_ids}", flush=True)
-        set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
+        set_state(
+            is_connecting=True,
+            last_check_message=f"正在并发检测筛选可用节点，进度 0/{len(to_test_ids)}，这可能需要 5-30 秒...",
+        )
         test_multiple_nodes(to_test_ids)
 
         is_connecting = False

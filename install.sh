@@ -1198,14 +1198,18 @@ for i in {1..90}; do
                 break
             else
                 if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                    echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
+                    echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
                     LAST_MSG="$CUR_MSG"
+                elif [ $((i % 5)) -eq 0 ]; then
+                    echo -e "  -> 等待中: 已等待 ${i}s，当前状态: ${YELLOW}${CUR_MSG:-服务初始化中...}${PLAIN}"
                 fi
             fi
         else
             if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
+                echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
                 LAST_MSG="$CUR_MSG"
+            elif [ $((i % 5)) -eq 0 ]; then
+                echo -e "  -> 等待中: 已等待 ${i}s，当前状态: ${YELLOW}${CUR_MSG:-服务初始化中...}${PLAIN}"
             fi
         fi
     else
