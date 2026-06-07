@@ -2657,25 +2657,34 @@ def has_confirmed_active_vpn_connection() -> bool:
             and active_openvpn_running()
     )
 
-def set_maintenance_progress(message: str) -> None:
+def set_maintenance_progress(message: str, show_ui_progress: bool = False) -> None:
     """
     后台维护进度。
 
-    已有确认连接时：
-    - 只更新 maintenance_message
-    - 不改 last_check_message
-    - 不改 is_connecting
+    show_ui_progress=False:
+    - 自动后台维护，不在页面显示“正在拉取 / 正在检测”
+    - 避免已连接后状态栏莫名出现维护提示
 
-    没有确认连接时：
-    - 作为主连接/初始化进度显示
+    show_ui_progress=True:
+    - 用户点击“更新节点 / 立即检测补齐”
+    - 页面显示维护进度
     """
     if has_confirmed_active_vpn_connection():
-        set_state(
-            is_maintaining=True,
-            maintenance_message=message,
-            maintenance_updated_at=time.time(),
-        )
+        if show_ui_progress:
+            set_state(
+                is_maintaining=True,
+                maintenance_message=message,
+                maintenance_updated_at=time.time(),
+            )
+        else:
+            # 自动维护时不要污染页面状态
+            set_state(
+                is_maintaining=False,
+                maintenance_message="",
+                maintenance_updated_at=None,
+            )
     else:
+        # 当前还没有确认连接时，维护进度仍然作为主状态显示
         set_state(
             is_connecting=True,
             is_maintaining=False,
@@ -2688,13 +2697,7 @@ def set_maintenance_progress(message: str) -> None:
 def finish_maintenance_progress(final_message: str = "") -> None:
     """
     结束后台维护状态。
-
-    已有确认连接时：
-    - 清理后台维护提示
-    - 保留主状态，例如“已恢复上次节点 / Connected ...”
-
-    没有确认连接时：
-    - 用 final_message 更新主状态
+    已经连接成功时，只清理后台维护提示，不覆盖主连接状态。
     """
     if has_confirmed_active_vpn_connection():
         set_state(
@@ -3156,7 +3159,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     f"{nid} => {ui_status}"
                 )
 
-                set_maintenance_progress(ui_progress_msg)
+                set_maintenance_progress(ui_progress_msg, show_ui_progress=False)
 
             except Exception as e:
                 err_msg = f"Test exception: {e}"
@@ -3182,7 +3185,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     f"{nid} => 检测异常"
                 )
 
-                set_maintenance_progress(ui_progress_msg)
+                set_maintenance_progress(ui_progress_msg, show_ui_progress=False)
 
 
 
@@ -4453,7 +4456,7 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
     return result
 
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
     is_connecting = not has_confirmed_active_vpn_connection()
@@ -4486,7 +4489,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 is_connecting = True
 
         try:
-            set_maintenance_progress("正在拉取最新的免费 VPN 节点列表...")
+            set_maintenance_progress(
+                "正在拉取最新的免费 VPN 节点列表...",
+                show_ui_progress=show_ui_progress,
+            )
             candidates = fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
@@ -4550,7 +4556,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         print(f"[维护线程] 正在检测优先国家节点，数量 {len(to_test_ids)}: {to_test_ids}", flush=True)
         set_maintenance_progress(
-            f"正在并发检测筛选可用节点，进度 0/{len(to_test_ids)}，这可能需要 5-30 秒..."
+            f"正在并发检测筛选可用节点，进度 0/{len(to_test_ids)}，这可能需要 5-30 秒...",
+            show_ui_progress=show_ui_progress,
         )
         test_multiple_nodes(to_test_ids)
 
@@ -5128,6 +5135,8 @@ INDEX_HTML = r"""<!doctype html>
     .brand {
       display: flex;
       flex-direction: column;
+      min-width: 0;
+      flex: 1;
     }
 
     h1 {
@@ -5163,12 +5172,25 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.45;
     }
     
+    .maintenance-status {
+      margin-top: 6px;
+      color: #f59e0b;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    
+    .proxy-auth-panel {
+      margin-top: 8px;
+      display: flex;
+      align-items: flex-start;
+    }
+    
     .proxy-auth-info {
       display: inline-flex;
       flex-direction: column;
-      gap: 2px;
-      margin-left: 8px;
-      min-width: 230px;
+      gap: 4px;
+      margin-left: 0;
+      min-width: 260px;
       line-height: 1.35;
     }
     
@@ -6203,6 +6225,8 @@ INDEX_HTML = r"""<!doctype html>
       AimiliVPN 节点管理系统
     </h1>
     <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
+    <div id="maintenance_status" class="maintenance-status" style="display:none;"></div>
+    <div id="proxy_auth_panel" class="proxy-auth-panel"></div>
   </div>
   <div class="btn-group">
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
@@ -7741,10 +7765,6 @@ function render(){
   $("active").textContent=activeNode?1:0; 
   
   const statusMessage = state.last_check_message || "";
-  const maintenanceInfo =
-  state.is_maintaining && state.maintenance_message
-    ? ` | 后台维护：<span style="color:#f59e0b;">${esc(state.maintenance_message)}</span>`
-    : "";
     
     const activeNodeInfo = activeNode
   ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>`
@@ -7783,7 +7803,25 @@ function render(){
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
 
-$("status").innerHTML=`<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}${maintenanceInfo}${proxyAuthInfo}`;  
+$("status").innerHTML =
+  `<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`;
+  
+  const maintenanceEl = $("maintenance_status");
+if (maintenanceEl) {
+  if (state.is_maintaining && state.maintenance_message) {
+    maintenanceEl.style.display = "";
+    maintenanceEl.textContent = state.maintenance_message;
+  } else {
+    maintenanceEl.style.display = "none";
+    maintenanceEl.textContent = "";
+  }
+}
+
+const proxyAuthPanel = $("proxy_auth_panel");
+if (proxyAuthPanel) {
+  proxyAuthPanel.innerHTML = proxyAuthInfo;
+}
+
   const checkBtn = $("check");
 if (checkBtn) {
   const checkBusy = !!state.is_maintaining || !!state.is_connecting || isQualityChecking;
@@ -9193,8 +9231,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                # “立即检测补齐”只负责补齐/刷新候选节点，不应该断开当前已通过质量检测的连接。
-                threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                threading.Thread(
+                    target=lambda: maintain_valid_nodes(force=False, show_ui_progress=True),
+                    daemon=True,
+                ).start()
                 self.send_json({"ok": True, "message": "已在后台启动检测补齐流程"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -9218,7 +9258,10 @@ class Handler(BaseHTTPRequestHandler):
 
         elif effective_path == "/api/refresh_nodes":
             try:
-                threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                threading.Thread(
+                    target=lambda: maintain_valid_nodes(force=False, show_ui_progress=True),
+                    daemon=True,
+                ).start()
                 self.send_json({"ok": True, "message": "已在后台启动节点更新流程"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
