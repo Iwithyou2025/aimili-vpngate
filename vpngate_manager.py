@@ -23,6 +23,8 @@ import concurrent.futures
 import sys
 import uuid
 from datetime import date, timedelta
+import hashlib
+import random
 
 # Force socket to resolve IPv4 only to avoid slow AAAA (IPv6) DNS resolution timeouts (e.g. in WSL)
 _orig_getaddrinfo = socket.getaddrinfo
@@ -233,6 +235,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 PROJECT_UPDATE_CONFIG_FILE = DATA_DIR / "project_update.json"
 LAST_CONNECTED_NODE_FILE = DATA_DIR / "last_connected_node.json"
+OPENVPN_FAILURE_REASONS_FILE = DATA_DIR / "openvpn_failure_reasons.json"
 PROJECT_AUTO_UPDATE_INTERVAL_SECONDS = max(
     3,
     int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "3"))
@@ -384,8 +387,284 @@ def read_json(path: Path, default: Any) -> Any:
         except (OSError, json.JSONDecodeError):
             return default
 
-import hashlib
-import random
+
+
+OPENVPN_KNOWN_FAILURE_RULES: list[dict[str, str]] = [
+    {
+        "pattern": "connection refused",
+        "message": "节点端口拒绝连接：对方 OpenVPN 服务未运行、节点已下线，或者端口已经变化。",
+    },
+    {
+        "pattern": "no route to host",
+        "message": "路由不可达：当前 VPS 到这个 VPNGate 节点的网络路径不可达，通常是节点掉线或中间路由异常。",
+    },
+    {
+        "pattern": "network is unreachable",
+        "message": "网络不可达：当前 VPS 网络无法到达目标节点，可能是路由、IPv4/IPv6 或上游网络问题。",
+    },
+    {
+        "pattern": "server poll timeout",
+        "message": "UDP 节点无响应：UDP 数据已发出，但没有收到服务端回应，常见于 UDP 节点掉线、丢包或被运营商过滤。",
+    },
+    {
+        "pattern": "connection timed out",
+        "message": "连接超时：节点没有在限定时间内响应，可能是节点慢、掉线或线路丢包。",
+    },
+    {
+        "pattern": "timed out",
+        "message": "连接超时：OpenVPN 等待节点响应超时，可能是节点慢、掉线或线路丢包。",
+    },
+    {
+        "pattern": "tls handshake failed",
+        "message": "TLS 握手失败：已经连接到节点，但加密握手没有完成，通常是节点异常、证书链异常或服务端响应中断。",
+    },
+    {
+        "pattern": "unable to get local issuer certificate",
+        "message": "TLS 证书链验证失败：OpenVPN 无法验证服务端证书链，通常需要更新或使用项目内置 CA bundle。",
+    },
+    {
+        "pattern": "certificate verify failed",
+        "message": "TLS 证书验证失败：服务端证书链无法被当前 OpenVPN 信任。",
+    },
+    {
+        "pattern": "auth_failed",
+        "message": "OpenVPN 认证失败：用户名或密码不正确，VPNGate 默认一般是 vpn / vpn。",
+    },
+    {
+        "pattern": "authentication failed",
+        "message": "OpenVPN 认证失败：用户名或密码不正确，VPNGate 默认一般是 vpn / vpn。",
+    },
+    {
+        "pattern": "connection reset",
+        "message": "连接被重置：对方节点或中间网络主动断开连接，通常是节点不稳定或已掉线。",
+    },
+    {
+        "pattern": "cannot open tun/tap",
+        "message": "TUN/TAP 设备打开失败：VPS 可能没有开启 TUN 权限，或者 /dev/net/tun 不存在。",
+    },
+    {
+        "pattern": "cannot ioctl tunsetiff",
+        "message": "TUN 设备权限不足：当前系统或容器没有创建 TUN 网卡的权限。",
+    },
+    {
+        "pattern": "operation not permitted",
+        "message": "权限不足：OpenVPN 无法执行所需网络操作，常见于容器未开启 TUN/TAP 或缺少 CAP_NET_ADMIN。",
+    },
+    {
+        "pattern": "openvpn command not found",
+        "message": "OpenVPN 未安装或命令不存在：请检查 openvpn 是否已安装，或者 OPENVPN_CMD 配置是否正确。",
+    },
+    {
+        "pattern": "server not found",
+        "message": "服务器未找到：节点域名或地址解析失败，可能是 DNS 问题或节点地址已经失效。",
+    },
+    {
+        "pattern": "name or service not known",
+        "message": "DNS 解析失败：系统无法解析节点域名。",
+    },
+    {
+        "pattern": "temporary failure in name resolution",
+        "message": "DNS 临时解析失败：当前 VPS 的 DNS 查询失败，稍后可能恢复。",
+    },
+    {
+        "pattern": "verify ok",
+        "message": "证书验证已经通过，但 OpenVPN 初始化没有完成：通常是节点后续握手卡住、响应太慢或服务端异常。",
+    },
+]
+
+
+OPENVPN_GENERIC_FAILURE_LINES = [
+    "exiting due to fatal error",
+    "all connections have been connect-retry-max",
+    "sigusr1",
+    "restart pause",
+    "process restarting",
+]
+
+
+def clean_openvpn_log_line(line: str) -> str:
+    line = str(line or "").strip()
+
+    # 去掉 OpenVPN 日志前面的时间戳：
+    # 2026-06-07 11:14:37 xxx
+    line = re.sub(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+us=\d+)?\s*", "", line)
+
+    # 压缩空格
+    line = re.sub(r"\s+", " ", line).strip()
+
+    return line
+
+
+def split_openvpn_failure_lines(raw_message: str) -> list[str]:
+    raw_message = str(raw_message or "").replace("\n", " | ")
+    parts = [clean_openvpn_log_line(x) for x in raw_message.split("|")]
+    return [x for x in parts if x]
+
+
+def extract_openvpn_core_reason(raw_message: str) -> str:
+    """
+    从 OpenVPN 多行日志里提取最有价值的一句真实原因。
+    避免只显示 Exiting due to fatal error 这种无意义结尾。
+    """
+    lines = split_openvpn_failure_lines(raw_message)
+    if not lines:
+        return str(raw_message or "").strip() or "OpenVPN failed."
+
+    priority_keywords = [
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "server poll timeout",
+        "server not found",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "unable to get local issuer certificate",
+        "certificate verify failed",
+        "tls handshake failed",
+        "auth_failed",
+        "authentication failed",
+        "connection reset",
+        "connection timed out",
+        "timed out",
+        "cannot open tun/tap",
+        "cannot ioctl",
+        "operation not permitted",
+        "error",
+        "failed",
+        "timeout",
+        "cannot",
+        "not found",
+    ]
+
+    # 优先找真正失败行
+    for keyword in priority_keywords:
+        for line in lines:
+            if keyword in line.lower():
+                return line
+
+    # 如果只有 VERIFY OK，但没有 Initialization Sequence Completed，
+    # 说明证书没问题，卡在后续初始化阶段
+    raw_lower = str(raw_message or "").lower()
+    if "verify ok" in raw_lower and "initialization sequence completed" not in raw_lower:
+        for line in reversed(lines):
+            if "verify ok" in line.lower():
+                return line
+
+    # 跳过无意义结尾
+    for line in lines:
+        lower = line.lower()
+        if any(x in lower for x in OPENVPN_GENERIC_FAILURE_LINES):
+            continue
+        return line
+
+    return lines[-1]
+
+
+def normalize_openvpn_reason_key(text: str) -> str:
+    """
+    归一化失败原因，避免 IP、端口、时间不同导致每次都记录成新原因。
+    """
+    text = clean_openvpn_log_line(text).lower()
+
+    # 替换 IPv4
+    text = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", text)
+
+    # 替换 [AF_INET] 这类标记
+    text = re.sub(r"\[af_inet6?\]", "[af_inet]", text)
+
+    # 替换 <ip>:端口
+    text = re.sub(r"<ip>:\d{1,5}", "<ip>:<port>", text)
+
+    # 替换 sid、序列号等随机值
+    text = re.sub(r"sid=[a-f0-9]+\s+[a-f0-9]+", "sid=<sid>", text)
+
+    # 替换长数字，避免证书 serial、端口、时间造成重复
+    text = re.sub(r"\b\d{4,}\b", "<num>", text)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def match_builtin_openvpn_failure_reason(core_reason: str, raw_message: str) -> str | None:
+    haystack = f"{core_reason} | {raw_message}".lower()
+
+    for rule in OPENVPN_KNOWN_FAILURE_RULES:
+        pattern = rule.get("pattern", "").lower()
+        if pattern and pattern in haystack:
+            return rule.get("message") or None
+
+    return None
+
+
+def match_or_record_custom_openvpn_failure_reason(core_reason: str) -> str:
+    """
+    未命中内置规则时：
+    - 第一次：直接返回真实原因，并写入 openvpn_failure_reasons.json
+    - 下次：如果规则文件里已有同类原因，直接返回记录里的 message
+    """
+    core_reason = clean_openvpn_log_line(core_reason)
+    if not core_reason:
+        return "OpenVPN 失败，但没有捕获到有效错误信息。"
+
+    key = normalize_openvpn_reason_key(core_reason)
+    now = int(time.time())
+
+    with lock:
+        rules = read_json(OPENVPN_FAILURE_REASONS_FILE, [])
+        if not isinstance(rules, list):
+            rules = []
+
+        for item in rules:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("pattern") == key:
+                item["count"] = int(item.get("count") or 0) + 1
+                item["last_seen"] = now
+
+                examples = item.get("examples")
+                if not isinstance(examples, list):
+                    examples = []
+
+                if core_reason not in examples:
+                    examples.append(core_reason)
+                    item["examples"] = examples[-3:]
+
+                write_json(OPENVPN_FAILURE_REASONS_FILE, rules)
+                return str(item.get("message") or core_reason)
+
+        # 新原因：自动追加到列表。
+        # message 默认用真实原因；以后你可以手动把 message 改成中文解释。
+        rules.append(
+            {
+                "pattern": key,
+                "message": core_reason,
+                "count": 1,
+                "first_seen": now,
+                "last_seen": now,
+                "examples": [core_reason],
+                "note": "自动记录的新 OpenVPN 失败原因。可手动把 message 改成中文提示。",
+            }
+        )
+
+        write_json(OPENVPN_FAILURE_REASONS_FILE, rules)
+
+    return core_reason
+
+
+def format_openvpn_failure_message(raw_message: str) -> str:
+    """
+    将 OpenVPN 原始失败日志转换成更容易理解的中文提示。
+    """
+    raw_message = str(raw_message or "").strip()
+    core_reason = extract_openvpn_core_reason(raw_message)
+
+    builtin_message = match_builtin_openvpn_failure_reason(core_reason, raw_message)
+    if builtin_message:
+        return f"{builtin_message} 原始原因: {core_reason}"
+
+    # 未命中内置规则：显示真实原因，并自动记录到列表
+    return match_or_record_custom_openvpn_failure_reason(core_reason)
 
 def generate_random_password() -> str:
     import string
@@ -2175,9 +2454,20 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             break
     else:
         message = f"OpenVPN timeout after {limit}s."
+    if not ok:
+        raw_message = message
 
-    if not ok and tail:
-        message = " | ".join(tail[-5:])[-700:]
+        if tail:
+            tail_message = " | ".join(tail[-5:])[-700:]
+
+            # 如果前面已经产生了 timeout 信息，不要被 tail 覆盖掉
+            if raw_message and raw_message.startswith("OpenVPN timeout"):
+                raw_message = f"{raw_message} | {tail_message}"
+            else:
+                raw_message = tail_message
+
+        message = format_openvpn_failure_message(raw_message)
+
     startup_done[0] = True
     if not keep_alive or not ok:
         stop_process(process)
