@@ -57,6 +57,9 @@ TEST_BATCH_SIZE = int(os.environ.get("TEST_BATCH_SIZE", "30"))
 
 
 
+OPENVPN_PROBE_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_PROBE_TIMEOUT_SECONDS", "20"))
+
+
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -2174,7 +2177,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         message = f"OpenVPN timeout after {limit}s."
 
     if not ok and tail:
-        message = tail[-1][-220:]
+        message = " | ".join(tail[-5:])[-700:]
     startup_done[0] = True
     if not keep_alive or not ok:
         stop_process(process)
@@ -2552,7 +2555,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     
     idx = get_free_test_index()
     try:
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=OPENVPN_PROBE_TIMEOUT_SECONDS, dev=f"tun{idx}")
     finally:
         release_test_index(idx)
     
@@ -2628,7 +2631,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             config_file,
             keep_alive=False,
             route_nopull=True,
-            timeout=12,
+            timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
             dev=dev_name,
         )
 
