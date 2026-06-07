@@ -1755,6 +1755,8 @@ def init_state_on_start() -> None:
         # 启动后不要继承“正在切换中”的状态，避免重启后算出异常超长切换耗时
         "node_switch_started_at": None,
         "node_switch_reason": "",
+        "is_maintaining": False,
+        "maintenance_message": "",
     }
 
     old_state.update(runtime_updates)
@@ -1804,7 +1806,7 @@ def get_state() -> dict[str, Any]:
     # 防止历史版本已经写入 state.json 的代理账号密码被继续带出来
     for key in SENSITIVE_STATE_KEYS:
         state.pop(key, None)
-    state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_openvpn_node_id"] = resolve_active_openvpn_node_id()
     state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
@@ -1812,6 +1814,8 @@ def get_state() -> dict[str, Any]:
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
     state.setdefault("last_fetch_status", "not_started")
+    state.setdefault("is_maintaining", False)
+    state.setdefault("maintenance_message", "")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
     state.setdefault("node_switch_started_at", None)
@@ -2565,6 +2569,77 @@ def stop_active_openvpn() -> None:
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
+def resolve_active_openvpn_node_id() -> str:
+    """
+    修正活动节点 ID。
+
+    避免 OpenVPN 实际还在运行，但 active_openvpn_node_id 临时为空，
+    导致 UI 显示“活动节点：无”。
+    """
+    global active_openvpn_node_id
+
+    if active_openvpn_node_id:
+        return active_openvpn_node_id
+
+    if active_openvpn_process is not None and active_openvpn_process.poll() is None:
+        args = active_openvpn_process.args
+
+        if isinstance(args, str):
+            try:
+                args = shlex.split(args)
+            except Exception:
+                args = []
+
+        if isinstance(args, list):
+            for i, arg in enumerate(args):
+                if arg == "--config" and i + 1 < len(args):
+                    node_id = Path(str(args[i + 1])).stem
+                    if node_id:
+                        active_openvpn_node_id = node_id
+                        return node_id
+
+    nodes = read_json(NODES_FILE, [])
+    active_node = next((n for n in nodes if n.get("active")), None)
+
+    if active_node and active_openvpn_running():
+        node_id = str(active_node.get("id") or "")
+        if node_id:
+            active_openvpn_node_id = node_id
+            return node_id
+
+    return ""
+
+
+def has_active_vpn_connection() -> bool:
+    return bool(resolve_active_openvpn_node_id() and active_openvpn_running())
+
+
+def set_maintenance_progress(message: str) -> None:
+    """
+    后台维护进度。
+
+    如果当前已经有可用 VPN 连接，不要把 is_connecting 改成 True，
+    否则 UI 会误显示“正在连接 / 测试中”。
+    """
+    if has_active_vpn_connection():
+        set_state(
+            is_maintaining=True,
+            maintenance_message=message,
+        )
+    else:
+        set_state(
+            is_connecting=True,
+            last_check_message=message,
+        )
+
+
+def finish_maintenance_progress() -> None:
+    if has_active_vpn_connection():
+        set_state(
+            is_maintaining=False,
+            maintenance_message="",
+        )
+
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     now = time.time()
 
@@ -2966,12 +3041,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     if total == 0:
         set_state(
-            is_connecting=True,
+
             last_check_message="没有需要检测的优先国家节点，准备进入下一步...",
         )
     else:
         set_state(
-            is_connecting=True,
+
             last_check_message=f"正在并发检测优先国家节点，进度 0/{total}...",
         )
 
@@ -3004,7 +3079,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 print(f"[维护线程] {progress_msg}", flush=True)
 
                 set_state(
-                    is_connecting=True,
+
                     last_check_message=progress_msg,
                 )
 
@@ -3026,7 +3101,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 print(f"[维护线程] {progress_msg}", flush=True)
 
                 set_state(
-                    is_connecting=True,
+
                     last_check_message=progress_msg,
                 )
 
@@ -4178,7 +4253,13 @@ def connect_node_with_quality_check(node_id: str) -> str:
         reason="IP质量与测速达标，开始统计连接时间",
     )
 
-    set_state(last_check_message=f"Connected {node_id}; IP质量达标")
+    set_state(
+        is_connecting=False,
+        is_maintaining=False,
+        maintenance_message="",
+        active_openvpn_node_id=node_id,
+        last_check_message=f"Connected {node_id}; IP质量达标",
+    )
     return result
 
 def connect_saved_node_without_quality_check(node_id: str) -> str:
@@ -4212,6 +4293,10 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
         proxy_ip=res.get("ip", "-"),
         proxy_latency_ms=res.get("latency_ms", 0),
         proxy_error="",
+        is_connecting=False,
+        is_maintaining=False,
+        maintenance_message="",
+        active_openvpn_node_id=node_id,
         last_check_message=f"已恢复上次节点: {node_id}",
     )
 
@@ -4230,7 +4315,7 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
-    is_connecting = True
+    is_connecting = not has_active_vpn_connection()
     try:
         if force:
             with lock:
@@ -4260,7 +4345,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 is_connecting = True
 
         try:
-            set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
+            set_maintenance_progress("正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
@@ -4322,7 +4407,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         print(f"[维护线程] 正在检测优先国家节点，数量 {len(to_test_ids)}: {to_test_ids}", flush=True)
         set_state(
-            is_connecting=True,
             last_check_message=f"正在并发检测筛选可用节点，进度 0/{len(to_test_ids)}，这可能需要 5-30 秒...",
         )
         test_multiple_nodes(to_test_ids)
@@ -4359,12 +4443,22 @@ def maintain_valid_nodes(force: bool = False) -> str:
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
 
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} prioritized nodes."
-        set_state(
-            last_check_at=time.time(),
-            last_check_message=message,
-            active_openvpn_node_id=active_openvpn_node_id,
-            valid_nodes=valid_nodes_count,
-        )
+        if has_active_vpn_connection():
+            finish_maintenance_progress()
+            set_state(
+                last_check_at=time.time(),
+                active_openvpn_node_id=resolve_active_openvpn_node_id(),
+                valid_nodes=valid_nodes_count,
+            )
+        else:
+            is_connecting = False
+            set_state(
+                is_connecting=False,
+                last_check_at=time.time(),
+                last_check_message=message,
+                active_openvpn_node_id=active_openvpn_node_id,
+                valid_nodes=valid_nodes_count,
+            )
         return message
     except Exception as e:
         is_connecting = False
@@ -7494,6 +7588,10 @@ function render(){
   $("active").textContent=activeNode?1:0; 
   
   const statusMessage = state.last_check_message || "";
+  const maintenanceInfo =
+  state.is_maintaining && state.maintenance_message
+    ? ` | 后台维护：<span style="color:#f59e0b;">${esc(state.maintenance_message)}</span>`
+    : "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
     const proxyAuthInfo = state.proxy_auth_enabled
       ? `<span class="proxy-auth-info">
@@ -7526,8 +7624,7 @@ function render(){
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
 
-$("status").innerHTML=`<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${proxyAuthInfo}`;
-  
+$("status").innerHTML=`<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}${maintenanceInfo}${proxyAuthInfo}`;  
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
   const pIpVal = $("proxy_ip_val");
@@ -8640,9 +8737,16 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_json(NODES_FILE, [])
-            active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
+            resolved_active_id = resolve_active_openvpn_node_id()
+
+            active_node = next(
+                (n for n in nodes if resolved_active_id and n.get("id") == resolved_active_id),
+                None,
+            )
+
             for n in nodes:
-                n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
+                n["active"] = bool(resolved_active_id and n.get("id") == resolved_active_id)
+
             if active_node:
                 ip = active_node.get("ip") or active_node.get("remote_host")
                 if ip:
