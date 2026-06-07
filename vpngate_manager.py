@@ -4089,10 +4089,19 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     if QUALITY_CHECK_SPEED_ENABLED and info.get("speed_test_checked"):
         speed_bps = parse_int(info.get("download_speed_bps"))
 
-        if speed_bps < QUALITY_MIN_DOWNLOAD_SPEED_BPS:
-            speed_mib = speed_bps / 1024 / 1024
-            min_mib = QUALITY_MIN_DOWNLOAD_SPEED_BPS / 1024 / 1024
-            return False, f"出口下载速度 {speed_mib:.2f} MB/s 低于阈值 {min_mib:.2f} MB/s"
+        # 允许测速存在少量波动，避免 0.998 MB/s 被显示成 1.00 MB/s 后仍判定失败
+        SPEED_TEST_TOLERANCE_RATIO = 0.02  # 2% 容差
+        
+        speed_mib = speed_bps / 1024 / 1024
+        min_mib = QUALITY_MIN_DOWNLOAD_SPEED_BPS / 1024 / 1024
+
+        effective_min_bps = QUALITY_MIN_DOWNLOAD_SPEED_BPS * (1 - SPEED_TEST_TOLERANCE_RATIO)
+
+        if speed_bps < effective_min_bps:
+            return (
+                False,
+                f"出口下载速度 {speed_mib:.3f} MB/s 低于阈值 {min_mib:.3f} MB/s"
+            )
 
     if QUALITY_REQUIRE_RESIDENTIAL and info.get("is_residential") is not True:
         return False, "IP 类型不是住宅/家庭宽带 IP"
