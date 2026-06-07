@@ -2568,18 +2568,31 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     updated_nodes_map = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
-        for future in concurrent.futures.as_completed(futures):
-            nid = futures[future]
-            try:
-                res = future.result()
-                updated_nodes_map[nid] = res
-            except Exception as e:
-                updated_nodes_map[nid] = {
-                    "id": nid,
-                    "probe_status": "unavailable",
-                    "probe_message": f"Test exception: {e}",
-                    "latency_ms": 0
-                }
+    total = len(futures)
+    done_count = 0
+
+    for future in concurrent.futures.as_completed(futures):
+        nid = futures[future]
+        done_count += 1
+
+        try:
+            res = future.result()
+            updated_nodes_map[nid] = res
+            print(
+                f"[维护线程] 节点检测进度 {done_count}/{total}: {nid} => {res.get('probe_status')} / {res.get('probe_message')}",
+                flush=True,
+            )
+        except Exception as e:
+            updated_nodes_map[nid] = {
+                "id": nid,
+                "probe_status": "unavailable",
+                "probe_message": f"Test exception: {e}",
+                "latency_ms": 0
+            }
+            print(
+                f"[维护线程] 节点检测进度 {done_count}/{total}: {nid} => exception: {e}",
+                flush=True,
+            )
                 
     with lock:
         current_nodes = read_json(NODES_FILE, [])
