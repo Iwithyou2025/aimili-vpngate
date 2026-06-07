@@ -5179,6 +5179,18 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.45;
     }
     
+    .speed-test-info {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      margin-left: 4px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.28);
+      color: #34d399;
+      font-weight: 700;
+      white-space: nowrap;
+    }
     .proxy-auth-panel {
       margin-top: 8px;
       display: flex;
@@ -6674,6 +6686,23 @@ const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
 
+function formatSpeedTestResult(state) {
+  const checked = !!state.proxy_speed_test_checked;
+  const speed = Number(state.proxy_download_speed_mib_s || 0);
+
+  if (!checked || !Number.isFinite(speed) || speed <= 0) {
+    return "";
+  }
+
+  const msg = state.last_check_message || "";
+
+  if (msg.includes("已恢复上次节点")) {
+    return `上次测速: ${speed.toFixed(2)} MB/s`;
+  }
+
+  return `测速完成: ${speed.toFixed(2)} MB/s`;
+}
+
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
   return dict[q] || q || "-";
@@ -7802,9 +7831,13 @@ function render(){
          </span>`;
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
+const speedTestText = formatSpeedTestResult(state);
+const speedTestInfo = speedTestText
+  ? ` | <span class="speed-test-info">${esc(speedTestText)}</span>`
+  : "";
 
 $("status").innerHTML =
-  `<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`;
+  `<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}${speedTestInfo}`;
   
   const maintenanceEl = $("maintenance_status");
 if (maintenanceEl) {
