@@ -161,6 +161,14 @@ ensure_openvpn_ca_bundle() {
     local tmp_dir
 
     mkdir -p "$cert_dir"
+
+    # 已存在且非空，则直接复用，避免每次安装/更新重复下载
+    if [ -s "$bundle" ]; then
+        echo -e "${GREEN}  -> OpenVPN CA bundle 已存在，直接复用: ${bundle}${PLAIN}"
+        ensure_env_var_nonempty "OPENVPN_CA_BUNDLE" "$bundle"
+        return 0
+    fi
+
     tmp_dir="$(mktemp -d)"
 
     echo -e "${YELLOW}正在准备 OpenVPN CA bundle，用于兼容 Let's Encrypt YR 证书链...${PLAIN}"
@@ -177,7 +185,7 @@ ensure_openvpn_ca_bundle() {
     local item name url
     for item in "${urls[@]}"; do
         name="${item%%|*}"
-        url="${item#*|}"
+        url="${item#*}"
 
         if curl -fsSL --connect-timeout 8 --max-time 20 "$url" -o "${tmp_dir}/${name}"; then
             echo -e "${GREEN}  -> 已下载 ${name}${PLAIN}"
