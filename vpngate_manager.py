@@ -4527,6 +4527,13 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
             quality_info["ipapi_error"] = str(exc)
 
     passed, reason = evaluate_ip_quality(quality_info)
+
+    log_hot_backup(
+        f"{iface} IP质量检测结果: {format_quality_check_result(quality_info)} | "
+        f"结论:{'通过' if passed else '失败'}"
+        f"{'' if passed else f'，原因:{reason}'}"
+    )
+
     if not passed:
         return passed, reason, quality_info
 
@@ -4550,6 +4557,11 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
             log_to_json("WARNING", "HotBackup", f"{iface} speedtest 测速失败: {exc}")
 
         passed, reason = evaluate_ip_quality(quality_info)
+        log_hot_backup(
+            f"{iface} IP质量+测速最终结果: {format_quality_check_result(quality_info)} | "
+            f"结论:{'通过' if passed else '失败'}"
+            f"{'' if passed else f'，原因:{reason}'}"
+        )
 
     return passed, reason, quality_info
 
@@ -4977,6 +4989,50 @@ def fetch_proxy_speed_quality(interface: str | None = None) -> dict[str, Any]:
             time.sleep(SPEEDTEST_RETRY_DELAY_SECONDS)
 
     raise RuntimeError(f"speedtest 测速失败: {last_error}")
+
+
+def bool_zh(value: Any) -> str:
+    if value is True:
+        return "是"
+    if value is False:
+        return "否"
+    return "-"
+
+
+def format_quality_check_result(info: dict[str, Any]) -> str:
+    ipapi_parts = []
+
+    for field, label in IPAPI_RISK_FIELD_LABELS.items():
+        short_label = (
+            label
+            .replace(" 网络", "")
+            .replace(" network", "")
+            .replace("地址", "")
+            .strip()
+        )
+        ipapi_parts.append(f"{short_label}:{bool_zh(info.get(field))}")
+
+    speed_text = "-"
+
+    if info.get("speed_test_checked"):
+        speed_text = (
+            f"{parse_float(info.get('download_speed_mib_s')):.2f} MB/s "
+            f"({parse_float(info.get('download_speed_mbps')):.2f} Mbps)"
+        )
+    elif info.get("speed_test_error"):
+        speed_text = f"失败: {info.get('speed_test_error')}"
+
+    return (
+        f"出口IP:{info.get('ip') or info.get('ipapi_ip') or '-'} | "
+        f"IPPure:{parse_int(info.get('ippure_score'))}% | "
+        f"人机流量比:{parse_int(info.get('human_ratio'))}% | "
+        f"住宅IP:{bool_zh(info.get('is_residential'))} | "
+        f"原生IP:{bool_zh(info.get('native_ip'))} | "
+        f"Scamalytics:{parse_int(info.get('scamalytics_score'))}/{QUALITY_MAX_SCAMALYTICS_SCORE} | "
+        f"Scam风险:{info.get('scamalytics_risk') or '-'} | "
+        f"ipapi.is: {'，'.join(ipapi_parts)} | "
+        f"测速:{speed_text}"
+    )
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
