@@ -8865,7 +8865,7 @@ def check_proxy_health() -> dict[str, Any]:
 
         return {
             "ok": False,
-            "error": "出口连接测试失败：所有 IP 检测接口均不可用"
+            "error": "当前代理出口检测失败"
         }
     except Exception as e:
         return {
@@ -8953,14 +8953,14 @@ def background_proxy_checker() -> None:
                 first_error = res.get("error", "未知错误")
 
                 print(
-                    f"[警告] 7928 端口本地代理首次检测不可用，开始连续确认检测: {first_error}",
+                    "[代理检测] 当前代理出口检测失败，开始连续确认",
                     flush=True,
                 )
 
                 log_to_json(
                     "WARNING",
                     "Proxy",
-                    f"代理首次检测不可用，开始连续确认检测: {first_error}",
+                    "当前代理出口检测失败，开始连续确认",
                 )
 
                 confirmed_failed, final_res = confirm_proxy_health_failure()
@@ -9009,11 +9009,11 @@ def background_proxy_checker() -> None:
 
                 if active_openvpn_node_id:
                     mark_node_switch_start(
-                        f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                        f"当前代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
                     )
 
                     mark_current_ip_uptime_pending_end(
-                        f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                        f"当前代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
                     )
 
                 if not active_openvpn_node_id:
@@ -9028,7 +9028,7 @@ def background_proxy_checker() -> None:
                 log_to_json(
                     "WARNING",
                     "Proxy",
-                    f"代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败，确认故障，开始自动切换节点，最后错误: {final_error}",
+                    f"当前代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败，确认故障，开始自动切换节点，最后错误: {final_error}",
                 )
 
                 with lock:
