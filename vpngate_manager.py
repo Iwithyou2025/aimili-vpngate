@@ -3118,12 +3118,13 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     updated_nodes_map = {}
     total = len(to_test)
+    max_workers = min(5, max(1, total))
     if total == 0:
         set_maintenance_progress("没有需要检测的优先国家节点，准备进入下一步...")
     else:
-        set_maintenance_progress(f"正在并发检测优先国家节点，进度 0/{total}...")
+        set_maintenance_progress(f"正在检测优先国家节点，最多 {max_workers} 个并发，进度 0/{total}...")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, total)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, max(1, total))) as executor:
         futures = {
             executor.submit(test_worker, (idx, n)): n["id"]
             for idx, n in enumerate(to_test)

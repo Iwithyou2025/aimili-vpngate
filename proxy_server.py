@@ -29,6 +29,12 @@ def env_flag(name: str, default: str = "0") -> bool:
 PROXY_AUTH_ENABLED = env_flag("PROXY_AUTH_ENABLED", "0")
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+MAX_PROXY_CONNECTIONS = max(
+    1,
+    parse_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS")) or 10
+)
+
+proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
 
 def proxy_auth_ready() -> bool:
@@ -402,7 +408,26 @@ def start_proxy_server(host: str, port: int) -> None:
     while True:
         try:
             client, address = server.accept()
-            threading.Thread(target=proxy_client, args=(client, address), daemon=True).start()
+
+            if not proxy_connection_sem.acquire(blocking=False):
+                print(
+                    f"[代理限流] 当前代理连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}",
+                    flush=True
+                )
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+
+            def run_proxy_client() -> None:
+                try:
+                    proxy_client(client, address)
+                finally:
+                    proxy_connection_sem.release()
+
+            threading.Thread(target=run_proxy_client, daemon=True).start()
+
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
