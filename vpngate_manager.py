@@ -220,6 +220,16 @@ PROXY_HEALTH_CONFIRM_DELAY_SECONDS = max(
     int(os.environ.get("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", "2"))
 )
 
+# 热备用：只维护 1 个已拨号、已质检、已测速通过的备用 OpenVPN 出口。
+# 正式节点故障时，直接把 7928 的出站接口切到这个备用 tun。
+HOT_BACKUP_ENABLED = env_flag("HOT_BACKUP_ENABLED", "1")
+HOT_BACKUP_DEV = os.environ.get("HOT_BACKUP_DEV", "tun1")
+HOT_BACKUP_TARGET_COUNT = max(1, int(os.environ.get("HOT_BACKUP_TARGET_COUNT", "1")))
+HOT_BACKUP_HEALTH_INTERVAL_SECONDS = max(5, int(os.environ.get("HOT_BACKUP_HEALTH_INTERVAL_SECONDS", "30")))
+HOT_BACKUP_HEALTH_MAX_AGE_SECONDS = max(10, int(os.environ.get("HOT_BACKUP_HEALTH_MAX_AGE_SECONDS", "45")))
+HOT_BACKUP_WAIT_CHECK_SECONDS = max(2, int(os.environ.get("HOT_BACKUP_WAIT_CHECK_SECONDS", "5")))
+HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "20")))
+
 # 自动切换策略：默认只在当前活动节点的同一国家内切换
 AUTO_SWITCH_SAME_COUNTRY_ONLY = env_flag("AUTO_SWITCH_SAME_COUNTRY_ONLY", "1")
 AUTO_SWITCH_MAX_ATTEMPTS = int(os.environ.get("AUTO_SWITCH_MAX_ATTEMPTS", "0"))  # 0 表示直到候选耗尽
@@ -262,6 +272,17 @@ project_update_lock = threading.Lock()
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
+active_proxy_interface = "tun0"
+
+hot_backup_lock = threading.RLock()
+hot_backup_process: subprocess.Popen[str] | None = None
+hot_backup_node_id = ""
+hot_backup_dev = ""
+hot_backup_info: dict[str, Any] = {}
+hot_backup_building = False
+hot_backup_waiting_promote = False
+last_hot_backup_health_check_at = 0.0
+
 login_failures: dict[str, dict[str, float | int]] = {}
 is_connecting = True
 last_active_ping_time = 0.0
@@ -1761,6 +1782,14 @@ def init_state_on_start() -> None:
         "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
 
         "active_openvpn_node_id": "",
+        "active_proxy_interface": "tun0",
+        "active_status": "starting",
+        "hot_backup_enabled": HOT_BACKUP_ENABLED,
+        "hot_backup_status": "empty",
+        "hot_backup_node_id": "",
+        "hot_backup_interface": "",
+        "hot_backup_building": False,
+        "hot_backup_message": "",
         "last_fetch_status": "starting",
         "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
         "is_connecting": True,
@@ -2542,53 +2571,117 @@ def set_rp_filter_loose(interface: str = "tun0") -> None:
             pass
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
-    set_rp_filter_loose(interface)
+def policy_table_for_interface(interface: str) -> int:
+    iface = str(interface or "tun0").strip() or "tun0"
+    m = re.search(r"(\d+)$", iface)
+    if m:
+        return 100 + parse_int(m.group(1))
+    return 100
+
+
+def setup_policy_routing(interface: str = "tun0", table_id: int | None = None) -> None:
+    iface = str(interface or "tun0").strip() or "tun0"
+    table = int(table_id or policy_table_for_interface(iface))
+    set_rp_filter_loose(iface)
 
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "oif", iface, "table", str(table)], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
     except Exception:
         pass
 
     success = False
     for attempt in range(1, 4):
         try:
-            set_rp_filter_loose(interface)
+            set_rp_filter_loose(iface)
 
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "route", "add", "default", "dev", iface, "table", str(table)], check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", iface, "table", str(table)], check=True, timeout=2)
 
-            set_rp_filter_loose(interface)
+            set_rp_filter_loose(iface)
 
             print(
-                f"[policy_routing] Enabled policy routing for interface {interface} "
-                f"(attempt {attempt} success, rp_filter=2)",
+                f"[policy_routing] Enabled policy routing for interface {iface} "
+                f"table {table} (attempt {attempt} success, rp_filter=2)",
                 flush=True,
             )
             success = True
             break
         except Exception as e:
-            print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
+            print(
+                f"[policy_routing] Attempt {attempt} failed to enable policy routing "
+                f"for {iface} table {table}: {e}",
+                flush=True,
+            )
             time.sleep(1)
 
     if not success:
-        print("[policy_routing] Failed to enable policy routing after 3 attempts", flush=True)
+        print(
+            f"[policy_routing] Failed to enable policy routing for {iface} table {table} after 3 attempts",
+            flush=True,
+        )
 
-def cleanup_policy_routing() -> None:
+
+def cleanup_policy_routing(interface: str | None = None, table_id: int | None = None) -> None:
+    targets: list[tuple[str, int]] = []
+
+    if interface:
+        iface = str(interface or "tun0").strip() or "tun0"
+        targets.append((iface, int(table_id or policy_table_for_interface(iface))))
+    else:
+        # 启动 / 兜底清理时，清理 tun0~tun19 对应的策略表。
+        targets = [(f"tun{i}", 100 + i) for i in range(20)]
+
+    for iface, table in targets:
+        try:
+            subprocess.run(["ip", "rule", "del", "oif", iface, "table", str(table)], capture_output=True, timeout=2)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    if targets:
+        desc = ", ".join(f"{iface}:table{table}" for iface, table in targets[:5])
+        if len(targets) > 5:
+            desc += ", ..."
+        print(f"[policy_routing] Cleared policy routing: {desc}", flush=True)
+
+
+def set_active_proxy_interface(interface: str) -> None:
+    global active_proxy_interface
+    iface = str(interface or "tun0").strip() or "tun0"
+    old = active_proxy_interface
+    active_proxy_interface = iface
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
+        proxy_server.set_active_interface(iface)
+    except Exception as exc:
+        print(f"[代理出口] 同步 7928 出口接口失败: {exc}", flush=True)
+
+    if old != iface:
+        print(f"[代理出口] 当前 7928 出口接口: {old} -> {iface}", flush=True)
+        log_to_json("INFO", "Proxy", f"7928 出口接口切换: {old} -> {iface}")
+
+    set_state(active_proxy_interface=iface)
+
+
+def get_active_proxy_interface() -> str:
+    try:
+        return proxy_server.get_active_interface()
     except Exception:
-        pass
+        return active_proxy_interface or "tun0"
+
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
-    cleanup_policy_routing()
+
+    active_dev = get_active_proxy_interface() or "tun0"
+    cleanup_policy_routing(active_dev)
+
     config_to_delete = None
     if active_openvpn_node_id:
         nodes = read_json(NODES_FILE, [])
@@ -2596,15 +2689,18 @@ def stop_active_openvpn() -> None:
         if node:
             config_to_delete = node.get("config_file")
 
+    if active_openvpn_process is not None:
+        stop_process(active_openvpn_process)
+
     active_openvpn_process = None
     active_openvpn_node_id = ""
+    set_active_proxy_interface("tun0")
     set_state(
         connected_at=None,
         connection_stage="idle",
         quality_checking_node_id="",
     )
-    kill_existing_openvpn_processes()
-    
+
     if config_to_delete:
         try:
             path = Path(config_to_delete)
@@ -2612,6 +2708,7 @@ def stop_active_openvpn() -> None:
                 path.unlink()
         except Exception:
             pass
+
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -2908,6 +3005,14 @@ QUALITY_CACHE_FIELDS = {
     "human_ratio",
     "native_ip",
     "is_residential",
+    "scamalytics_checked",
+    "has_scamalytics_score",
+    "scamalytics_score",
+    "scamalytics_risk",
+    "scamalytics_url",
+    "scamalytics_isp",
+    "scamalytics_org",
+    "scamalytics_error",
     "quality_source",
     "ipapi_checked",
     "ipapi_error",
@@ -2924,6 +3029,546 @@ QUALITY_CACHE_FIELDS = {
     "download_speed_mbps",
     "download_speed_mib_s",
 }
+
+
+def log_hot_backup(message: str, level: str = "INFO") -> None:
+    print(f"[热备用] {message}", flush=True)
+    log_to_json(level, "HotBackup", message)
+
+
+def hot_backup_snapshot() -> dict[str, Any]:
+    with hot_backup_lock:
+        return {
+            "node_id": hot_backup_node_id,
+            "dev": hot_backup_dev,
+            "running": hot_backup_process is not None and hot_backup_process.poll() is None,
+            "building": hot_backup_building,
+            "info": dict(hot_backup_info),
+        }
+
+
+def hot_backup_ready() -> bool:
+    snap = hot_backup_snapshot()
+    return bool(snap.get("node_id") and snap.get("dev") and snap.get("running"))
+
+
+def set_hot_backup_state(status: str, **extra: Any) -> None:
+    payload = {
+        "hot_backup_enabled": HOT_BACKUP_ENABLED,
+        "hot_backup_status": status,
+        "hot_backup_node_id": hot_backup_node_id,
+        "hot_backup_interface": hot_backup_dev,
+        "hot_backup_building": hot_backup_building,
+    }
+    payload.update(extra)
+    set_state(**payload)
+
+
+def choose_hot_backup_dev() -> str:
+    active_iface = get_active_proxy_interface() or "tun0"
+    preferred = str(HOT_BACKUP_DEV or "tun1").strip() or "tun1"
+
+    if preferred != active_iface:
+        return preferred
+
+    for idx in range(1, 20):
+        candidate = f"tun{idx}"
+        if candidate != active_iface:
+            return candidate
+
+    return "tun19"
+
+
+def cleanup_hot_backup(reason: str = "") -> None:
+    global hot_backup_process, hot_backup_node_id, hot_backup_dev, hot_backup_info, hot_backup_building
+
+    with hot_backup_lock:
+        process = hot_backup_process
+        node_id = hot_backup_node_id
+        dev = hot_backup_dev
+
+        hot_backup_process = None
+        hot_backup_node_id = ""
+        hot_backup_dev = ""
+        hot_backup_info = {}
+        hot_backup_building = False
+
+    if process is not None:
+        stop_process(process)
+
+    if dev:
+        cleanup_policy_routing(dev)
+
+    if node_id:
+        with lock:
+            nodes = read_json(NODES_FILE, [])
+            for item in nodes:
+                if item.get("id") == node_id:
+                    item["probe_status"] = "unavailable"
+                    item["probe_message"] = reason or "热备用已移除"
+                    item["probed_at"] = time.time()
+                    item["hot_backup_status"] = "empty"
+                    item["hot_backup_message"] = reason
+                    item["hot_backup_updated_at"] = time.time()
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+
+    msg = reason or "热备用已清空"
+    log_hot_backup(msg, "INFO")
+    set_hot_backup_state("empty", hot_backup_message=msg)
+
+
+def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str = "") -> list[dict[str, Any]]:
+    target_country = (country_code or get_active_country_code(nodes, active_openvpn_node_id)).upper()
+    now = time.time()
+
+    candidates = []
+    for node in nodes:
+        if not node or node.get("active"):
+            continue
+        if node.get("id") == active_openvpn_node_id:
+            continue
+        if node.get("id") == hot_backup_node_id:
+            continue
+        if should_skip_candidate_by_quality(node, now):
+            continue
+        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and get_country_code(node) != target_country:
+            continue
+
+        # OpenVPN 探测失败的节点不要立刻反复尝试，但过了 INVALID_BACKOFF_SECONDS 可以再试。
+        if node.get("probe_status") == "unavailable":
+            probed_at = float(node.get("probed_at") or 0)
+            if now - probed_at < INVALID_BACKOFF_SECONDS:
+                continue
+
+        candidates.append(node)
+
+    candidates.sort(
+        key=lambda n: (
+            0 if n.get("quality_status") == "passed" else 1,
+            parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
+            -parse_int(n.get("human_ratio")),
+            parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999,
+            -parse_int(n.get("score")),
+        )
+    )
+    return candidates
+
+
+def mark_hot_backup_node_fields(node_id: str, fields: dict[str, Any]) -> None:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        for item in nodes:
+            if item.get("id") == node_id:
+                item.update(fields)
+                item["hot_backup_updated_at"] = time.time()
+                break
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+
+
+def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str = "") -> bool:
+    global hot_backup_process, hot_backup_node_id, hot_backup_dev, hot_backup_info, hot_backup_building
+
+    if not HOT_BACKUP_ENABLED:
+        return False
+
+    with hot_backup_lock:
+        if hot_backup_process is not None and hot_backup_process.poll() is None and hot_backup_node_id:
+            return True
+        if hot_backup_building:
+            log_hot_backup("已有热备用构建任务正在运行，跳过重复构建")
+            return False
+        hot_backup_building = True
+
+    set_hot_backup_state("building", hot_backup_message="正在构建热备用节点")
+
+    candidates = choose_hot_backup_candidates(nodes, country_code)
+    if not candidates:
+        with hot_backup_lock:
+            hot_backup_building = False
+        set_hot_backup_state("empty", hot_backup_message="没有符合条件的热备用候选节点")
+        log_hot_backup("没有符合条件的热备用候选节点", "WARNING")
+        return False
+
+    attempts = 0
+    dev_name = choose_hot_backup_dev()
+
+    try:
+        for node in candidates:
+            if attempts >= HOT_BACKUP_BUILD_MAX_ATTEMPTS:
+                break
+            attempts += 1
+
+            node_id = str(node.get("id") or "")
+            if not node_id:
+                continue
+
+            if should_skip_candidate_by_quality(node):
+                log_hot_backup(f"跳过 hard fail 冷却期节点: {node_id}")
+                continue
+
+            config_file = node.get("config_file")
+            config_text = node.get("config_text") or ""
+            if not config_file:
+                continue
+
+            process: subprocess.Popen[str] | None = None
+            keep_process = False
+
+            try:
+                cleanup_policy_routing(dev_name)
+
+                # 避免旧的 tun1 OpenVPN 残留影响本次构建。
+                try:
+                    subprocess.run(["pkill", "-f", f"openvpn.*{dev_name}"], capture_output=True, timeout=2)
+                except Exception:
+                    pass
+
+                CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+                Path(config_file).write_text(config_text, encoding="utf-8")
+
+                log_hot_backup(f"开始构建热备用 {node_id}，接口 {dev_name}，第 {attempts}/{min(len(candidates), HOT_BACKUP_BUILD_MAX_ATTEMPTS)} 个候选")
+                set_hot_backup_state("building", hot_backup_message=f"正在拨号热备用节点 {node_id}")
+
+                ok, message, process = run_openvpn_until_ready(
+                    str(config_file),
+                    keep_alive=True,
+                    route_nopull=True,
+                    timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                    dev=dev_name,
+                )
+
+                if not ok or process is None:
+                    log_hot_backup(f"热备用 {node_id} OpenVPN probe 失败: {message}", "WARNING")
+                    mark_hot_backup_node_fields(node_id, {
+                        "probe_status": "unavailable",
+                        "probe_message": message,
+                        "probed_at": time.time(),
+                        "hot_backup_status": "probe_failed",
+                        "hot_backup_message": message,
+                    })
+                    continue
+
+                setup_policy_routing(dev_name)
+
+                health = check_interface_health(dev_name)
+                if not health.get("ok"):
+                    reason = health.get("error", "热备用出口检测失败")
+                    log_hot_backup(f"热备用 {node_id} 出口连通性失败: {reason}", "WARNING")
+                    mark_hot_backup_node_fields(node_id, {
+                        "probe_status": "unavailable",
+                        "probe_message": reason,
+                        "probed_at": time.time(),
+                        "hot_backup_status": "health_failed",
+                        "hot_backup_message": reason,
+                    })
+                    continue
+
+                mark_hot_backup_node_fields(node_id, {
+                    "probe_status": "available",
+                    "probe_message": f"热备用 OpenVPN 已建立，出口 IP {health.get('ip', '')}",
+                    "probed_at": time.time(),
+                })
+
+                log_hot_backup(f"热备用 {node_id} OpenVPN 可用，出口 IP {health.get('ip', '')}，开始质量预检")
+                passed, reason, quality_info = probe_quality_via_interface(dev_name, include_speed=True)
+                update_node_quality(node_id, quality_info, passed, reason)
+
+                if not passed:
+                    log_hot_backup(f"热备用 {node_id} 质量/测速不达标: {reason}", "WARNING")
+                    mark_hot_backup_node_fields(node_id, {
+                        "hot_backup_status": "quality_failed",
+                        "hot_backup_message": reason,
+                    })
+                    continue
+
+                ip_to_enrich = {
+                    "ip": node.get("ip"),
+                    "remote_host": node.get("remote_host") or node.get("ip"),
+                    "owner": "",
+                    "asn": "",
+                    "as_name": "",
+                    "location": "",
+                    "ip_type": "",
+                    "quality": "",
+                }
+                try:
+                    vpn_utils.enrich_ip_info([ip_to_enrich])
+                except Exception:
+                    pass
+
+                now = time.time()
+                with hot_backup_lock:
+                    hot_backup_process = process
+                    hot_backup_node_id = node_id
+                    hot_backup_dev = dev_name
+                    hot_backup_info = {
+                        "node_id": node_id,
+                        "dev": dev_name,
+                        "exit_ip": quality_info.get("ip") or health.get("ip") or "",
+                        "quality_info": quality_info,
+                        "created_at": now,
+                        "last_health_ok_at": now,
+                        "last_health_latency_ms": health.get("latency_ms", 0),
+                    }
+                    hot_backup_building = False
+
+                mark_hot_backup_node_fields(node_id, {
+                    **{k: v for k, v in ip_to_enrich.items() if k not in {"ip", "remote_host"}},
+                    "hot_backup_status": "ready",
+                    "hot_backup_message": "热备用已就绪",
+                    "hot_backup_interface": dev_name,
+                    "hot_backup_exit_ip": quality_info.get("ip") or health.get("ip") or "",
+                    "hot_backup_last_health_ok_at": now,
+                })
+
+                keep_process = True
+                set_hot_backup_state(
+                    "ready",
+                    hot_backup_message="热备用已就绪",
+                    hot_backup_exit_ip=quality_info.get("ip") or health.get("ip") or "",
+                    hot_backup_last_health_ok_at=now,
+                )
+                log_hot_backup(
+                    f"热备用已就绪: node={node_id}, dev={dev_name}, "
+                    f"exit_ip={quality_info.get('ip') or health.get('ip') or ''}, "
+                    f"speed={parse_float(quality_info.get('download_speed_mib_s')):.2f} MB/s"
+                )
+                return True
+
+            except Exception as exc:
+                log_hot_backup(f"构建热备用 {node_id} 异常: {exc}", "ERROR")
+                mark_hot_backup_node_fields(node_id, {
+                    "hot_backup_status": "exception",
+                    "hot_backup_message": str(exc),
+                })
+            finally:
+                if not keep_process:
+                    stop_process(process)
+                    cleanup_policy_routing(dev_name)
+
+        with hot_backup_lock:
+            hot_backup_building = False
+
+        set_hot_backup_state("empty", hot_backup_message="已尝试候选节点，但没有找到可用热备用")
+        log_hot_backup("已尝试候选节点，但没有找到可用热备用", "WARNING")
+        return False
+
+    except Exception:
+        with hot_backup_lock:
+            hot_backup_building = False
+        raise
+
+
+def build_hot_backup_from_current_nodes(country_code: str = "") -> bool:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+    return build_hot_backup_from_nodes(nodes, country_code)
+
+
+def start_hot_backup_builder_thread(country_code: str = "") -> None:
+    if not HOT_BACKUP_ENABLED:
+        return
+
+    snap = hot_backup_snapshot()
+    if snap.get("running") or snap.get("building"):
+        return
+
+    def worker() -> None:
+        try:
+            build_hot_backup_from_current_nodes(country_code)
+        except Exception as exc:
+            log_hot_backup(f"后台构建热备用异常: {exc}", "ERROR")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def check_hot_backup_health(force: bool = False) -> bool:
+    global hot_backup_info, last_hot_backup_health_check_at
+
+    snap = hot_backup_snapshot()
+    node_id = str(snap.get("node_id") or "")
+    dev = str(snap.get("dev") or "")
+
+    if not node_id or not dev:
+        return False
+
+    if not snap.get("running"):
+        cleanup_hot_backup(f"热备用 {node_id} OpenVPN 进程已退出")
+        start_hot_backup_builder_thread()
+        return False
+
+    now = time.time()
+    if not force and now - last_hot_backup_health_check_at < HOT_BACKUP_HEALTH_INTERVAL_SECONDS:
+        return True
+
+    last_hot_backup_health_check_at = now
+    res = check_interface_health(dev)
+
+    if res.get("ok"):
+        with hot_backup_lock:
+            hot_backup_info["last_health_ok_at"] = now
+            hot_backup_info["last_health_latency_ms"] = res.get("latency_ms", 0)
+            hot_backup_info["exit_ip"] = res.get("ip") or hot_backup_info.get("exit_ip", "")
+
+        mark_hot_backup_node_fields(node_id, {
+            "hot_backup_status": "ready",
+            "hot_backup_message": "热备用健康检测正常",
+            "hot_backup_last_health_ok_at": now,
+            "hot_backup_exit_ip": res.get("ip") or "",
+        })
+        set_hot_backup_state(
+            "ready",
+            hot_backup_message="热备用健康检测正常",
+            hot_backup_exit_ip=res.get("ip") or "",
+            hot_backup_last_health_ok_at=now,
+        )
+        log_hot_backup(f"热备用健康正常: node={node_id}, dev={dev}, ip={res.get('ip')}, latency={res.get('latency_ms')}ms")
+        return True
+
+    reason = res.get("error", "热备用健康检测失败")
+    cleanup_hot_backup(f"热备用 {node_id} 失效: {reason}")
+    start_hot_backup_builder_thread()
+    return False
+
+
+def promote_hot_backup_if_available(reason: str = "") -> bool:
+    global active_openvpn_process, active_openvpn_node_id
+    global hot_backup_process, hot_backup_node_id, hot_backup_dev, hot_backup_info
+
+    if not HOT_BACKUP_ENABLED:
+        return False
+
+    snap = hot_backup_snapshot()
+    node_id = str(snap.get("node_id") or "")
+    dev = str(snap.get("dev") or "")
+    info = dict(snap.get("info") or {})
+
+    if not node_id or not dev or not snap.get("running"):
+        log_hot_backup("没有可提升的热备用节点", "WARNING")
+        return False
+
+    last_ok = float(info.get("last_health_ok_at") or 0)
+    if time.time() - last_ok > HOT_BACKUP_HEALTH_MAX_AGE_SECONDS:
+        log_hot_backup(f"热备用 {node_id} 最近健康检测过旧，提升前快速复检")
+        if not check_hot_backup_health(force=True):
+            log_hot_backup(f"热备用 {node_id} 提升前复检失败，不能提升", "WARNING")
+            return False
+
+    health = check_interface_health(dev, timeout_seconds=5)
+    if not health.get("ok"):
+        cleanup_hot_backup(f"热备用 {node_id} 提升前检测失败: {health.get('error', '未知错误')}")
+        return False
+
+    quality_info = info.get("quality_info") if isinstance(info.get("quality_info"), dict) else {}
+    exit_ip = quality_info.get("ip") or health.get("ip") or info.get("exit_ip") or ""
+
+    log_hot_backup(f"开始提升热备用为正式出口: node={node_id}, dev={dev}, reason={reason}")
+
+    process_to_promote = None
+    with hot_backup_lock:
+        if hot_backup_node_id != node_id or hot_backup_dev != dev or hot_backup_process is None:
+            log_hot_backup("热备用状态在提升前发生变化，取消本次提升", "WARNING")
+            return False
+        process_to_promote = hot_backup_process
+        hot_backup_process = None
+        hot_backup_node_id = ""
+        hot_backup_dev = ""
+        hot_backup_info = {}
+
+    stop_active_openvpn()
+
+    active_openvpn_process = process_to_promote
+    active_openvpn_node_id = node_id
+    set_active_proxy_interface(dev)
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        promoted_node = None
+        for item in nodes:
+            item["active"] = item.get("id") == node_id
+            if item["active"]:
+                promoted_node = item
+                item["probe_status"] = "available"
+                item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+                item["hot_backup_status"] = "promoted"
+                item["hot_backup_message"] = "已提升为正式出口"
+            else:
+                if item.get("hot_backup_status") == "ready":
+                    item["hot_backup_status"] = "empty"
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+
+    if promoted_node:
+        save_last_connected_node(node_id, promoted_node)
+
+    set_hot_backup_state("empty", hot_backup_message="热备用已提升为正式出口")
+
+    finish_node_switch_duration(f"热备用 {node_id} 已提升为正式出口")
+    begin_or_continue_ip_uptime(
+        exit_ip,
+        node_id=node_id,
+        reason="热备用提升为正式出口，开始统计连接时间",
+    )
+
+    set_state(
+        proxy_ok=True,
+        proxy_ip=exit_ip or health.get("ip", "-"),
+        proxy_latency_ms=health.get("latency_ms", 0),
+        proxy_error="",
+        is_connecting=False,
+        is_maintaining=False,
+        maintenance_message="",
+        connection_stage="connected",
+        active_status="connected",
+        quality_checking_node_id="",
+        active_openvpn_node_id=node_id,
+        connected_at=time.time(),
+        last_check_message=f"热备用已提升为正式出口: {node_id}",
+    )
+
+    log_hot_backup(f"热备用提升完成: node={node_id}, dev={dev}, exit_ip={exit_ip}")
+    start_hot_backup_builder_thread()
+    return True
+
+
+def start_waiting_for_hot_backup(reason: str = "") -> None:
+    global hot_backup_waiting_promote
+
+    if not HOT_BACKUP_ENABLED:
+        return
+
+    with hot_backup_lock:
+        if hot_backup_waiting_promote:
+            return
+        hot_backup_waiting_promote = True
+
+    set_state(
+        active_status="waiting_backup",
+        connection_stage="waiting_backup",
+        last_check_message="当前正式节点故障，正在等待热备用节点就绪...",
+    )
+
+    def waiter() -> None:
+        global hot_backup_waiting_promote
+        log_hot_backup(f"进入等待热备用状态: {reason}", "WARNING")
+        try:
+            while True:
+                if promote_hot_backup_if_available("等待热备用就绪后自动提升"):
+                    return
+
+                snap = hot_backup_snapshot()
+                if not snap.get("building") and not snap.get("running"):
+                    log_hot_backup("热备用为空，触发维护线程补齐")
+                    try:
+                        maintain_valid_nodes(force=False, show_ui_progress=False)
+                    except Exception as exc:
+                        log_hot_backup(f"等待热备用期间维护线程异常: {exc}", "ERROR")
+
+                time.sleep(HOT_BACKUP_WAIT_CHECK_SECONDS)
+        finally:
+            with hot_backup_lock:
+                hot_backup_waiting_promote = False
+
+    threading.Thread(target=waiter, daemon=True).start()
 
 
 def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, Any] | None) -> dict[str, Any]:
@@ -3452,6 +4097,7 @@ def connect_node(node_id: str) -> str:
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
+        set_active_proxy_interface("tun0")
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -3733,6 +4379,180 @@ def fetch_ipapi_quality() -> dict[str, Any]:
 
     return parse_ipapi_quality(raw)
 
+
+def run_curl_json_via_interface(url: str, interface: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+    iface = str(interface or "").strip()
+    if not iface:
+        raise RuntimeError("缺少出口接口，无法执行预检请求")
+
+    timeout = int(timeout_seconds or QUALITY_HTTP_TIMEOUT_SECONDS)
+    cmd = [
+        "curl", "-4", "-s",
+        "--interface", iface,
+        url,
+        "--connect-timeout", "8",
+        "--max-time", str(timeout),
+    ]
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout + 3,
+    )
+
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"curl --interface {iface} 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+        )
+
+    body = res.stdout.strip()
+    if not body:
+        raise RuntimeError(f"curl --interface {iface} 返回为空")
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"curl --interface {iface} 返回不是 JSON: {exc}; body={body[:200]}")
+
+
+def fetch_ippure_quality_via_interface(interface: str) -> dict[str, Any]:
+    raw = run_curl_json_via_interface(IPPURE_API_URL, interface)
+    return parse_ippure_quality(raw)
+
+
+def fetch_ipapi_quality_via_interface(interface: str) -> dict[str, Any]:
+    raw = run_curl_json_via_interface(IPAPI_API_URL, interface)
+    return parse_ipapi_quality(raw)
+
+
+def check_interface_health(interface: str, timeout_seconds: int = 6) -> dict[str, Any]:
+    iface = str(interface or "").strip()
+    if not iface:
+        return {"ok": False, "error": "缺少备用出口接口"}
+
+    if sys.platform.startswith("linux"):
+        iface_path = Path("/sys/class/net") / iface
+        if not iface_path.exists():
+            return {"ok": False, "error": f"备用出口接口 {iface} 不存在"}
+
+    def run_ip_check(url: str) -> dict[str, Any] | None:
+        cmd = [
+            "curl", "-4", "-sS",
+            "--interface", iface,
+            "-w", "\n%{time_total} %{http_code}",
+            url,
+            "--connect-timeout", "5",
+            "--max-time", str(timeout_seconds),
+        ]
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds + 2)
+        if res.returncode != 0:
+            return None
+
+        lines = res.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return None
+
+        ip = lines[0].strip()
+        time_info = lines[-1].strip().split()
+        if len(time_info) != 2:
+            return None
+
+        total_time_str, http_code = time_info
+        if http_code != "200" or not ip:
+            return None
+
+        return {
+            "ok": True,
+            "ip": ip,
+            "latency_ms": int(float(total_time_str) * 1000),
+            "interface": iface,
+        }
+
+    try:
+        for url in (
+            "http://ip.sb",
+            "http://api.ipify.org",
+            "https://ifconfig.me/ip",
+        ):
+            result = run_ip_check(url)
+            if result:
+                return result
+
+        return {"ok": False, "error": f"备用出口 {iface} 检测失败"}
+    except Exception as exc:
+        return {"ok": False, "error": f"备用出口 {iface} 检测异常: {exc}"}
+
+
+def probe_quality_via_interface(interface: str, include_speed: bool = True) -> tuple[bool, str, dict[str, Any]]:
+    iface = str(interface or "").strip()
+    if not iface:
+        return False, "缺少备用出口接口", {}
+
+    quality_info: dict[str, Any] = {}
+
+    print(f"[热备用] 开始通过 {iface} 进行 IPPure 预检", flush=True)
+    quality_info = fetch_ippure_quality_via_interface(iface)
+
+    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
+        try:
+            scamalytics_info = fetch_scamalytics_quality(quality_info.get("ip"))
+            quality_info["scamalytics_checked"] = True
+            quality_info["has_scamalytics_score"] = scamalytics_info.get("has_scamalytics_score", False)
+            quality_info["scamalytics_score"] = scamalytics_info.get("scamalytics_score", 0)
+            quality_info["scamalytics_risk"] = scamalytics_info.get("scamalytics_risk", "")
+            quality_info["scamalytics_url"] = scamalytics_info.get("scamalytics_url", "")
+            quality_info["scamalytics_isp"] = scamalytics_info.get("scamalytics_isp", "")
+            quality_info["scamalytics_org"] = scamalytics_info.get("scamalytics_org", "")
+            quality_info["scamalytics_error"] = ""
+        except Exception as exc:
+            quality_info["scamalytics_checked"] = False
+            quality_info["has_scamalytics_score"] = False
+            quality_info["scamalytics_score"] = 0
+            quality_info["scamalytics_error"] = str(exc)
+
+    if QUALITY_CHECK_IPAPI_ENABLED:
+        try:
+            ipapi_info = fetch_ipapi_quality_via_interface(iface)
+            for field in IPAPI_RISK_FIELD_LABELS:
+                quality_info[field] = ipapi_info.get(field)
+            quality_info["ipapi_checked"] = True
+            quality_info["ipapi_ip"] = ipapi_info.get("ipapi_ip", "")
+            quality_info["ipapi_asn"] = ipapi_info.get("ipapi_asn", "")
+            quality_info["ipapi_org"] = ipapi_info.get("ipapi_org", "")
+            quality_info["ipapi_error"] = ""
+        except Exception as exc:
+            quality_info["ipapi_checked"] = False
+            quality_info["ipapi_error"] = str(exc)
+
+    passed, reason = evaluate_ip_quality(quality_info)
+    if not passed:
+        return passed, reason, quality_info
+
+    if include_speed and QUALITY_CHECK_SPEED_ENABLED:
+        print(f"[热备用] IP 质量通过，开始通过 {iface} 进行 speedtest 测速", flush=True)
+        try:
+            speed_info = fetch_proxy_speed_quality(iface)
+            quality_info["speed_test_checked"] = True
+            quality_info["speed_test_error"] = ""
+            quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
+            quality_info["speed_test_http_code"] = speed_info.get("speed_test_http_code", "")
+            quality_info["speed_test_size_bytes"] = speed_info.get("speed_test_size_bytes", 0)
+            quality_info["speed_test_time_seconds"] = speed_info.get("speed_test_time_seconds", 0)
+            quality_info["download_speed_bps"] = speed_info.get("download_speed_bps", 0)
+            quality_info["download_speed_mbps"] = speed_info.get("download_speed_mbps", 0)
+            quality_info["download_speed_mib_s"] = speed_info.get("download_speed_mib_s", 0)
+        except Exception as exc:
+            quality_info["speed_test_checked"] = False
+            quality_info["speed_test_error"] = str(exc)
+            print(f"[热备用] {iface} speedtest 测速失败: {exc}", flush=True)
+            log_to_json("WARNING", "HotBackup", f"{iface} speedtest 测速失败: {exc}")
+
+        passed, reason = evaluate_ip_quality(quality_info)
+
+    return passed, reason, quality_info
+
 def strip_ansi(text: str) -> str:
     """
     去掉 speedtest 输出里的 ANSI 颜色控制字符。
@@ -3954,25 +4774,27 @@ def is_retryable_speedtest_error(message: str) -> bool:
 
     return any(k in s for k in retry_keywords)
 
-def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts: int) -> dict[str, Any]:
+def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts: int, interface: str | None = None) -> dict[str, Any]:
     """
     单次 speedtest 测速。
     失败时抛 RuntimeError，由 fetch_proxy_speed_quality() 负责判断是否重试。
     """
+    iface = str(interface or SPEEDTEST_INTERFACE or "tun0").strip() or "tun0"
+
     print(
-        f"[测速] 开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度..."
+        f"[测速] 开始使用 speedtest 通过 {iface} 测试出口下载速度..."
         f" 第 {attempt}/{max_attempts} 次",
         flush=True,
     )
     log_to_json(
         "INFO",
         "Speed",
-        f"开始使用 speedtest 通过 {SPEEDTEST_INTERFACE} 测试出口下载速度，第 {attempt}/{max_attempts} 次",
+        f"开始使用 speedtest 通过 {iface} 测试出口下载速度，第 {attempt}/{max_attempts} 次",
     )
 
     cmd = [
         SPEEDTEST_CMD,
-        "--interface", SPEEDTEST_INTERFACE,
+        "--interface", iface,
         "--accept-license",
         "--accept-gdpr",
         "--progress=no",
@@ -4081,7 +4903,7 @@ def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts
 
         return {
             "speed_test_checked": True,
-            "speed_test_url": f"speedtest://interface/{SPEEDTEST_INTERFACE}",
+            "speed_test_url": f"speedtest://interface/{iface}",
             "speed_test_http_code": "speedtest",
             "speed_test_size_bytes": data_used_bytes,
             "speed_test_time_seconds": round(time_total, 2),
@@ -4103,7 +4925,7 @@ def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts
                     pass
 
 
-def fetch_proxy_speed_quality() -> dict[str, Any]:
+def fetch_proxy_speed_quality(interface: str | None = None) -> dict[str, Any]:
     """
     使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
 
@@ -4112,8 +4934,10 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
     - 只接受包含 data used 的完整下载结果；
     - 数据量为 0 不算测速完成。
     """
+    iface = str(interface or SPEEDTEST_INTERFACE or "tun0").strip() or "tun0"
+
     install_speedtest_cli()
-    ensure_speedtest_interface_ready(SPEEDTEST_INTERFACE)
+    ensure_speedtest_interface_ready(iface)
 
     speedtest_env = build_speedtest_env()
 
@@ -4125,6 +4949,7 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
                 speedtest_env=speedtest_env,
                 attempt=attempt,
                 max_attempts=SPEEDTEST_RETRY_TIMES,
+                interface=iface,
             )
 
         except Exception as exc:
@@ -4388,12 +5213,12 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
     if passed and QUALITY_CHECK_SPEED_ENABLED:
         set_state(
             last_check_message=(
-                f"正在通过 {SPEEDTEST_INTERFACE} 使用 speedtest 进行出口下载测速..."
+                f"正在通过 {get_active_proxy_interface()} 使用 speedtest 进行出口下载测速..."
             )
         )
 
         try:
-            speed_info = fetch_proxy_speed_quality()
+            speed_info = fetch_proxy_speed_quality(get_active_proxy_interface())
 
             quality_info["speed_test_checked"] = True
             quality_info["speed_test_error"] = ""
@@ -4427,8 +5252,8 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["speed_test_checked"] = False
             quality_info["speed_test_error"] = str(exc)
 
-            print(f"[测速] speedtest tun0 出口测速失败: {exc}", flush=True)
-            log_to_json("WARNING", "Speed", f"speedtest tun0 出口测速失败: {exc}")
+            print(f"[测速] speedtest {get_active_proxy_interface()} 出口测速失败: {exc}", flush=True)
+            log_to_json("WARNING", "Speed", f"speedtest {get_active_proxy_interface()} 出口测速失败: {exc}")
 
         # 6. 加入测速结果后，再完整判断一次
         passed, reason = evaluate_ip_quality(quality_info)
@@ -4597,11 +5422,17 @@ def connect_node_with_quality_check(node_id: str) -> str:
         is_maintaining=False,
         maintenance_message="",
         connection_stage="connected",
+        active_status="connected",
         quality_checking_node_id="",
         active_openvpn_node_id=node_id,
         connected_at=time.time(),
         last_check_message=f"Connected {node_id}; IP质量达标",
     )
+
+    if HOT_BACKUP_ENABLED:
+        log_hot_backup("正式节点已连接，触发后台补齐 1 个热备用节点")
+        start_hot_backup_builder_thread()
+
     return result
 
 def connect_saved_node_without_quality_check(node_id: str) -> str:
@@ -4756,6 +5587,47 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                         pass
                         
             write_json(NODES_FILE, merged)
+
+        waiting_backup = read_json(STATE_FILE, {}).get("active_status") == "waiting_backup"
+        active_confirmed = has_confirmed_active_vpn_connection()
+
+        if HOT_BACKUP_ENABLED and (active_confirmed or waiting_backup):
+            with lock:
+                current_nodes = read_json(NODES_FILE, [])
+                target_country = get_active_country_code(current_nodes, active_openvpn_node_id)
+
+            if hot_backup_ready():
+                check_hot_backup_health(force=False)
+                to_test_ids: list[str] = []
+                log_hot_backup("热备用已存在，本轮维护不再做新节点质量检测和测速")
+            else:
+                log_hot_backup("热备用为空，本轮维护开始串行构建 1 个热备用节点")
+                build_hot_backup_from_nodes(current_nodes, target_country)
+                to_test_ids = []
+
+            if waiting_backup:
+                promote_hot_backup_if_available("维护线程补齐热备用后自动提升")
+
+            with lock:
+                merged = read_json(NODES_FILE, [])
+
+            valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
+            message = (
+                f"拉取完成：获取 {len(candidates)} 个节点，"
+                f"热备用状态 {read_json(STATE_FILE, {}).get('hot_backup_status', 'unknown')}，"
+                f"当前可用 {valid_nodes_count} 个。"
+            )
+
+            finish_maintenance_progress(message)
+            is_connecting = False
+            set_state(
+                is_connecting=False,
+                last_check_at=time.time(),
+                last_check_message=message,
+                active_openvpn_node_id=active_openvpn_node_id,
+                valid_nodes=valid_nodes_count,
+            )
+            return message
 
         # Test the first 10 non-active nodes from the new list
         with lock:
@@ -8808,12 +9680,13 @@ def check_proxy_health() -> dict[str, Any]:
             "error": f"代理服务未运行 (端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e})"
         }
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
+    # 2. 检测当前 7928 出口虚拟网卡是否存在 (Linux 下)
+    active_iface = get_active_proxy_interface()
+    tun_path = Path("/sys/class/net") / active_iface
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"VPN 虚拟网卡 ({active_iface}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -8910,6 +9783,9 @@ def background_proxy_checker() -> None:
             if is_connecting:
                 time.sleep(5)
                 continue
+
+            if HOT_BACKUP_ENABLED:
+                check_hot_backup_health(force=False)
 
             if not active_openvpn_node_id and not active_openvpn_running():
                 set_state(
@@ -9050,7 +9926,26 @@ def background_proxy_checker() -> None:
                         active_node["probed_at"] = time.time()
                         write_json(NODES_FILE, nodes)
 
-                auto_switch_node(record_switch=True)
+                if HOT_BACKUP_ENABLED:
+                    if promote_hot_backup_if_available(
+                        f"当前代理连续 {PROXY_HEALTH_CONFIRM_TIMES} 次检测失败: {final_error}"
+                    ):
+                        time.sleep(1)
+                        continue
+
+                    print(
+                        "[代理检测] 没有可用热备用，进入等待热备用就绪状态",
+                        flush=True,
+                    )
+                    log_to_json(
+                        "WARNING",
+                        "HotBackup",
+                        "正式节点故障但没有可用热备用，开始等待维护线程补齐",
+                    )
+                    stop_active_openvpn()
+                    start_waiting_for_hot_backup(final_error)
+                else:
+                    auto_switch_node(record_switch=True)
 
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
@@ -9621,6 +10516,8 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    cleanup_policy_routing()
+    set_active_proxy_interface("tun0")
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))

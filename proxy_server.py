@@ -30,7 +30,30 @@ PROXY_AUTH_ENABLED = env_flag("PROXY_AUTH_ENABLED", "0")
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
 
+ACTIVE_PROXY_INTERFACE = os.environ.get("ACTIVE_PROXY_INTERFACE", "tun0")
+ACTIVE_PROXY_INTERFACE_LOCK = threading.RLock()
 
+
+def set_active_interface(interface: str) -> None:
+    global ACTIVE_PROXY_INTERFACE
+    iface = str(interface or "").strip() or "tun0"
+    with ACTIVE_PROXY_INTERFACE_LOCK:
+        if ACTIVE_PROXY_INTERFACE != iface:
+            print(
+                f"[代理出口] 7928 代理出口接口切换: {ACTIVE_PROXY_INTERFACE} -> {iface}",
+                flush=True,
+            )
+        ACTIVE_PROXY_INTERFACE = iface
+
+
+def get_active_interface() -> str:
+    with ACTIVE_PROXY_INTERFACE_LOCK:
+        return str(ACTIVE_PROXY_INTERFACE or "tun0")
+
+
+def bind_socket_to_interface(sock: socket.socket, interface: str) -> None:
+    iface = str(interface or "tun0").strip() or "tun0"
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
 
 
 def proxy_auth_ready() -> bool:
@@ -143,7 +166,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def resolve_dns_over_interface(host: str, interface: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -171,7 +194,7 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     try:
         sock.settimeout(timeout)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            bind_socket_to_interface(sock, interface)
         except OSError:
             return None
         sock.sendto(packet, (dns_server, 53))
@@ -234,9 +257,11 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         offset += rdlength
     return None
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+def create_connection(address: tuple[str, int], timeout: float = 20, interface: str | None = None) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    iface = str(interface or get_active_interface() or "tun0").strip() or "tun0"
+
+    resolved_ip = resolve_dns_over_interface(host, iface)
     if resolved_ip:
         host = resolved_ip
 
@@ -247,7 +272,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            bind_socket_to_interface(sock, iface)
             sock.connect(sa)
             return sock
         except OSError as e:
@@ -256,8 +281,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
                 sock.close()
     if err is not None:
         raise err
-    else:
-        raise OSError("getaddrinfo returns empty list")
+    raise OSError("getaddrinfo returns empty list")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
