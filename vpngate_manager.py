@@ -3124,7 +3124,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     else:
         set_maintenance_progress(f"正在检测优先国家节点，最多 {max_workers} 个并发，进度 0/{total}...")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, max(1, total))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(test_worker, (idx, n)): n["id"]
             for idx, n in enumerate(to_test)
