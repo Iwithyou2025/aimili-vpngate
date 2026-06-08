@@ -31,7 +31,7 @@ PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
 MAX_PROXY_CONNECTIONS = max(
     1,
-    parse_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS")) or 10
+    parse_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS")) or 32
 )
 
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
