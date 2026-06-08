@@ -4091,7 +4091,7 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
         # 允许测速存在少量波动，避免 0.998 MB/s 被显示成 1.00 MB/s 后仍判定失败
         SPEED_TEST_TOLERANCE_RATIO = 0.02  # 2% 容差
-        
+
         speed_mib = speed_bps / 1024 / 1024
         min_mib = QUALITY_MIN_DOWNLOAD_SPEED_BPS / 1024 / 1024
 
@@ -5338,15 +5338,18 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       gap: 20px;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
+      min-width: 0;
+      overflow: hidden;
     }
     
     .active-card-details {
       display: flex;
       flex-direction: column;
       gap: 6px;
+      min-width: 0;
+      flex: 1;
     }
-    
     .active-card-title {
       font-size: 14px;
       font-weight: 700;
