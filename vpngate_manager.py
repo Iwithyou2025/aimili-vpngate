@@ -105,6 +105,21 @@ QUALITY_HTTP_TIMEOUT_SECONDS = int(os.environ.get("QUALITY_HTTP_TIMEOUT_SECONDS"
 
 IPAPI_API_URL = os.environ.get("IPAPI_API_URL", "https://api.ipapi.is")
 
+# Scamalytics 风险分检测
+QUALITY_CHECK_SCAMALYTICS_ENABLED = env_flag("QUALITY_CHECK_SCAMALYTICS_ENABLED", "1")
+
+SCAMALYTICS_API_URL_TEMPLATE = os.environ.get(
+    "SCAMALYTICS_API_URL_TEMPLATE",
+    "https://api11.scamalytics.com/v3/6a2661bbedc29/?key=e48c35faae9467cdcb34f4bbde0eed609ff5f3bcc91a4b5f9b1833a52c5174f4&ip={ip}"
+)
+
+QUALITY_MAX_SCAMALYTICS_SCORE = int(
+    os.environ.get("QUALITY_MAX_SCAMALYTICS_SCORE", "30")
+)
+
+# 严格模式：Scamalytics 请求失败 / 没有分数字段时，直接判定不合格
+QUALITY_SCAMALYTICS_STRICT = env_flag("QUALITY_SCAMALYTICS_STRICT", "1")
+
 # 是否启用 ipapi.is 补充检测
 QUALITY_CHECK_IPAPI_ENABLED = env_flag("QUALITY_CHECK_IPAPI_ENABLED", "1")
 
@@ -2838,6 +2853,9 @@ def is_hard_quality_fail_reason(reason: str) -> bool:
         "IP 类型不是住宅",
         "IP 来源不是原生",
         "人机流量比",
+        "Scamalytics 风险分",
+        "无法读取 Scamalytics",
+        "Scamalytics 检测异常",
     ]
 
     return any(keyword in reason for keyword in hard_keywords)
@@ -3585,6 +3603,76 @@ def fetch_ippure_quality() -> dict[str, Any]:
 
     return parse_ippure_quality(raw)
 
+def parse_scamalytics_quality(raw: dict[str, Any]) -> dict[str, Any]:
+    payload = raw.get("scamalytics") if isinstance(raw, dict) else None
+    if not isinstance(payload, dict):
+        payload = raw if isinstance(raw, dict) else {}
+
+    score_raw = payload.get("scamalytics_score")
+    has_score = score_raw is not None and str(score_raw).strip() != ""
+
+    return {
+        "source": "scamalytics",
+        "raw": raw,
+        "scamalytics_checked": True,
+        "has_scamalytics_score": has_score,
+        "scamalytics_score": parse_int(score_raw),
+        "scamalytics_risk": str(payload.get("scamalytics_risk") or ""),
+        "scamalytics_url": str(payload.get("scamalytics_url") or ""),
+        "scamalytics_isp": str(payload.get("scamalytics_isp") or ""),
+        "scamalytics_org": str(payload.get("scamalytics_org") or ""),
+    }
+
+
+def build_scamalytics_url(ip: str) -> str:
+    ip = str(ip or "").strip()
+    if not ip:
+        raise RuntimeError("Scamalytics 缺少出口 IP，无法查询风险分")
+
+    encoded_ip = urllib.parse.quote(ip, safe="")
+    template = SCAMALYTICS_API_URL_TEMPLATE
+
+    if "{ip}" in template:
+        return template.replace("{ip}", encoded_ip)
+
+    sep = "&" if "?" in template else "?"
+    return f"{template}{sep}ip={encoded_ip}"
+
+
+def fetch_scamalytics_quality(ip: str) -> dict[str, Any]:
+    url = build_scamalytics_url(ip)
+
+    # 注意：这里不走 7928 代理
+    # 因为 Scamalytics 是通过 URL 里的 ip 参数查询，不需要请求本身从 VPN 出口出去
+    cmd = [
+        "curl", "-4", "-s",
+        url,
+        "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
+    ]
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
+    )
+
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Scamalytics 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+        )
+
+    body = res.stdout.strip()
+    if not body:
+        raise RuntimeError("Scamalytics 返回为空")
+
+    try:
+        raw = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Scamalytics 返回不是 JSON: {exc}; body={body[:200]}")
+
+    return parse_scamalytics_quality(raw)
+
 def parse_ipapi_quality(raw: dict[str, Any]) -> dict[str, Any]:
     result = {
         "source": "ipapi.is",
@@ -4066,10 +4154,26 @@ def fetch_proxy_speed_quality() -> dict[str, Any]:
     raise RuntimeError(f"speedtest 测速失败: {last_error}")
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
+
     score = parse_int(info.get("ippure_score"))
+    scamalytics_score = parse_int(info.get("scamalytics_score"))
 
     if not info.get("has_ippure_score"):
         return False, "无法读取 IPPure 风控系数"
+
+    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
+        if QUALITY_SCAMALYTICS_STRICT and info.get("scamalytics_error"):
+            return False, f"Scamalytics 检测异常: {info.get('scamalytics_error')}"
+
+    if info.get("scamalytics_checked"):
+        if not info.get("has_scamalytics_score"):
+            return False, "无法读取 Scamalytics 风险分"
+
+        if scamalytics_score > QUALITY_MAX_SCAMALYTICS_SCORE:
+            return False, (
+                f"Scamalytics 风险分 {scamalytics_score} "
+                f"超过阈值 {QUALITY_MAX_SCAMALYTICS_SCORE}"
+            )
 
     if score > QUALITY_MAX_FRAUD_SCORE:
         return False, f"IPPure 系数 {score}% 超过阈值 {QUALITY_MAX_FRAUD_SCORE}%"
@@ -4156,6 +4260,15 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         node["native_ip"] = quality_info.get("native_ip")
         node["is_residential"] = quality_info.get("is_residential")
 
+        # Scamalytics 风险分字段
+        node["scamalytics_checked"] = quality_info.get("scamalytics_checked", False)
+        node["scamalytics_error"] = quality_info.get("scamalytics_error", "")
+        node["scamalytics_score"] = parse_int(quality_info.get("scamalytics_score"))
+        node["scamalytics_risk"] = quality_info.get("scamalytics_risk", "")
+        node["scamalytics_url"] = quality_info.get("scamalytics_url", "")
+        node["scamalytics_isp"] = quality_info.get("scamalytics_isp", "")
+        node["scamalytics_org"] = quality_info.get("scamalytics_org", "")
+
         if quality_info.get("asn"):
             node["asn"] = quality_info.get("asn")
 
@@ -4208,10 +4321,48 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
     if not QUALITY_CHECK_ENABLED:
         return True, "IP质量检测未启用", {}
 
-    # 1. 先做原有 IPPure 检测
+    # 1. 先做原有 IPPure 检测，拿到实际出口 IP
     quality_info = fetch_ippure_quality()
 
-    # 2. 再做 ipapi.is 补充检测
+    # 2. 用出口 IP 查询 Scamalytics 风险分
+    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
+        try:
+            scamalytics_info = fetch_scamalytics_quality(quality_info.get("ip"))
+
+            quality_info["scamalytics_checked"] = True
+            quality_info["has_scamalytics_score"] = scamalytics_info.get(
+                "has_scamalytics_score",
+                False
+            )
+            quality_info["scamalytics_score"] = scamalytics_info.get(
+                "scamalytics_score",
+                0
+            )
+            quality_info["scamalytics_risk"] = scamalytics_info.get(
+                "scamalytics_risk",
+                ""
+            )
+            quality_info["scamalytics_url"] = scamalytics_info.get(
+                "scamalytics_url",
+                ""
+            )
+            quality_info["scamalytics_isp"] = scamalytics_info.get(
+                "scamalytics_isp",
+                ""
+            )
+            quality_info["scamalytics_org"] = scamalytics_info.get(
+                "scamalytics_org",
+                ""
+            )
+            quality_info["scamalytics_error"] = ""
+
+        except Exception as exc:
+            quality_info["scamalytics_checked"] = False
+            quality_info["has_scamalytics_score"] = False
+            quality_info["scamalytics_score"] = 0
+            quality_info["scamalytics_error"] = str(exc)
+
+    # 3. 再做 ipapi.is 补充检测
     if QUALITY_CHECK_IPAPI_ENABLED:
         try:
             ipapi_info = fetch_ipapi_quality()
@@ -4229,13 +4380,17 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["ipapi_checked"] = False
             quality_info["ipapi_error"] = str(exc)
 
-    # 3. 先按原有 IPPure + ipapi 质量逻辑判断
+    # 4. 先按 IPPure + Scamalytics + ipapi 质量逻辑判断
     # 如果这里已经不达标，就不要再测速，减少对节点的影响
     passed, reason = evaluate_ip_quality(quality_info)
 
-    # 4. 只有前面的 IP 质量通过后，才进行 7928 出口测速
+    # 5. 只有前面的 IP 质量通过后，才进行 7928 出口测速
     if passed and QUALITY_CHECK_SPEED_ENABLED:
-        set_state(last_check_message=f"正在通过 {SPEEDTEST_INTERFACE} 使用 speedtest 进行出口下载测速...")
+        set_state(
+            last_check_message=(
+                f"正在通过 {SPEEDTEST_INTERFACE} 使用 speedtest 进行出口下载测速..."
+            )
+        )
 
         try:
             speed_info = fetch_proxy_speed_quality()
@@ -4243,12 +4398,30 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["speed_test_checked"] = True
             quality_info["speed_test_error"] = ""
             quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
-            quality_info["speed_test_http_code"] = speed_info.get("speed_test_http_code", "")
-            quality_info["speed_test_size_bytes"] = speed_info.get("speed_test_size_bytes", 0)
-            quality_info["speed_test_time_seconds"] = speed_info.get("speed_test_time_seconds", 0)
-            quality_info["download_speed_bps"] = speed_info.get("download_speed_bps", 0)
-            quality_info["download_speed_mbps"] = speed_info.get("download_speed_mbps", 0)
-            quality_info["download_speed_mib_s"] = speed_info.get("download_speed_mib_s", 0)
+            quality_info["speed_test_http_code"] = speed_info.get(
+                "speed_test_http_code",
+                ""
+            )
+            quality_info["speed_test_size_bytes"] = speed_info.get(
+                "speed_test_size_bytes",
+                0
+            )
+            quality_info["speed_test_time_seconds"] = speed_info.get(
+                "speed_test_time_seconds",
+                0
+            )
+            quality_info["download_speed_bps"] = speed_info.get(
+                "download_speed_bps",
+                0
+            )
+            quality_info["download_speed_mbps"] = speed_info.get(
+                "download_speed_mbps",
+                0
+            )
+            quality_info["download_speed_mib_s"] = speed_info.get(
+                "download_speed_mib_s",
+                0
+            )
 
         except Exception as exc:
             quality_info["speed_test_checked"] = False
@@ -4257,13 +4430,13 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             print(f"[测速] speedtest tun0 出口测速失败: {exc}", flush=True)
             log_to_json("WARNING", "Speed", f"speedtest tun0 出口测速失败: {exc}")
 
-        # 5. 加入测速结果后，再完整判断一次
+        # 6. 加入测速结果后，再完整判断一次
         passed, reason = evaluate_ip_quality(quality_info)
 
-    # 6. 写入节点质量结果
+    # 7. 写入节点质量结果
     update_node_quality(node_id, quality_info, passed, reason)
 
-    # 7. 写入全局状态
+    # 8. 写入全局状态
     state_updates = {
         "proxy_quality_ok": passed,
         "proxy_quality_error": "" if passed else reason,
@@ -4272,19 +4445,45 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
         "proxy_native_ip": quality_info.get("native_ip"),
         "proxy_is_residential": quality_info.get("is_residential"),
 
+        "proxy_scamalytics_checked": quality_info.get(
+            "scamalytics_checked",
+            False
+        ),
+        "proxy_scamalytics_error": quality_info.get("scamalytics_error", ""),
+        "proxy_scamalytics_score": parse_int(
+            quality_info.get("scamalytics_score")
+        ),
+        "proxy_scamalytics_risk": quality_info.get("scamalytics_risk", ""),
+        "proxy_scamalytics_url": quality_info.get("scamalytics_url", ""),
+        "proxy_scamalytics_isp": quality_info.get("scamalytics_isp", ""),
+        "proxy_scamalytics_org": quality_info.get("scamalytics_org", ""),
+
         "proxy_ipapi_checked": quality_info.get("ipapi_checked", False),
         "proxy_ipapi_error": quality_info.get("ipapi_error", ""),
         "proxy_ipapi_ip": quality_info.get("ipapi_ip", ""),
         "proxy_ipapi_asn": quality_info.get("ipapi_asn", ""),
         "proxy_ipapi_org": quality_info.get("ipapi_org", ""),
 
-        "proxy_speed_test_checked": quality_info.get("speed_test_checked", False),
+        "proxy_speed_test_checked": quality_info.get(
+            "speed_test_checked",
+            False
+        ),
         "proxy_speed_test_error": quality_info.get("speed_test_error", ""),
-        "proxy_download_speed_bps": parse_int(quality_info.get("download_speed_bps")),
-        "proxy_download_speed_mbps": parse_float(quality_info.get("download_speed_mbps")),
-        "proxy_download_speed_mib_s": parse_float(quality_info.get("download_speed_mib_s")),
-        "proxy_speed_test_size_bytes": parse_int(quality_info.get("speed_test_size_bytes")),
-        "proxy_speed_test_time_seconds": parse_float(quality_info.get("speed_test_time_seconds")),
+        "proxy_download_speed_bps": parse_int(
+            quality_info.get("download_speed_bps")
+        ),
+        "proxy_download_speed_mbps": parse_float(
+            quality_info.get("download_speed_mbps")
+        ),
+        "proxy_download_speed_mib_s": parse_float(
+            quality_info.get("download_speed_mib_s")
+        ),
+        "proxy_speed_test_size_bytes": parse_int(
+            quality_info.get("speed_test_size_bytes")
+        ),
+        "proxy_speed_test_time_seconds": parse_float(
+            quality_info.get("speed_test_time_seconds")
+        ),
     }
 
     for field in IPAPI_RISK_FIELD_LABELS:
