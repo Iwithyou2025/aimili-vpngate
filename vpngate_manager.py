@@ -5150,15 +5150,14 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
         ipapi_parts.append(f"{short_label}:{bool_zh(info.get(field))}")
 
     proxycheck_text = "-"
+    speed_text = "-"
 
     if info.get("proxycheck_checked"):
-        proxycheck_text = (
-            f"proxy:{info.get('proxycheck_proxy') or '-'}"
-            f", type:{info.get('proxycheck_type')}" if info.get("proxycheck_type") else ""
-        )
+        proxycheck_text = f"proxy:{info.get('proxycheck_proxy') or '-'}"
+        if info.get("proxycheck_type"):
+            proxycheck_text += f", type:{info.get('proxycheck_type')}"
     elif info.get("proxycheck_error"):
         proxycheck_text = f"失败:{info.get('proxycheck_error')}"
-
 
     if info.get("speed_test_checked"):
         speed_text = (
