@@ -1,4 +1,5 @@
 import json
+import subprocess
 import time
 from typing import Optional
 import os
@@ -300,6 +301,79 @@ def query_single_ip_vpn(
 
     except Exception:
         return None
+def test_proxy_alive(
+        proxy_server: Optional[str] = None,
+        test_url: str = "https://www.ipipseek.com/",
+        timeout: int = 20,
+) -> dict:
+    """
+    测试代理是否可用，并返回耗时。
+
+    返回示例：
+        {
+            "ok": True,
+            "http_code": "200",
+            "time_total": 1.234,
+            "proxy": "socks5://xxx:xxx@127.0.0.1:7928",
+            "error": ""
+        }
+    """
+
+    if proxy_server is None:
+        proxy_server = get_aimilivpn_proxy_server()
+
+    cmd = [
+        "curl",
+        "-x", proxy_server,
+        "-L",
+        "-s",
+        "-o", "/dev/null",
+        "-w", "%{http_code} %{time_total}",
+        "--connect-timeout", str(timeout),
+        "--max-time", str(timeout),
+        test_url,
+    ]
+
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+
+        output = res.stdout.strip()
+
+        if res.returncode != 0:
+            return {
+                "ok": False,
+                "http_code": "",
+                "time_total": None,
+                "proxy": proxy_server,
+                "error": res.stderr.strip() or output,
+            }
+
+        parts = output.split()
+
+        http_code = parts[0] if len(parts) >= 1 else ""
+        time_total = float(parts[1]) if len(parts) >= 2 else None
+
+        return {
+            "ok": http_code.startswith("2") or http_code.startswith("3"),
+            "http_code": http_code,
+            "time_total": time_total,
+            "proxy": proxy_server,
+            "error": "",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "http_code": "",
+            "time_total": None,
+            "proxy": proxy_server,
+            "error": repr(e),
+        }
 
 
 def get_ip_vpn_status(
@@ -371,6 +445,22 @@ def get_ip_vpn_status(
 
 
 if __name__ == "__main__":
+    proxy_server = get_aimilivpn_proxy_server()
+
+    proxy_test = test_proxy_alive(
+        proxy_server=proxy_server,
+        test_url="https://www.ipipseek.com/",
+        timeout=20,
+    )
+
+    print("代理测试结果：", json.dumps(proxy_test, ensure_ascii=False))
+
+    if not proxy_test["ok"]:
+        print("代理不可用，停止查询")
+        exit(1)
+
+    print(f"代理可用，耗时：{proxy_test['time_total']} 秒")
+
     result = get_ip_vpn_status(
         "60.113.181.155",
         "138.64.65.244"
