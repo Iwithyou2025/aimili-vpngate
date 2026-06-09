@@ -135,6 +135,7 @@ def query_ip(driver, ip: str, timeout: int = 30):
 
     # 6. 点击查询按钮
     driver.execute_script("arguments[0].click();", search_btn)
+    driver.execute_script("arguments[0].click();", search_btn)
 
 
 def wait_result_ip(driver, ip: str, timeout: int = 60) -> bool:
@@ -416,6 +417,7 @@ def get_ip_vpn_status(
         try:
             driver.get("https://www.ipipseek.com/")
             driver.refresh()
+            driver.refresh()
         except TimeoutException:
             # 页面加载超时，但 DOM 可能已经可用，所以继续执行
             pass
@@ -428,7 +430,7 @@ def get_ip_vpn_status(
                 query_timeout=query_timeout,
                 result_timeout=result_timeout,
             )
-            time.sleep(5)
+            time.sleep(10)
 
         return json.dumps(results, ensure_ascii=False)
 
