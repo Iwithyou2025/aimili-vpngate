@@ -5154,7 +5154,7 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
     if info.get("proxycheck_checked"):
         proxycheck_text = (
             f"proxy:{info.get('proxycheck_proxy') or '-'}"
-            f', type:{info.get('proxycheck_type')}' if info.get('proxycheck_type') else ''
+            (f", type:{info.get('proxycheck_type')}" if info.get("proxycheck_type") else "")
         )
     elif info.get("proxycheck_error"):
         proxycheck_text = f"失败:{info.get('proxycheck_error')}"
