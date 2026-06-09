@@ -16,6 +16,100 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+def check_proxy(
+        host: str,
+        port: int,
+        test_url: str = "https://www.ipipseek.com/",
+        timeout: int = 10,
+) -> bool:
+    """
+    通过 HTTP CONNECT 隧道验证代理是否可用。
+    直接用 socket 发 CONNECT 请求，不依赖 selenium。
+    返回 True 表示代理可用，False 表示不通。
+    """
+    try:
+        # 解析目标域名和端口
+        from urllib.parse import urlparse
+        parsed = urlparse(test_url)
+        target_host = parsed.hostname
+        target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        sock = socket.create_connection((host, port), timeout=timeout)
+
+        # 发送 HTTP CONNECT 请求
+        connect_req = (
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
+            f"\r\n"
+        )
+        sock.sendall(connect_req.encode("ascii"))
+
+        # 读取代理响应
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        sock.close()
+
+        # HTTP/1.1 200 Connection established 表示隧道建立成功
+        first_line = response.split(b"\r\n")[0].decode("ascii", errors="ignore")
+        status_code = int(first_line.split()[1]) if len(first_line.split()) >= 2 else 0
+        return status_code == 200
+
+    except Exception:
+        return False
+
+
+def check_proxy_with_auth(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        test_url: str = "https://www.ipipseek.com/",
+        timeout: int = 10,
+) -> bool:
+    """
+    带认证的代理连通性验证。
+    在 CONNECT 请求头里附上 Proxy-Authorization。
+    """
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(test_url)
+        target_host = parsed.hostname
+        target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        token = base64.b64encode(
+            f"{username}:{password}".encode("utf-8")
+        ).decode("ascii")
+
+        sock = socket.create_connection((host, port), timeout=timeout)
+
+        connect_req = (
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
+            f"Proxy-Authorization: Basic {token}\r\n"
+            f"\r\n"
+        )
+        sock.sendall(connect_req.encode("ascii"))
+
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        sock.close()
+
+        first_line = response.split(b"\r\n")[0].decode("ascii", errors="ignore")
+        status_code = int(first_line.split()[1]) if len(first_line.split()) >= 2 else 0
+        return status_code == 200
+
+    except Exception:
+        return False
 
 def load_aimilivpn_proxy_config(env_file: str = "/etc/default/aimilivpn"):
     cfg = {
@@ -402,15 +496,31 @@ def get_ip_vpn_status(
         upstream_host = "127.0.0.1"
         upstream_port = int(proxy_cfg["port"])
 
+        # ── 新增：代理连通性检查 ──────────────────────────────
         if proxy_cfg["auth_enabled"]:
             username = proxy_cfg["username"]
             password = proxy_cfg["password"]
 
             if not username or not password:
-                for ip in ips:
-                    results[ip] = None
-                return json.dumps(results, ensure_ascii=False)
+                return json.dumps(
+                    {"error": "代理认证已启用，但未配置用户名或密码"},
+                    ensure_ascii=False
+                )
 
+            proxy_ok = check_proxy_with_auth(
+                upstream_host, upstream_port, username, password
+            )
+        else:
+            proxy_ok = check_proxy(upstream_host, upstream_port)
+
+        if not proxy_ok:
+            return json.dumps(
+                {"error": f"代理不通：{upstream_host}:{upstream_port}"},
+                ensure_ascii=False
+            )
+        # ────────────────────────────────────────────────────
+
+        if proxy_cfg["auth_enabled"]:
             bridge_server, chrome_proxy_server = start_auth_proxy_bridge(
                 upstream_host=upstream_host,
                 upstream_port=upstream_port,
@@ -431,8 +541,7 @@ def get_ip_vpn_status(
 
         for ip in ips:
             results[ip] = query_single_ip_vpn(
-                driver,
-                ip,
+                driver, ip,
                 query_timeout=query_timeout,
                 result_timeout=result_timeout,
             )
