@@ -45,7 +45,23 @@ echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
 echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
 apt-get update -q || true
 echo -e "  -> 正在运行 apt-get install 安装基础依赖包 (openvpn, curl, git, iptables, iproute2, psmisc, python3, gnupg, lsb-release)..."
-apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 gnupg lsb-release
+
+apt-get install -y \
+  openvpn \
+  curl \
+  wget \
+  unzip \
+  git \
+  ca-certificates \
+  iptables \
+  iproute2 \
+  psmisc \
+  python3 \
+  python3-pip \
+  python3-venv \
+  gnupg \
+  lsb-release \
+  fonts-liberation
 
 echo -e "  -> 正在检查 Ookla speedtest CLI..."
 if ! command -v speedtest >/dev/null 2>&1; then
@@ -214,6 +230,106 @@ ensure_openvpn_ca_bundle() {
     rm -rf "$tmp_dir"
 }
 
+ensure_chrome_selenium_env() {
+    echo -e "\n${YELLOW}正在初始化 Chrome / ChromeDriver / Selenium 环境...${PLAIN}"
+
+    # 1. 安装 Google Chrome
+    if ! command -v google-chrome >/dev/null 2>&1; then
+        echo -e "  -> 未检测到 Google Chrome，正在安装..."
+
+        wget -O /tmp/google-chrome-stable_current_amd64.deb \
+          https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+
+        apt-get install -y /tmp/google-chrome-stable_current_amd64.deb
+
+        rm -f /tmp/google-chrome-stable_current_amd64.deb
+    else
+        echo -e "${GREEN}  -> Google Chrome 已安装，跳过。${PLAIN}"
+    fi
+
+    if ! command -v google-chrome >/dev/null 2>&1; then
+        echo -e "${RED}  -> 错误: Google Chrome 安装失败。${PLAIN}"
+        exit 1
+    fi
+
+    CHROME_VERSION="$(google-chrome --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)"
+    CHROME_MAJOR="$(echo "$CHROME_VERSION" | cut -d. -f1)"
+
+    echo -e "  -> 当前 Chrome 版本: ${GREEN}${CHROME_VERSION}${PLAIN}"
+    echo -e "  -> 当前 Chrome 主版本: ${GREEN}${CHROME_MAJOR}${PLAIN}"
+
+    # 2. 安装匹配版本 ChromeDriver
+    NEED_INSTALL_DRIVER=1
+
+    if command -v chromedriver >/dev/null 2>&1; then
+        DRIVER_VERSION="$(chromedriver --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
+        DRIVER_MAJOR="$(echo "$DRIVER_VERSION" | cut -d. -f1)"
+
+        if [ "$DRIVER_MAJOR" = "$CHROME_MAJOR" ]; then
+            NEED_INSTALL_DRIVER=0
+            echo -e "${GREEN}  -> ChromeDriver 已安装且版本匹配: ${DRIVER_VERSION}${PLAIN}"
+        else
+            echo -e "${YELLOW}  -> ChromeDriver 版本不匹配，将重新安装。当前: ${DRIVER_VERSION:-未知}${PLAIN}"
+        fi
+    fi
+
+    if [ "$NEED_INSTALL_DRIVER" = "1" ]; then
+        echo -e "  -> 正在下载匹配 Chrome ${CHROME_MAJOR} 的 ChromeDriver..."
+
+        DRIVER_VERSION="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+          "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")"
+
+        if [ -z "$DRIVER_VERSION" ]; then
+            echo -e "${RED}  -> 错误: 无法获取 ChromeDriver 版本号。${PLAIN}"
+            exit 1
+        fi
+
+        DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
+
+        TMP_DRIVER_DIR="$(mktemp -d)"
+
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+          "$DRIVER_URL" \
+          -o "${TMP_DRIVER_DIR}/chromedriver.zip"
+
+        unzip -q "${TMP_DRIVER_DIR}/chromedriver.zip" -d "$TMP_DRIVER_DIR"
+
+        install -m 0755 \
+          "${TMP_DRIVER_DIR}/chromedriver-linux64/chromedriver" \
+          /usr/local/bin/chromedriver
+
+        rm -rf "$TMP_DRIVER_DIR"
+
+        echo -e "${GREEN}  -> ChromeDriver 安装完成: $(chromedriver --version)${PLAIN}"
+    fi
+
+    # 3. 创建 Python 虚拟环境
+    VENV_DIR="${INSTALL_DIR}/.venv"
+
+    if [ ! -d "$VENV_DIR" ]; then
+        echo -e "  -> 正在创建 Python 虚拟环境: ${VENV_DIR}"
+        python3 -m venv "$VENV_DIR"
+    else
+        echo -e "${GREEN}  -> Python 虚拟环境已存在，跳过创建。${PLAIN}"
+    fi
+
+    # 4. 安装 Selenium
+    echo -e "  -> 正在安装 / 更新 pip 与 Selenium..."
+
+    "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel
+    "${VENV_DIR}/bin/python" -m pip install -U selenium
+
+    # 5. 如果项目有 requirements.txt，也一起安装
+    if [ -f "${INSTALL_DIR}/requirements.txt" ]; then
+        echo -e "  -> 检测到 requirements.txt，正在安装项目依赖..."
+        "${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt"
+    fi
+
+    echo -e "${GREEN} -> Chrome / ChromeDriver / Selenium 环境初始化完成。${PLAIN}"
+}
+
+
+
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
@@ -253,9 +369,18 @@ fi
 echo -e "\n${YELLOW}正在初始化代理认证配置...${PLAIN}"
 ensure_proxy_auth_env
 echo -e "${GREEN} -> 代理认证配置已准备完成: ${ENV_FILE}${PLAIN}"
+
+
 echo -e "\n${YELLOW}正在初始化 OpenVPN CA bundle...${PLAIN}"
 ensure_openvpn_ca_bundle
+
+echo -e "\n${YELLOW}正在初始化 Chrome / Selenium 环境...${PLAIN}"
+ensure_chrome_selenium_env
+
 echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
+
+
+
 echo -e "  -> 正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
 cat > /lib/systemd/system/aimilivpn.service <<EOF
 [Unit]
@@ -265,7 +390,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/python3 vpngate_manager.py
+ExecStart=${INSTALL_DIR}/.venv/bin/python vpngate_manager.py
 Restart=always
 RestartSec=5
 EnvironmentFile=-/etc/default/aimilivpn
