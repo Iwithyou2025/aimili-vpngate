@@ -1,9 +1,10 @@
 import json
+import os
 import subprocess
 import time
 from typing import Optional
-import os
 from urllib.parse import quote
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -12,13 +13,20 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+
+IPIPSEEK_URL = "https://www.ipipseek.com/"
+AIMILIVPN_ENV_FILE = "/etc/default/aimilivpn"
+
+
 def get_aimilivpn_proxy_server(
-        env_file: str = "/etc/default/aimilivpn",
+        env_file: str = AIMILIVPN_ENV_FILE,
         scheme: str = "http",
 ) -> str:
     """
     从 /etc/default/aimilivpn 自动读取代理端口、用户名、密码。
-    返回：
+
+    返回示例：
+        http://user:pass@127.0.0.1:7928
         socks5://user:pass@127.0.0.1:7928
     """
 
@@ -40,13 +48,10 @@ def get_aimilivpn_proxy_server(
 
                 if key == "LOCAL_PROXY_PORT":
                     port = value
-
                 elif key == "PROXY_AUTH_ENABLED":
                     auth_enabled = value.lower() in ("1", "true", "yes", "on")
-
                 elif key == "PROXY_USERNAME":
                     username = value
-
                 elif key == "PROXY_PASSWORD":
                     password = value
 
@@ -56,6 +61,90 @@ def get_aimilivpn_proxy_server(
         return f"{scheme}://{username}:{password}@127.0.0.1:{port}"
 
     return f"{scheme}://127.0.0.1:{port}"
+
+
+def mask_proxy_url(proxy_server: str) -> str:
+    """打印日志时隐藏代理密码。"""
+    if not proxy_server or "@" not in proxy_server:
+        return proxy_server
+
+    prefix, suffix = proxy_server.rsplit("@", 1)
+    if "://" not in prefix:
+        return proxy_server
+
+    scheme, auth = prefix.split("://", 1)
+    if ":" not in auth:
+        return proxy_server
+
+    user, _ = auth.split(":", 1)
+    return f"{scheme}://{user}:***@{suffix}"
+
+
+def test_proxy_alive(
+        proxy_server: Optional[str] = None,
+        test_url: str = IPIPSEEK_URL,
+        timeout: int = 20,
+) -> dict:
+    """
+    使用 curl 测试代理是否可用。
+    注意：curl 通，只代表代理本身通；Chrome 是否支持该认证写法，需要再看 Selenium 结果。
+    """
+
+    if proxy_server is None:
+        proxy_server = get_aimilivpn_proxy_server()
+
+    cmd = [
+        "curl",
+        "-x", proxy_server,
+        "-L",
+        "-s",
+        "-o", "/dev/null",
+        "-w", "%{http_code} %{time_total}",
+        "--connect-timeout", str(timeout),
+        "--max-time", str(timeout),
+        test_url,
+    ]
+
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+
+        output = res.stdout.strip()
+
+        if res.returncode != 0:
+            return {
+                "ok": False,
+                "http_code": "",
+                "time_total": None,
+                "proxy": mask_proxy_url(proxy_server),
+                "error": res.stderr.strip() or output,
+            }
+
+        parts = output.split()
+        http_code = parts[0] if len(parts) >= 1 else ""
+        time_total = float(parts[1]) if len(parts) >= 2 else None
+
+        return {
+            "ok": http_code.startswith("2") or http_code.startswith("3"),
+            "http_code": http_code,
+            "time_total": time_total,
+            "proxy": mask_proxy_url(proxy_server),
+            "error": "",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "http_code": "",
+            "time_total": None,
+            "proxy": mask_proxy_url(proxy_server),
+            "error": repr(e),
+        }
+
 
 def create_driver(
         headless: bool = True,
@@ -71,21 +160,23 @@ def create_driver(
     else:
         options.add_argument("--start-maximized")
 
+    # 服务器无头模式稳定性参数
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
 
+    # 代理配置。无代理时保持和本地验证版本一致。
     if proxy_server:
         options.add_argument(f"--proxy-server={proxy_server}")
 
-    # 开启无头 Chrome 远程调试
+    # 可选：无头 Chrome 远程调试
     if debug:
         options.add_argument(f"--remote-debugging-port={debug_port}")
-
-        # 推荐只监听本机，避免 9222 暴露到公网
         options.add_argument("--remote-debugging-address=127.0.0.1")
 
     return webdriver.Chrome(options=options)
+
+
 def query_ip(driver, ip: str, timeout: int = 30):
     wait = WebDriverWait(driver, timeout)
 
@@ -141,8 +232,7 @@ def query_ip(driver, ip: str, timeout: int = 30):
         """)
     )
 
-    # 6. 点击查询按钮
-    driver.execute_script("arguments[0].click();", search_btn)
+    # 6. 点击查询按钮。只点击一次，避免第二次点击造成页面状态混乱。
     driver.execute_script("arguments[0].click();", search_btn)
 
 
@@ -155,7 +245,6 @@ def wait_result_ip(driver, ip: str, timeout: int = 60) -> bool:
 
     js = r"""
     const targetIp = arguments[0];
-
     const elements = Array.from(document.querySelectorAll("span, div, p"));
 
     for (const el of elements) {
@@ -176,9 +265,7 @@ def wait_result_ip(driver, ip: str, timeout: int = 60) -> bool:
     """
 
     try:
-        return wait.until(
-            lambda d: d.execute_script(js, ip)
-        )
+        return wait.until(lambda d: d.execute_script(js, ip))
     except TimeoutException:
         return False
 
@@ -252,9 +339,7 @@ def get_field_value(driver, key: str, timeout: int = 60) -> Optional[str]:
     """
 
     try:
-        return wait.until(
-            lambda d: d.execute_script(js, key)
-        )
+        return wait.until(lambda d: d.execute_script(js, key))
     except TimeoutException:
         return None
 
@@ -299,98 +384,27 @@ def query_single_ip_vpn(
             return None
 
         vpn_value = get_field_value(driver, "vpn", timeout=result_timeout)
-
         return parse_bool(vpn_value)
 
-    except TimeoutException:
+    except (TimeoutException, WebDriverException):
         return None
-
-    except WebDriverException:
-        return None
-
     except Exception:
         return None
-def test_proxy_alive(
-        proxy_server: Optional[str] = None,
-        test_url: str = "https://www.ipipseek.com/",
-        timeout: int = 20,
-) -> dict:
-    """
-    测试代理是否可用，并返回耗时。
-
-    返回示例：
-        {
-            "ok": True,
-            "http_code": "200",
-            "time_total": 1.234,
-            "proxy": "socks5://xxx:xxx@127.0.0.1:7928",
-            "error": ""
-        }
-    """
-
-    if proxy_server is None:
-        proxy_server = get_aimilivpn_proxy_server()
-
-    cmd = [
-        "curl",
-        "-x", proxy_server,
-        "-L",
-        "-s",
-        "-o", "/dev/null",
-        "-w", "%{http_code} %{time_total}",
-        "--connect-timeout", str(timeout),
-        "--max-time", str(timeout),
-        test_url,
-    ]
-
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 5,
-        )
-
-        output = res.stdout.strip()
-
-        if res.returncode != 0:
-            return {
-                "ok": False,
-                "http_code": "",
-                "time_total": None,
-                "proxy": proxy_server,
-                "error": res.stderr.strip() or output,
-            }
-
-        parts = output.split()
-
-        http_code = parts[0] if len(parts) >= 1 else ""
-        time_total = float(parts[1]) if len(parts) >= 2 else None
-
-        return {
-            "ok": http_code.startswith("2") or http_code.startswith("3"),
-            "http_code": http_code,
-            "time_total": time_total,
-            "proxy": proxy_server,
-            "error": "",
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "http_code": "",
-            "time_total": None,
-            "proxy": proxy_server,
-            "error": repr(e),
-        }
 
 
 def get_ip_vpn_status(
         *ips: str,
         headless: bool = True,
+        use_proxy: bool = True,
+        proxy_scheme: str = "http",
         page_load_timeout: int = 30,
         query_timeout: int = 30,
         result_timeout: int = 60,
+        interval_seconds: int = 5,
+        debug: bool = False,
+        debug_port: int = 9222,
+        debug_keep_open: bool = False,
+        debug_keep_seconds: int = 600,
 ) -> str:
     """
     批量查询 ipipseek 的 vpn 字段。
@@ -404,60 +418,64 @@ def get_ip_vpn_status(
             "138.64.65.244": false,
             "1.1.1.1": null
         }
-
-    注意：
-        Python 内部是 True / False / None
-        JSON 输出后是 true / false / null
     """
 
     results = {}
     driver = None
 
     try:
-        proxy_server = get_aimilivpn_proxy_server()
+        proxy_server = get_aimilivpn_proxy_server(scheme=proxy_scheme) if use_proxy else None
 
         driver = create_driver(
             headless=headless,
             proxy_server=proxy_server,
-            debug=True,
-            debug_port=9222,
+            debug=debug,
+            debug_port=debug_port,
         )
         driver.set_page_load_timeout(page_load_timeout)
 
         try:
-            driver.get("https://www.ipipseek.com/")
-            driver.refresh()
+            driver.get(IPIPSEEK_URL)
+            # 保留本地验证成功版本的一次刷新，不做第二次刷新。
             driver.refresh()
         except TimeoutException:
             # 页面加载超时，但 DOM 可能已经可用，所以继续执行
             pass
 
         for ip in ips:
-
             results[ip] = query_single_ip_vpn(
                 driver,
                 ip,
                 query_timeout=query_timeout,
                 result_timeout=result_timeout,
             )
-            time.sleep(10)
+
+            if interval_seconds > 0:
+                time.sleep(interval_seconds)
 
         return json.dumps(results, ensure_ascii=False)
 
     except Exception:
+        # 浏览器初始化、打开页面等整体失败时，所有 IP 返回 None。
+        for ip in ips:
+            results[ip] = None
         return json.dumps(results, ensure_ascii=False)
 
     finally:
         if driver is not None:
+            if debug_keep_open:
+                print(f"[DEBUG] 浏览器保持打开 {debug_keep_seconds} 秒，方便 DevTools 调试。")
+                print(f"[DEBUG] 本地访问: http://127.0.0.1:{debug_port}/json/list")
+                time.sleep(debug_keep_seconds)
             driver.quit()
 
 
 if __name__ == "__main__":
-    proxy_server = get_aimilivpn_proxy_server()
+    proxy_server = get_aimilivpn_proxy_server(scheme="http")
 
     proxy_test = test_proxy_alive(
         proxy_server=proxy_server,
-        test_url="https://www.ipipseek.com/",
+        test_url=IPIPSEEK_URL,
         timeout=20,
     )
 
@@ -465,13 +483,19 @@ if __name__ == "__main__":
 
     if not proxy_test["ok"]:
         print("代理不可用，停止查询")
-        exit(1)
+        raise SystemExit(1)
 
     print(f"代理可用，耗时：{proxy_test['time_total']} 秒")
 
     result = get_ip_vpn_status(
         "60.113.181.155",
-        "138.64.65.244"
+        "138.64.65.244",
+        headless=True,
+        use_proxy=True,
+        proxy_scheme="http",
+        debug=False,
+        # 调试时改成 True，并用 SSH -L 9222:127.0.0.1:9222 root@服务器IP 看 DevTools。
+        debug_keep_open=False,
     )
 
     print(result)
