@@ -322,7 +322,6 @@ if __name__ == "__main__":
 
     result = get_ip_vpn_status(
         "60.113.181.155",
-        "138.64.65.244",
-        headless=False
+        "138.64.65.244"
     )
     print(result)
