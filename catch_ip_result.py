@@ -60,6 +60,8 @@ def get_aimilivpn_proxy_server(
 def create_driver(
         headless: bool = True,
         proxy_server: Optional[str] = None,
+        debug: bool = False,
+        debug_port: int = 9222,
 ):
     options = Options()
 
@@ -76,8 +78,14 @@ def create_driver(
     if proxy_server:
         options.add_argument(f"--proxy-server={proxy_server}")
 
-    return webdriver.Chrome(options=options)
+    # 开启无头 Chrome 远程调试
+    if debug:
+        options.add_argument(f"--remote-debugging-port={debug_port}")
 
+        # 推荐只监听本机，避免 9222 暴露到公网
+        options.add_argument("--remote-debugging-address=127.0.0.1")
+
+    return webdriver.Chrome(options=options)
 def query_ip(driver, ip: str, timeout: int = 30):
     wait = WebDriverWait(driver, timeout)
 
@@ -411,6 +419,8 @@ def get_ip_vpn_status(
         driver = create_driver(
             headless=headless,
             proxy_server=proxy_server,
+            debug=True,
+            debug_port=9222,
         )
         driver.set_page_load_timeout(page_load_timeout)
 
