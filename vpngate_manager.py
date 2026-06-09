@@ -105,37 +105,17 @@ QUALITY_HTTP_TIMEOUT_SECONDS = int(os.environ.get("QUALITY_HTTP_TIMEOUT_SECONDS"
 
 IPAPI_API_URL = os.environ.get("IPAPI_API_URL", "https://api.ipapi.is")
 
-# Scamalytics 风险分检测
-QUALITY_CHECK_SCAMALYTICS_ENABLED = env_flag("QUALITY_CHECK_SCAMALYTICS_ENABLED", "1")
+# 已移除 Scamalytics / ProxyCheck 第三方质量校验。
+# 保留这两个开关变量，是为了兼容 IPAPI_REJECT_CONFIG 里的引用，避免 NameError。
+# 后续不再读取 SCAMALYTICS_API_URL_TEMPLATE / PROXYCHECK_API_URL_TEMPLATE，
+# 也不会再请求 Scamalytics / ProxyCheck 接口。
+QUALITY_CHECK_SCAMALYTICS_ENABLED = False
+QUALITY_CHECK_PROXYCHECK_ENABLED = False
 
-SCAMALYTICS_API_URL_TEMPLATE = os.environ.get(
-    "SCAMALYTICS_API_URL_TEMPLATE",
-    "https://api11.scamalytics.com/v3/6a2661bbedc29/?key=e48c35faae9467cdcb34f4bbde0eed609ff5f3bcc91a4b5f9b1833a52c5174f4&ip={ip}"
-)
-
-QUALITY_MAX_SCAMALYTICS_SCORE = int(
-    os.environ.get("QUALITY_MAX_SCAMALYTICS_SCORE", "30")
-)
-
-
-# ProxyCheck 代理/VPN 检测
-# 用它替代 ipapi.is 的 is_proxy / is_vpn 拦截逻辑
-QUALITY_CHECK_PROXYCHECK_ENABLED = env_flag("QUALITY_CHECK_PROXYCHECK_ENABLED", "1")
-
-PROXYCHECK_API_URL_TEMPLATE = os.environ.get(
-    "PROXYCHECK_API_URL_TEMPLATE",
-    "http://proxycheck.io/v2/{ip}?key=3w758p-495302-95d4w0-912om1"
-)
-
-QUALITY_PROXYCHECK_STRICT = env_flag("QUALITY_PROXYCHECK_STRICT", "1")
-
-# proxycheck.io 返回 proxy=yes 时直接淘汰
-QUALITY_REJECT_PROXYCHECK_PROXY = env_flag("QUALITY_REJECT_PROXYCHECK_PROXY", "1")
-
-
-
-# 严格模式：Scamalytics 请求失败 / 没有分数字段时，直接判定不合格
-QUALITY_SCAMALYTICS_STRICT = env_flag("QUALITY_SCAMALYTICS_STRICT", "1")
+QUALITY_SCAMALYTICS_STRICT = False
+QUALITY_PROXYCHECK_STRICT = False
+QUALITY_REJECT_PROXYCHECK_PROXY = False
+QUALITY_MAX_SCAMALYTICS_SCORE = 0
 
 # 是否启用 ipapi.is 补充检测
 QUALITY_CHECK_IPAPI_ENABLED = env_flag("QUALITY_CHECK_IPAPI_ENABLED", "1")
@@ -4590,54 +4570,54 @@ def parse_scamalytics_quality(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_scamalytics_url(ip: str) -> str:
-    ip = str(ip or "").strip()
-    if not ip:
-        raise RuntimeError("Scamalytics 缺少出口 IP，无法查询风险分")
+# def build_scamalytics_url(ip: str) -> str:
+#     ip = str(ip or "").strip()
+#     if not ip:
+#         raise RuntimeError("Scamalytics 缺少出口 IP，无法查询风险分")
+#
+#     encoded_ip = urllib.parse.quote(ip, safe="")
+#     template = SCAMALYTICS_API_URL_TEMPLATE
+#
+#     if "{ip}" in template:
+#         return template.replace("{ip}", encoded_ip)
+#
+#     sep = "&" if "?" in template else "?"
+#     return f"{template}{sep}ip={encoded_ip}"
 
-    encoded_ip = urllib.parse.quote(ip, safe="")
-    template = SCAMALYTICS_API_URL_TEMPLATE
 
-    if "{ip}" in template:
-        return template.replace("{ip}", encoded_ip)
-
-    sep = "&" if "?" in template else "?"
-    return f"{template}{sep}ip={encoded_ip}"
-
-
-def fetch_scamalytics_quality(ip: str) -> dict[str, Any]:
-    url = build_scamalytics_url(ip)
-
-    # 注意：这里不走 7928 代理
-    # 因为 Scamalytics 是通过 URL 里的 ip 参数查询，不需要请求本身从 VPN 出口出去
-    cmd = [
-        "curl", "-4", "-s",
-        url,
-        "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
-    ]
-
-    res = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
-    )
-
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"Scamalytics 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
-        )
-
-    body = res.stdout.strip()
-    if not body:
-        raise RuntimeError("Scamalytics 返回为空")
-
-    try:
-        raw = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Scamalytics 返回不是 JSON: {exc}; body={body[:200]}")
-
-    return parse_scamalytics_quality(raw)
+# def fetch_scamalytics_quality(ip: str) -> dict[str, Any]:
+#     url = build_scamalytics_url(ip)
+#
+#     # 注意：这里不走 7928 代理
+#     # 因为 Scamalytics 是通过 URL 里的 ip 参数查询，不需要请求本身从 VPN 出口出去
+#     cmd = [
+#         "curl", "-4", "-s",
+#         url,
+#         "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
+#     ]
+#
+#     res = subprocess.run(
+#         cmd,
+#         capture_output=True,
+#         text=True,
+#         timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
+#     )
+#
+#     if res.returncode != 0:
+#         raise RuntimeError(
+#             f"Scamalytics 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+#         )
+#
+#     body = res.stdout.strip()
+#     if not body:
+#         raise RuntimeError("Scamalytics 返回为空")
+#
+#     try:
+#         raw = json.loads(body)
+#     except json.JSONDecodeError as exc:
+#         raise RuntimeError(f"Scamalytics 返回不是 JSON: {exc}; body={body[:200]}")
+#
+#     return parse_scamalytics_quality(raw)
 
 def parse_proxycheck_quality(ip: str, raw: dict[str, Any]) -> dict[str, Any]:
     ip = str(ip or "").strip()
@@ -4672,58 +4652,58 @@ def parse_proxycheck_quality(ip: str, raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_proxycheck_url(ip: str) -> str:
-    ip = str(ip or "").strip()
-    if not ip:
-        raise RuntimeError("ProxyCheck 缺少出口 IP，无法查询 proxy 字段")
+# def build_proxycheck_url(ip: str) -> str:
+#     ip = str(ip or "").strip()
+#     if not ip:
+#         raise RuntimeError("ProxyCheck 缺少出口 IP，无法查询 proxy 字段")
+#
+#     encoded_ip = urllib.parse.quote(ip, safe="")
+#     template = PROXYCHECK_API_URL_TEMPLATE
+#
+#     if "{ip}" in template:
+#         return template.replace("{ip}", encoded_ip)
+#
+#     sep = "&" if "?" in template else "?"
+#     return f"{template}{sep}{encoded_ip}"
 
-    encoded_ip = urllib.parse.quote(ip, safe="")
-    template = PROXYCHECK_API_URL_TEMPLATE
 
-    if "{ip}" in template:
-        return template.replace("{ip}", encoded_ip)
-
-    sep = "&" if "?" in template else "?"
-    return f"{template}{sep}{encoded_ip}"
-
-
-def fetch_proxycheck_quality(ip: str) -> dict[str, Any]:
-    url = build_proxycheck_url(ip)
-
-    # 注意：这里不走 7928 / tun1
-    # ProxyCheck 是通过 URL 中的 IP 查询，不依赖请求来源 IP
-    cmd = [
-        "curl", "-4", "-s",
-        url,
-        "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
-    ]
-
-    res = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
-    )
-
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"ProxyCheck 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
-        )
-
-    body = res.stdout.strip()
-    if not body:
-        raise RuntimeError("ProxyCheck 返回为空")
-
-    try:
-        raw = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"ProxyCheck 返回不是 JSON: {exc}; body={body[:200]}")
-
-    status = str(raw.get("status") or "").strip().lower()
-    if status and status != "ok":
-        raise RuntimeError(f"ProxyCheck 返回状态异常: {status}; body={body[:200]}")
-
-    return parse_proxycheck_quality(ip, raw)
+# def fetch_proxycheck_quality(ip: str) -> dict[str, Any]:
+#     url = build_proxycheck_url(ip)
+#
+#     # 注意：这里不走 7928 / tun1
+#     # ProxyCheck 是通过 URL 中的 IP 查询，不依赖请求来源 IP
+#     cmd = [
+#         "curl", "-4", "-s",
+#         url,
+#         "--max-time", str(QUALITY_HTTP_TIMEOUT_SECONDS),
+#     ]
+#
+#     res = subprocess.run(
+#         cmd,
+#         capture_output=True,
+#         text=True,
+#         timeout=QUALITY_HTTP_TIMEOUT_SECONDS + 3,
+#     )
+#
+#     if res.returncode != 0:
+#         raise RuntimeError(
+#             f"ProxyCheck 请求失败: curl={res.returncode}, stderr={res.stderr.strip()}"
+#         )
+#
+#     body = res.stdout.strip()
+#     if not body:
+#         raise RuntimeError("ProxyCheck 返回为空")
+#
+#     try:
+#         raw = json.loads(body)
+#     except json.JSONDecodeError as exc:
+#         raise RuntimeError(f"ProxyCheck 返回不是 JSON: {exc}; body={body[:200]}")
+#
+#     status = str(raw.get("status") or "").strip().lower()
+#     if status and status != "ok":
+#         raise RuntimeError(f"ProxyCheck 返回状态异常: {status}; body={body[:200]}")
+#
+#     return parse_proxycheck_quality(ip, raw)
 
 
 def apply_proxycheck_quality(quality_info: dict[str, Any], proxycheck_info: dict[str, Any]) -> None:
@@ -4890,7 +4870,7 @@ def apply_ipipseek_vpn_precheck(
 
         print(msg, flush=True)
         log_to_json("WARNING", "Quality", msg)
-        
+
 
 def parse_ipapi_quality(raw: dict[str, Any]) -> dict[str, Any]:
     result = {
@@ -5071,36 +5051,25 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
     apply_ipipseek_vpn_precheck(quality_info, log_prefix="热备用")
 
 
-    if QUALITY_CHECK_PROXYCHECK_ENABLED:
-        try:
-            proxycheck_info = fetch_proxycheck_quality(quality_info.get("ip"))
-            apply_proxycheck_quality(quality_info, proxycheck_info)
+    # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
+    quality_info.update({
+        "scamalytics_checked": False,
+        "has_scamalytics_score": False,
+        "scamalytics_score": 0,
+        "scamalytics_risk": "",
+        "scamalytics_url": "",
+        "scamalytics_isp": "",
+        "scamalytics_org": "",
+        "scamalytics_error": "",
 
-        except Exception as exc:
-            quality_info["proxycheck_checked"] = False
-            quality_info["has_proxycheck_proxy"] = False
-            quality_info["proxycheck_proxy"] = ""
-            quality_info["proxycheck_is_proxy"] = False
-            quality_info["proxycheck_type"] = ""
-            quality_info["proxycheck_ip"] = str(quality_info.get("ip") or "")
-            quality_info["proxycheck_error"] = str(exc)
-
-    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
-        try:
-            scamalytics_info = fetch_scamalytics_quality(quality_info.get("ip"))
-            quality_info["scamalytics_checked"] = True
-            quality_info["has_scamalytics_score"] = scamalytics_info.get("has_scamalytics_score", False)
-            quality_info["scamalytics_score"] = scamalytics_info.get("scamalytics_score", 0)
-            quality_info["scamalytics_risk"] = scamalytics_info.get("scamalytics_risk", "")
-            quality_info["scamalytics_url"] = scamalytics_info.get("scamalytics_url", "")
-            quality_info["scamalytics_isp"] = scamalytics_info.get("scamalytics_isp", "")
-            quality_info["scamalytics_org"] = scamalytics_info.get("scamalytics_org", "")
-            quality_info["scamalytics_error"] = ""
-        except Exception as exc:
-            quality_info["scamalytics_checked"] = False
-            quality_info["has_scamalytics_score"] = False
-            quality_info["scamalytics_score"] = 0
-            quality_info["scamalytics_error"] = str(exc)
+        "proxycheck_checked": False,
+        "has_proxycheck_proxy": False,
+        "proxycheck_proxy": "",
+        "proxycheck_is_proxy": False,
+        "proxycheck_type": "",
+        "proxycheck_ip": str(quality_info.get("ip") or ""),
+        "proxycheck_error": "",
+    })
 
     if QUALITY_CHECK_IPAPI_ENABLED:
         try:
@@ -5658,11 +5627,7 @@ def format_speed_brief(info: dict[str, Any]) -> str:
 def format_quality_fail_brief(info: dict[str, Any], reason: str) -> str:
     reason = str(reason or "").strip()
 
-    if "ProxyCheck 检测为代理" in reason:
-        proxy_value = info.get("proxycheck_proxy") or "yes"
-        proxy_type = info.get("proxycheck_type") or ""
-        type_text = f"，type:{proxy_type}" if proxy_type else ""
-        return f"质量:ProxyCheck proxy【{proxy_value}】{type_text} 不符合要求"
+
 
     ipapi_short_labels = {
         "is_bogon": "保留/异常 bogon",
@@ -5689,8 +5654,7 @@ def format_quality_fail_brief(info: dict[str, Any], reason: str) -> str:
     if "IPPure 系数" in reason:
         return f"质量:IPPure【{parse_int(info.get('ippure_score'))}%】不符合要求"
 
-    if "Scamalytics 风险分" in reason:
-        return f"质量:Scamalytics【{parse_int(info.get('scamalytics_score'))}】不符合要求"
+
 
     if "非住宅" in reason or "住宅" in reason:
         return f"质量:住宅IP【否】不符合要求"
@@ -5732,46 +5696,18 @@ def format_hot_backup_total_result(
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
     score = parse_int(info.get("ippure_score"))
-    scamalytics_score = parse_int(info.get("scamalytics_score"))
 
     if not info.get("has_ippure_score"):
         return False, "无法读取 IPPure 风控系数"
 
-    # 新增：ipipseek VPN 预检
+    # ipipseek VPN 预检
     # 只有 True 才拦截；False / None 都放行
     if QUALITY_CHECK_IPIPSEEK_VPN_ENABLED and info.get("ipipseek_vpn") is True:
         return False, "ipipseek VPN 预检命中：vpn=true"
 
-    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
-        if QUALITY_SCAMALYTICS_STRICT and info.get("scamalytics_error"):
-            return False, f"Scamalytics 检测异常: {info.get('scamalytics_error')}"
+    # Scamalytics / ProxyCheck 已移除。
+    # 后续只继续执行 IPPure / ipapi / speedtest 判断。
 
-    if info.get("scamalytics_checked"):
-        if not info.get("has_scamalytics_score"):
-            return False, "无法读取 Scamalytics 风险分"
-
-        if scamalytics_score > QUALITY_MAX_SCAMALYTICS_SCORE:
-            return False, (
-                f"Scamalytics 风险分 {scamalytics_score} "
-                f"超过阈值 {QUALITY_MAX_SCAMALYTICS_SCORE}"
-            )
-
-    if QUALITY_CHECK_PROXYCHECK_ENABLED:
-        if QUALITY_PROXYCHECK_STRICT and info.get("proxycheck_error"):
-            return False, f"ProxyCheck 检测异常: {info.get('proxycheck_error')}"
-
-        if info.get("proxycheck_checked"):
-            if not info.get("has_proxycheck_proxy"):
-                return False, "无法读取 ProxyCheck proxy 字段"
-
-            proxy_value = str(info.get("proxycheck_proxy") or "").strip().lower()
-
-            if QUALITY_REJECT_PROXYCHECK_PROXY and proxy_value == "yes":
-                proxy_type = str(info.get("proxycheck_type") or "")
-                return False, (
-                    f"ProxyCheck 检测为代理: proxy=yes"
-                    f"{f', type={proxy_type}' if proxy_type else ''}"
-                )
 
     if score > QUALITY_MAX_FRAUD_SCORE:
         return False, f"IPPure 系数 {score}% 超过阈值 {QUALITY_MAX_FRAUD_SCORE}%"
@@ -5917,14 +5853,14 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
 
         quality_sources = ["ippure"]
 
-        if quality_info.get("scamalytics_checked"):
-            quality_sources.append("scamalytics")
-
-        if quality_info.get("proxycheck_checked"):
-            quality_sources.append("proxycheck")
+        if quality_info.get("ipipseek_vpn_checked"):
+            quality_sources.append("ipipseek")
 
         if quality_info.get("ipapi_checked"):
             quality_sources.append("ipapi")
+
+        if quality_info.get("speed_test_checked"):
+            quality_sources.append("speedtest")
 
         node["quality_source"] = "+".join(quality_sources)
 
@@ -5945,59 +5881,26 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
     # 新增：ipipseek VPN 预检
     apply_ipipseek_vpn_precheck(quality_info, log_prefix="质量检测")
 
-    # 2. 用出口 IP 查询 Scamalytics 风险分
-    if QUALITY_CHECK_SCAMALYTICS_ENABLED:
-        try:
-            scamalytics_info = fetch_scamalytics_quality(quality_info.get("ip"))
+    # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
+    # 写默认值是为了清理旧状态，避免前端继续显示上一次的旧结果。
+    quality_info.update({
+        "scamalytics_checked": False,
+        "has_scamalytics_score": False,
+        "scamalytics_score": 0,
+        "scamalytics_risk": "",
+        "scamalytics_url": "",
+        "scamalytics_isp": "",
+        "scamalytics_org": "",
+        "scamalytics_error": "",
 
-            quality_info["scamalytics_checked"] = True
-            quality_info["has_scamalytics_score"] = scamalytics_info.get(
-                "has_scamalytics_score",
-                False
-            )
-            quality_info["scamalytics_score"] = scamalytics_info.get(
-                "scamalytics_score",
-                0
-            )
-            quality_info["scamalytics_risk"] = scamalytics_info.get(
-                "scamalytics_risk",
-                ""
-            )
-            quality_info["scamalytics_url"] = scamalytics_info.get(
-                "scamalytics_url",
-                ""
-            )
-            quality_info["scamalytics_isp"] = scamalytics_info.get(
-                "scamalytics_isp",
-                ""
-            )
-            quality_info["scamalytics_org"] = scamalytics_info.get(
-                "scamalytics_org",
-                ""
-            )
-            quality_info["scamalytics_error"] = ""
-
-        except Exception as exc:
-            quality_info["scamalytics_checked"] = False
-            quality_info["has_scamalytics_score"] = False
-            quality_info["scamalytics_score"] = 0
-            quality_info["scamalytics_error"] = str(exc)
-
-    # 3. 用出口 IP 查询 ProxyCheck，替代 ipapi.is 的 proxy/vpn 判断
-    if QUALITY_CHECK_PROXYCHECK_ENABLED:
-        try:
-            proxycheck_info = fetch_proxycheck_quality(quality_info.get("ip"))
-            apply_proxycheck_quality(quality_info, proxycheck_info)
-
-        except Exception as exc:
-            quality_info["proxycheck_checked"] = False
-            quality_info["has_proxycheck_proxy"] = False
-            quality_info["proxycheck_proxy"] = ""
-            quality_info["proxycheck_is_proxy"] = False
-            quality_info["proxycheck_type"] = ""
-            quality_info["proxycheck_ip"] = str(quality_info.get("ip") or "")
-            quality_info["proxycheck_error"] = str(exc)
-
+        "proxycheck_checked": False,
+        "has_proxycheck_proxy": False,
+        "proxycheck_proxy": "",
+        "proxycheck_is_proxy": False,
+        "proxycheck_type": "",
+        "proxycheck_ip": str(quality_info.get("ip") or ""),
+        "proxycheck_error": "",
+    })
 
     # 4. 再做 ipapi.is 补充检测
     if QUALITY_CHECK_IPAPI_ENABLED:
@@ -6082,18 +5985,13 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
         "proxy_native_ip": quality_info.get("native_ip"),
         "proxy_is_residential": quality_info.get("is_residential"),
 
-        "proxy_scamalytics_checked": quality_info.get(
-            "scamalytics_checked",
-            False
-        ),
-        "proxy_scamalytics_error": quality_info.get("scamalytics_error", ""),
-        "proxy_scamalytics_score": parse_int(
-            quality_info.get("scamalytics_score")
-        ),
-        "proxy_scamalytics_risk": quality_info.get("scamalytics_risk", ""),
-        "proxy_scamalytics_url": quality_info.get("scamalytics_url", ""),
-        "proxy_scamalytics_isp": quality_info.get("scamalytics_isp", ""),
-        "proxy_scamalytics_org": quality_info.get("scamalytics_org", ""),
+        "proxy_scamalytics_checked": False,
+        "proxy_scamalytics_error": "",
+        "proxy_scamalytics_score": 0,
+        "proxy_scamalytics_risk": "",
+        "proxy_scamalytics_url": "",
+        "proxy_scamalytics_isp": "",
+        "proxy_scamalytics_org": "",
 
         "proxy_ipapi_checked": quality_info.get("ipapi_checked", False),
         "proxy_ipapi_error": quality_info.get("ipapi_error", ""),
@@ -6122,12 +6020,12 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info.get("speed_test_time_seconds")
         ),
 
-        "proxy_proxycheck_checked": quality_info.get("proxycheck_checked", False),
-        "proxy_proxycheck_error": quality_info.get("proxycheck_error", ""),
-        "proxy_proxycheck_proxy": quality_info.get("proxycheck_proxy", ""),
-        "proxy_proxycheck_is_proxy": quality_info.get("proxycheck_is_proxy", False),
-        "proxy_proxycheck_type": quality_info.get("proxycheck_type", ""),
-        "proxy_proxycheck_ip": quality_info.get("proxycheck_ip", ""),
+        "proxy_proxycheck_checked": False,
+        "proxy_proxycheck_error": "",
+        "proxy_proxycheck_proxy": "",
+        "proxy_proxycheck_is_proxy": False,
+        "proxy_proxycheck_type": "",
+        "proxy_proxycheck_ip": "",
     }
 
     for field in IPAPI_RISK_FIELD_LABELS:
