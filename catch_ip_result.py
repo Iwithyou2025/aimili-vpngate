@@ -3,8 +3,6 @@ import os
 import subprocess
 import time
 from typing import Optional
-from urllib.parse import quote
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -23,17 +21,14 @@ def get_aimilivpn_proxy_server(
         scheme: str = "http",
 ) -> str:
     """
-    从 /etc/default/aimilivpn 自动读取代理端口、用户名、密码。
+    本机 127.0.0.1 已在服务端放行免认证，所以这里不要拼用户名和密码。
 
+    只从 /etc/default/aimilivpn 读取 LOCAL_PROXY_PORT。
     返回示例：
-        http://user:pass@127.0.0.1:7928
-        socks5://user:pass@127.0.0.1:7928
+        http://127.0.0.1:7928
     """
 
     port = "7928"
-    auth_enabled = False
-    username = ""
-    password = ""
 
     if os.path.exists(env_file):
         with open(env_file, "r", encoding="utf-8") as f:
@@ -46,22 +41,10 @@ def get_aimilivpn_proxy_server(
                 key, value = line.split("=", 1)
                 value = value.strip().strip('"').strip("'")
 
-                if key == "LOCAL_PROXY_PORT":
+                if key == "LOCAL_PROXY_PORT" and value:
                     port = value
-                elif key == "PROXY_AUTH_ENABLED":
-                    auth_enabled = value.lower() in ("1", "true", "yes", "on")
-                elif key == "PROXY_USERNAME":
-                    username = value
-                elif key == "PROXY_PASSWORD":
-                    password = value
-
-    if auth_enabled and username and password:
-        username = quote(username, safe="")
-        password = quote(password, safe="")
-        return f"{scheme}://{username}:{password}@127.0.0.1:{port}"
 
     return f"{scheme}://127.0.0.1:{port}"
-
 
 def mask_proxy_url(proxy_server: str) -> str:
     """打印日志时隐藏代理密码。"""
@@ -87,7 +70,7 @@ def test_proxy_alive(
 ) -> dict:
     """
     使用 curl 测试代理是否可用。
-    注意：curl 通，只代表代理本身通；Chrome 是否支持该认证写法，需要再看 Selenium 结果。
+    当前服务端已支持 127.0.0.1 本机免认证；这里测试的就是无账号密码本机代理。
     """
 
     if proxy_server is None:
@@ -472,6 +455,7 @@ def get_ip_vpn_status(
 
 if __name__ == "__main__":
     proxy_server = get_aimilivpn_proxy_server(scheme="http")
+    print("Selenium/Chrome 将使用代理：", proxy_server)
 
     proxy_test = test_proxy_alive(
         proxy_server=proxy_server,
