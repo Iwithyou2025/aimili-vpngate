@@ -110,7 +110,7 @@ QUALITY_CHECK_SCAMALYTICS_ENABLED = env_flag("QUALITY_CHECK_SCAMALYTICS_ENABLED"
 
 SCAMALYTICS_API_URL_TEMPLATE = os.environ.get(
     "SCAMALYTICS_API_URL_TEMPLATE",
-    "https://api11.scamalytics.com/v2/6a2661bbedc29/?key=e48c35faae9467cdcb34f4bbde0eed609ff5f3bcc91a4b5f9b1833a52c5174f4&ip={ip}"
+    "https://api11.scamalytics.com/v3/6a2661bbedc29/?key=e48c35faae9467cdcb34f4bbde0eed609ff5f3bcc91a4b5f9b1833a52c5174f4&ip={ip}"
 )
 
 QUALITY_MAX_SCAMALYTICS_SCORE = int(
