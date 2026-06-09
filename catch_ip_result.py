@@ -435,10 +435,6 @@ def get_ip_vpn_status(
         return json.dumps(results, ensure_ascii=False)
 
     except Exception:
-        # 如果浏览器初始化或打开页面失败，所有 IP 返回 None
-        for ip in ips:
-            results[ip] = None
-
         return json.dumps(results, ensure_ascii=False)
 
     finally:
