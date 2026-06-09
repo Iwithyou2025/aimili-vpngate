@@ -10,24 +10,242 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+def load_aimilivpn_proxy_config(env_file: str = "/etc/default/aimilivpn"):
+    """
+    自动读取 /etc/default/aimilivpn 里的代理配置。
+    """
+    cfg = {
+        "host": "127.0.0.1",
+        "port": 7928,
+        "auth_enabled": False,
+        "username": "",
+        "password": "",
+    }
 
-def create_driver(headless: bool = True):
+    if not os.path.exists(env_file):
+        return cfg
+
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            value = value.strip().strip('"').strip("'")
+
+            if key == "LOCAL_PROXY_PORT":
+                try:
+                    cfg["port"] = int(value)
+                except ValueError:
+                    pass
+
+            elif key == "PROXY_AUTH_ENABLED":
+                cfg["auth_enabled"] = value.lower() in ("1", "true", "yes", "on")
+
+            elif key == "PROXY_USERNAME":
+                cfg["username"] = value
+
+            elif key == "PROXY_PASSWORD":
+                cfg["password"] = value
+
+    return cfg
+class AuthProxyBridgeHandler(socketserver.BaseRequestHandler):
+    """
+    本地临时 HTTP 代理桥接器。
+
+    Chrome 连接本地无认证代理：
+        http://127.0.0.1:随机端口
+
+    该桥接器再连接真实代理：
+        http://127.0.0.1:7928
+
+    并自动添加：
+        Proxy-Authorization: Basic xxx
+    """
+
+    def handle(self):
+        client = self.request
+        client.settimeout(15)
+
+        upstream_host = self.server.upstream_host
+        upstream_port = self.server.upstream_port
+        auth_header = self.server.auth_header
+
+        upstream = None
+
+        try:
+            first_data = self._recv_header(client)
+            if not first_data:
+                return
+
+            upstream = socket.create_connection(
+                (upstream_host, upstream_port),
+                timeout=15
+            )
+
+            first_data = self._add_proxy_auth(first_data, auth_header)
+
+            upstream.sendall(first_data)
+
+            self._relay(client, upstream)
+
+        except Exception:
+            return
+
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _recv_header(sock):
+        data = b""
+
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(8192)
+
+            if not chunk:
+                break
+
+            data += chunk
+
+            if len(data) > 1024 * 1024:
+                break
+
+        return data
+
+    @staticmethod
+    def _add_proxy_auth(data: bytes, auth_header: bytes) -> bytes:
+        if b"\r\n\r\n" not in data:
+            return data
+
+        header, body = data.split(b"\r\n\r\n", 1)
+        lines = header.split(b"\r\n")
+
+        if not lines:
+            return data
+
+        request_line = lines[0]
+
+        new_headers = []
+
+        for line in lines[1:]:
+            lower = line.lower()
+
+            # 删除旧的代理认证头，避免重复
+            if lower.startswith(b"proxy-authorization:"):
+                continue
+
+            new_headers.append(line)
+
+        rebuilt = b"\r\n".join(
+            [request_line, auth_header] + new_headers
+        ) + b"\r\n\r\n" + body
+
+        return rebuilt
+
+    @staticmethod
+    def _relay(sock1, sock2):
+        sockets = [sock1, sock2]
+
+        while True:
+            readable, _, error = select.select(sockets, [], sockets, 60)
+
+            if error:
+                break
+
+            if not readable:
+                break
+
+            for s in readable:
+                try:
+                    data = s.recv(8192)
+
+                    if not data:
+                        return
+
+                    if s is sock1:
+                        sock2.sendall(data)
+                    else:
+                        sock1.sendall(data)
+
+                except Exception:
+                    return
+
+
+class ThreadingProxyBridgeServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_auth_proxy_bridge(
+        upstream_host: str,
+        upstream_port: int,
+        username: str,
+        password: str,
+):
+    """
+    启动本地临时代理桥接器。
+    返回：
+        server 对象
+        Chrome 可使用的 proxy_server 地址
+    """
+    token = base64.b64encode(
+        f"{username}:{password}".encode("utf-8")
+    ).decode("ascii")
+
+    auth_header = f"Proxy-Authorization: Basic {token}".encode("ascii")
+
+    server = ThreadingProxyBridgeServer(
+        ("127.0.0.1", 0),
+        AuthProxyBridgeHandler
+    )
+
+    server.upstream_host = upstream_host
+    server.upstream_port = upstream_port
+    server.auth_header = auth_header
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
+    thread.start()
+
+    local_port = server.server_address[1]
+    proxy_server = f"http://127.0.0.1:{local_port}"
+
+    return server, proxy_server
+
+def create_driver(
+        headless: bool = True,
+        proxy_server: Optional[str] = None,
+):
     options = Options()
 
     if headless:
-        # Chrome 新版无头模式
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
     else:
         options.add_argument("--start-maximized")
 
-    # 提高无头模式稳定性
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
 
-    return webdriver.Chrome(options=options)
+    # 让 Chrome 走指定代理
+    if proxy_server:
+        options.add_argument(f"--proxy-server={proxy_server}")
 
+    return webdriver.Chrome(options=options)
 
 def query_ip(driver, ip: str, timeout: int = 30):
     wait = WebDriverWait(driver, timeout)
@@ -264,8 +482,11 @@ def get_ip_vpn_status(
     """
     批量查询 ipipseek 的 vpn 字段。
 
-    调用示例：
-        result = get_ip_vpn_status("60.113.181.155", "138.64.65.244")
+    访问 ipipseek.com 的浏览器流量会自动走：
+        127.0.0.1:7928
+
+    并自动读取：
+        /etc/default/aimilivpn
 
     返回 JSON 字符串：
         {
@@ -273,40 +494,65 @@ def get_ip_vpn_status(
             "138.64.65.244": false,
             "1.1.1.1": null
         }
-
-    注意：
-        Python 内部是 True / False / None
-        JSON 输出后是 true / false / null
     """
 
     results = {}
     driver = None
+    bridge_server = None
 
     try:
-        driver = create_driver(headless=headless)
+        proxy_cfg = load_aimilivpn_proxy_config()
+
+        upstream_host = "127.0.0.1"
+        upstream_port = int(proxy_cfg["port"])
+
+        # 如果开启了代理认证，则启动本地临时桥接代理
+        if proxy_cfg["auth_enabled"]:
+            username = proxy_cfg["username"]
+            password = proxy_cfg["password"]
+
+            if not username or not password:
+                for ip in ips:
+                    results[ip] = None
+                return json.dumps(results, ensure_ascii=False)
+
+            bridge_server, chrome_proxy_server = start_auth_proxy_bridge(
+                upstream_host=upstream_host,
+                upstream_port=upstream_port,
+                username=username,
+                password=password,
+            )
+
+        else:
+            # 没有认证，Chrome 直接走 127.0.0.1:7928
+            chrome_proxy_server = f"http://{upstream_host}:{upstream_port}"
+
+        driver = create_driver(
+            headless=headless,
+            proxy_server=chrome_proxy_server,
+        )
+
         driver.set_page_load_timeout(page_load_timeout)
 
         try:
             driver.get("https://www.ipipseek.com/")
             driver.refresh()
         except TimeoutException:
-            # 页面加载超时，但 DOM 可能已经可用，所以继续执行
             pass
 
         for ip in ips:
-
             results[ip] = query_single_ip_vpn(
                 driver,
                 ip,
                 query_timeout=query_timeout,
                 result_timeout=result_timeout,
             )
+
             time.sleep(5)
 
         return json.dumps(results, ensure_ascii=False)
 
     except Exception:
-        # 如果浏览器初始化或打开页面失败，所有 IP 返回 None
         for ip in ips:
             results[ip] = None
 
@@ -316,6 +562,12 @@ def get_ip_vpn_status(
         if driver is not None:
             driver.quit()
 
+        if bridge_server is not None:
+            try:
+                bridge_server.shutdown()
+                bridge_server.server_close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     result = get_ip_vpn_status(
