@@ -3334,8 +3334,20 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
                 CONFIG_DIR.mkdir(exist_ok=True, parents=True)
                 Path(config_file).write_text(config_text, encoding="utf-8")
 
-                log_hot_backup(f"开始构建热备用 {node_id}，接口 {dev_name}，第 {attempts}/{min(len(candidates), HOT_BACKUP_BUILD_MAX_ATTEMPTS)} 个候选")
-                set_hot_backup_state("building", hot_backup_message=f"正在拨号热备用节点 {node_id}")
+                if is_stale_after_restart:
+                    set_hot_backup_state(
+                        "building",
+                        hot_backup_message=f"正在重建重启前旧热备用节点 {node_id}",
+                    )
+                else:
+                    log_hot_backup(
+                        f"开始构建热备用 {node_id}，接口 {dev_name}，"
+                        f"第 {attempts}/{min(len(candidates), HOT_BACKUP_BUILD_MAX_ATTEMPTS)} 个候选"
+                    )
+                    set_hot_backup_state(
+                        "building",
+                        hot_backup_message=f"正在拨号热备用节点 {node_id}",
+                    )
 
                 ok, message, process = run_openvpn_until_ready(
                     str(config_file),
