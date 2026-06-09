@@ -329,6 +329,13 @@ IPAPI_REJECT_CONFIG = {
     "is_vpn": lambda: QUALITY_REJECT_IPAPI_VPN and not QUALITY_CHECK_PROXYCHECK_ENABLED,
     "is_abuser": lambda: QUALITY_REJECT_IPAPI_ABUSER,
 }
+
+# ipipseek VPN 字段预检
+# true  => 预检不通过
+# false => 预检通过
+# None  => 预检通过，但日志警告
+QUALITY_CHECK_IPIPSEEK_VPN_ENABLED = env_flag("QUALITY_CHECK_IPIPSEEK_VPN_ENABLED", "1")
+
 def ensure_openvpn_ca_bundle() -> None:
     """
     生成 OpenVPN 专用 CA bundle。
@@ -4709,6 +4716,76 @@ def apply_proxycheck_quality(quality_info: dict[str, Any], proxycheck_info: dict
     quality_info["proxycheck_ip"] = proxycheck_info.get("proxycheck_ip", "")
     quality_info["proxycheck_error"] = ""
 
+
+def apply_ipipseek_vpn_precheck(
+        quality_info: dict[str, Any],
+        log_prefix: str = "质量检测",
+) -> None:
+    """
+    ipipseek VPN 预检。
+
+    从 catch_ip_result.py 调用 get_ip_vpn_status(ip)。
+
+    判断规则：
+    - True  : VPN 命中，后续 evaluate_ip_quality 判定不通过
+    - False : 通过
+    - None  : 通过，但日志提示
+    """
+    quality_info["ipipseek_vpn_checked"] = False
+    quality_info["ipipseek_vpn"] = None
+    quality_info["ipipseek_vpn_error"] = ""
+
+    if not QUALITY_CHECK_IPIPSEEK_VPN_ENABLED:
+        return
+
+    ip = str(quality_info.get("ip") or "").strip()
+
+    if not ip:
+        quality_info["ipipseek_vpn_error"] = "缺少出口 IP，无法执行 ipipseek VPN 预检"
+        msg = f"[{log_prefix}] ipipseek VPN 预检跳过：缺少出口 IP"
+        print(msg, flush=True)
+        log_to_json("WARNING", "Quality", msg)
+        return
+
+    try:
+        # 延迟导入，避免 catch_ip_result.py / selenium 异常影响主程序启动
+        from catch_ip_result import get_ip_vpn_status
+
+        raw_text = get_ip_vpn_status(ip)
+        raw_data = json.loads(raw_text)
+
+        vpn_value = raw_data.get(ip)
+
+        quality_info["ipipseek_vpn_checked"] = True
+        quality_info["ipipseek_vpn"] = vpn_value if vpn_value in (True, False) else None
+
+    except Exception as exc:
+        quality_info["ipipseek_vpn_checked"] = False
+        quality_info["ipipseek_vpn"] = None
+        quality_info["ipipseek_vpn_error"] = str(exc)
+
+    vpn_value = quality_info.get("ipipseek_vpn")
+    error_text = quality_info.get("ipipseek_vpn_error") or ""
+
+    if vpn_value is True:
+        msg = f"[{log_prefix}] ipipseek VPN 预检：ip={ip}, vpn=true，判定不通过"
+        print(msg, flush=True)
+        log_to_json("WARNING", "Quality", msg)
+
+    elif vpn_value is False:
+        msg = f"[{log_prefix}] ipipseek VPN 预检：ip={ip}, vpn=false，判定通过"
+        print(msg, flush=True)
+        log_to_json("INFO", "Quality", msg)
+
+    else:
+        if error_text:
+            msg = f"[{log_prefix}] ipipseek VPN 预检：ip={ip}, vpn=None，按规则放行；原因：{error_text}"
+        else:
+            msg = f"[{log_prefix}] ipipseek VPN 预检：ip={ip}, vpn=None，按规则放行，建议人工留意"
+
+        print(msg, flush=True)
+        log_to_json("WARNING", "Quality", msg)
+
 def parse_ipapi_quality(raw: dict[str, Any]) -> dict[str, Any]:
     result = {
         "source": "ipapi.is",
@@ -4884,6 +4961,8 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
 
     print(f"[热备用] 开始通过 {iface} 进行 IPPure 预检", flush=True)
     quality_info = fetch_ippure_quality_via_interface(iface)
+
+    apply_ipipseek_vpn_precheck(quality_info, log_prefix="热备用")
 
     if QUALITY_CHECK_PROXYCHECK_ENABLED:
         try:
@@ -5551,6 +5630,11 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     if not info.get("has_ippure_score"):
         return False, "无法读取 IPPure 风控系数"
 
+    # 新增：ipipseek VPN 预检
+    # 只有 True 才拦截；False / None 都放行
+    if QUALITY_CHECK_IPIPSEEK_VPN_ENABLED and info.get("ipipseek_vpn") is True:
+        return False, "ipipseek VPN 预检命中：vpn=true"
+
     if QUALITY_CHECK_SCAMALYTICS_ENABLED:
         if QUALITY_SCAMALYTICS_STRICT and info.get("scamalytics_error"):
             return False, f"Scamalytics 检测异常: {info.get('scamalytics_error')}"
@@ -5750,6 +5834,9 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
 
     # 1. 先做原有 IPPure 检测，拿到实际出口 IP
     quality_info = fetch_ippure_quality()
+
+    # 新增：ipipseek VPN 预检
+    apply_ipipseek_vpn_precheck(quality_info, log_prefix="质量检测")
 
     # 2. 用出口 IP 查询 Scamalytics 风险分
     if QUALITY_CHECK_SCAMALYTICS_ENABLED:
