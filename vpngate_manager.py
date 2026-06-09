@@ -3057,6 +3057,15 @@ QUALITY_CACHE_FIELDS = {
     "proxycheck_error",
 }
 
+HOT_BACKUP_CACHE_FIELDS = {
+    "hot_backup_status",
+    "hot_backup_message",
+    "hot_backup_interface",
+    "hot_backup_exit_ip",
+    "hot_backup_last_health_ok_at",
+    "hot_backup_updated_at",
+    "hot_backup_stale_after_restart_at",
+}
 
 def log_hot_backup(message: str, level: str = "INFO") -> None:
     print(f"[热备用] {message}", flush=True)
@@ -3090,6 +3099,62 @@ def set_hot_backup_state(status: str, **extra: Any) -> None:
     payload.update(extra)
     set_state(**payload)
 
+def reset_stale_hot_backup_after_restart() -> None:
+    """
+    服务重启后，内存中的热备用 OpenVPN 进程 / tun 接口 / policy routing 都已经失效。
+
+    所以：
+    1. 把 nodes.json 里旧的 hot_backup_status=ready 改成 stale_after_restart；
+    2. 不直接删掉这个记录，因为它可以作为“上次热备用节点”优先重新构建；
+    3. 全局 state 里仍然显示 empty，因为当前确实没有可直接提升的热备用。
+    """
+    if not HOT_BACKUP_ENABLED:
+        return
+
+    now = time.time()
+    stale_count = 0
+    stale_node_ids: list[str] = []
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        changed = False
+
+        for node in nodes:
+            status = str(node.get("hot_backup_status") or "")
+
+            if status == "ready":
+                stale_count += 1
+                stale_node_ids.append(str(node.get("id") or ""))
+
+                node["hot_backup_status"] = "stale_after_restart"
+                node["hot_backup_message"] = "服务重启，热备用运行态已失效，将优先尝试重新构建"
+                node["hot_backup_stale_after_restart_at"] = now
+                node["hot_backup_updated_at"] = now
+                changed = True
+
+            elif status == "building":
+                node["hot_backup_status"] = "empty"
+                node["hot_backup_message"] = "服务重启，未完成的热备用构建状态已清理"
+                node["hot_backup_updated_at"] = now
+                changed = True
+
+        if changed:
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+
+    set_hot_backup_state(
+        "empty",
+        hot_backup_message="服务重启，热备用运行态已清空，等待重新构建",
+        hot_backup_node_id="",
+        hot_backup_interface="",
+    )
+
+    if stale_count > 0:
+        log_hot_backup(
+            f"服务重启后发现 {stale_count} 个旧热备用标记，"
+            f"将优先尝试重新构建: {stale_node_ids}"
+        )
+    else:
+        log_hot_backup("服务重启后未发现旧热备用 ready 标记")
 
 def choose_hot_backup_dev() -> str:
     active_iface = get_active_proxy_interface() or "tun0"
@@ -3171,10 +3236,22 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
 
     candidates.sort(
         key=lambda n: (
+            # 服务重启前的热备用节点优先重新尝试
+            0 if str(n.get("hot_backup_status") or "") == "stale_after_restart" else 1,
+
+            # 其次优先质量检测通过的节点
             0 if n.get("quality_status") == "passed" else 1,
+
+            # passed 节点里，IPPure 分数越低越优先
             parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
+
+            # 人机流量比越高越优先
             -parse_int(n.get("human_ratio")),
+
+            # 延迟越低越优先
             parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999,
+
+            # VPNGate 分数越高越优先
             -parse_int(n.get("score")),
         )
     )
@@ -3228,6 +3305,10 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
             node_id = str(node.get("id") or "")
             if not node_id:
                 continue
+
+            is_stale_after_restart = (
+                    str(node.get("hot_backup_status") or "") == "stale_after_restart"
+            )
 
             if should_skip_candidate_by_quality(node):
                 log_hot_backup(f"跳过 hard fail 冷却期节点: {node_id}")
@@ -3295,6 +3376,87 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
                     "probe_message": f"热备用 OpenVPN 已建立，出口 IP {health.get('ip', '')}",
                     "probed_at": time.time(),
                 })
+
+                # ── 服务重启后的旧热备用快速恢复 ─────────────────────────────
+                # stale_after_restart 表示：
+                # - 这个节点在服务重启前已经是 ready 热备用；
+                # - 重启后 OpenVPN 进程 / tun 接口丢失；
+                # - 但 nodes.json 里还保留了它之前的质量检测和测速结果。
+                #
+                # 所以只要现在重新拨号成功，并且通过一次轻量健康检测，
+                # 就直接恢复为 ready，不重新跑 IPPure / Scamalytics / ipapi / speedtest。
+                if is_stale_after_restart:
+                    now = time.time()
+
+                    cached_quality_info: dict[str, Any] = {}
+
+                    for field in QUALITY_CACHE_FIELDS:
+                        if field in node:
+                            cached_quality_info[field] = node.get(field)
+
+                    for field in IPAPI_RISK_FIELD_LABELS:
+                        if field in node:
+                            cached_quality_info[field] = node.get(field)
+
+                    # 健康检测拿到的新出口 IP 优先用于本次运行态。
+                    # 旧缓存里的 IP 只作为参考，不作为强制拦截条件。
+                    old_exit_ip = str(node.get("hot_backup_exit_ip") or node.get("ip") or "")
+                    current_exit_ip = str(health.get("ip") or old_exit_ip or "")
+
+                    cached_quality_info["ip"] = current_exit_ip
+                    cached_quality_info["quality_source"] = "stale_after_restart_reused"
+
+                    with hot_backup_lock:
+                        hot_backup_process = process
+                        hot_backup_node_id = node_id
+                        hot_backup_dev = dev_name
+                        hot_backup_info = {
+                            "node_id": node_id,
+                            "dev": dev_name,
+                            "exit_ip": current_exit_ip,
+                            "quality_info": cached_quality_info,
+                            "created_at": now,
+                            "last_health_ok_at": now,
+                            "last_health_latency_ms": health.get("latency_ms", 0),
+                            "restored_after_restart": True,
+                            "old_exit_ip": old_exit_ip,
+                        }
+                        hot_backup_building = False
+
+                    mark_hot_backup_node_fields(node_id, {
+                        "hot_backup_status": "ready",
+                        "hot_backup_message": "服务重启后旧热备用重建成功，已通过健康检测并复用原质量缓存",
+                        "hot_backup_interface": dev_name,
+                        "hot_backup_exit_ip": current_exit_ip,
+                        "hot_backup_last_health_ok_at": now,
+                        "hot_backup_updated_at": now,
+                        "hot_backup_restored_after_restart": True,
+                    })
+
+                    keep_process = True
+
+                    set_hot_backup_state(
+                        "ready",
+                        hot_backup_message="旧热备用重建成功，已通过健康检测并复用原质量缓存",
+                        hot_backup_exit_ip=current_exit_ip,
+                        hot_backup_last_health_ok_at=now,
+                        hot_backup_restored_after_restart=True,
+                    )
+
+                    if old_exit_ip and current_exit_ip and old_exit_ip != current_exit_ip:
+                        log_hot_backup(
+                            f"旧热备用 {node_id} 重建成功，出口 IP 有变化: "
+                            f"{old_exit_ip} -> {current_exit_ip}，仍按健康检测结果恢复 ready",
+                            "WARNING",
+                        )
+                    else:
+                        log_hot_backup(
+                            f"旧热备用 {node_id} 重建成功，出口 IP {current_exit_ip}，"
+                            f"已复用原质量/测速缓存并恢复 ready"
+                        )
+
+                    return True
+                # ── 旧热备用快速恢复结束 ─────────────────────────────────────
 
                 log_hot_backup(f"热备用 {node_id} OpenVPN 可用，出口 IP {health.get('ip', '')}，开始质量预检")
                 passed, reason, quality_info = probe_quality_via_interface(dev_name, include_speed=True)
@@ -3601,7 +3763,11 @@ def start_waiting_for_hot_backup(reason: str = "") -> None:
 def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, Any] | None) -> dict[str, Any]:
     """
     拉取 VPNGate 新列表时，保留同 ID 节点已有的质量检测缓存。
-    否则每次 fetch_candidates() 都会把 quality_fail_until 等字段冲掉。
+
+    这里也保留热备用的重启残留标记：
+    - 服务重启后，热备用运行态一定丢失；
+    - 但上次热备用节点仍然有参考价值；
+    - 所以保留 stale_after_restart，方便维护线程优先重新尝试它。
     """
     if not old_node:
         return new_node
@@ -3616,7 +3782,12 @@ def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, An
         if field in old_node:
             merged[field] = old_node.get(field)
 
+    for field in HOT_BACKUP_CACHE_FIELDS:
+        if field in old_node:
+            merged[field] = old_node.get(field)
+
     return merged
+
 
 def pick_nodes_to_test(nodes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     now = time.time()
@@ -4663,21 +4834,24 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
             quality_info["ipapi_checked"] = False
             quality_info["ipapi_error"] = str(exc)
 
+    # 先做质量预检，但不打印“通过”，也不作为最终结论
     passed, reason = evaluate_ip_quality(quality_info)
 
-    log_hot_backup(
-        f"{iface} IP质量检测结果: {format_quality_check_result(quality_info)} | "
-        f"结论:{'通过' if passed else '失败'}"
-        f"{'' if passed else f'，原因:{reason}'}"
-    )
-
+    # 质量不通过：不测速，直接输出一次总结果
     if not passed:
+        log_hot_backup(
+            f"{iface} 总检测结果: "
+            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
+        )
         return passed, reason, quality_info
 
-    if include_speed and QUALITY_CHECK_SPEED_ENABLED:
-        print(f"[热备用] IP 质量通过，开始通过 {iface} 进行 speedtest 测速", flush=True)
+    # 质量通过后才测速
+    need_speed = include_speed and QUALITY_CHECK_SPEED_ENABLED
+
+    if need_speed:
         try:
             speed_info = fetch_proxy_speed_quality(iface)
+
             quality_info["speed_test_checked"] = True
             quality_info["speed_test_error"] = ""
             quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
@@ -4687,18 +4861,27 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
             quality_info["download_speed_bps"] = speed_info.get("download_speed_bps", 0)
             quality_info["download_speed_mbps"] = speed_info.get("download_speed_mbps", 0)
             quality_info["download_speed_mib_s"] = speed_info.get("download_speed_mib_s", 0)
+
         except Exception as exc:
             quality_info["speed_test_checked"] = False
             quality_info["speed_test_error"] = str(exc)
-            print(f"[热备用] {iface} speedtest 测速失败: {exc}", flush=True)
             log_to_json("WARNING", "HotBackup", f"{iface} speedtest 测速失败: {exc}")
 
-        passed, reason = evaluate_ip_quality(quality_info)
-        log_hot_backup(
-            f"{iface} IP质量+测速最终结果: {format_quality_check_result(quality_info)} | "
-            f"结论:{'通过' if passed else '失败'}"
-            f"{'' if passed else f'，原因:{reason}'}"
-        )
+        # 热备用最终验收：测速没完成/测速异常，必须判不通过
+        if quality_info.get("speed_test_error"):
+            passed = False
+            reason = f"出口测速异常: {quality_info.get('speed_test_error')}"
+        elif not quality_info.get("speed_test_checked"):
+            passed = False
+            reason = "出口测速未完成"
+        else:
+            passed, reason = evaluate_ip_quality(quality_info)
+
+    # 最终只输出一次总结果
+    log_hot_backup(
+        f"{iface} 总检测结果: "
+        f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
+    )
 
     return passed, reason, quality_info
 
@@ -5179,6 +5362,90 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
         f"ipapi.is: {'，'.join(ipapi_parts)} | "
         f"测速:{speed_text}"
     )
+
+def format_speed_brief(info: dict[str, Any]) -> str:
+    if info.get("speed_test_checked"):
+        return f"{parse_float(info.get('download_speed_mib_s')):.2f} MB/s"
+
+    if info.get("speed_test_error"):
+        return f"失败:{info.get('speed_test_error')}"
+
+    return "未测速"
+
+
+def format_quality_fail_brief(info: dict[str, Any], reason: str) -> str:
+    reason = str(reason or "").strip()
+
+    if "ProxyCheck 检测为代理" in reason:
+        proxy_value = info.get("proxycheck_proxy") or "yes"
+        proxy_type = info.get("proxycheck_type") or ""
+        type_text = f"，type:{proxy_type}" if proxy_type else ""
+        return f"质量:ProxyCheck proxy【{proxy_value}】{type_text} 不符合要求"
+
+    ipapi_short_labels = {
+        "is_bogon": "保留/异常 bogon",
+        "is_mobile": "移动网络 mobile",
+        "is_satellite": "卫星网络 satellite",
+        "is_crawler": "爬虫 crawler",
+        "is_datacenter": "数据中心 datacenter",
+        "is_tor": "Tor",
+        "is_proxy": "代理 proxy",
+        "is_vpn": "VPN",
+        "is_abuser": "滥用 IP abuser",
+    }
+
+    if reason.startswith("ipapi.is 风险命中"):
+        for field, label in ipapi_short_labels.items():
+            try:
+                reject_enabled = IPAPI_REJECT_CONFIG[field]()
+            except Exception:
+                reject_enabled = False
+
+            if reject_enabled and info.get(field) is True:
+                return f"质量:{label}【是】不符合要求"
+
+    if "IPPure 系数" in reason:
+        return f"质量:IPPure【{parse_int(info.get('ippure_score'))}%】不符合要求"
+
+    if "Scamalytics 风险分" in reason:
+        return f"质量:Scamalytics【{parse_int(info.get('scamalytics_score'))}】不符合要求"
+
+    if "非住宅" in reason or "住宅" in reason:
+        return f"质量:住宅IP【否】不符合要求"
+
+    if "非原生" in reason or "原生" in reason:
+        return f"质量:原生IP【否】不符合要求"
+
+    if "人机流量比" in reason:
+        return f"质量:人机流量比【{parse_int(info.get('human_ratio'))}%】不符合要求"
+
+    return f"质量:{reason} 不符合要求"
+
+
+def format_hot_backup_total_result(
+        info: dict[str, Any],
+        passed: bool,
+        reason: str,
+        include_speed: bool = True,
+) -> str:
+    if passed:
+        if include_speed and QUALITY_CHECK_SPEED_ENABLED:
+            return f"质量预检和测速通过，测速:{format_speed_brief(info)}，结论:通过"
+
+        return "质量预检通过，结论:通过"
+
+    reason = str(reason or "").strip()
+
+    if reason == "出口测速未完成":
+        return "测速:未完成 不符合要求，结论:不通过"
+
+    if info.get("speed_test_error"):
+        return f"测速:{format_speed_brief(info)} 不符合要求，结论:不通过"
+
+    if info.get("speed_test_checked") and ("速度" in reason or "测速" in reason):
+        return f"测速:{format_speed_brief(info)} 不符合要求，结论:不通过"
+
+    return f"{format_quality_fail_brief(info, reason)}，结论:不通过"
 
 def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
@@ -10787,7 +11054,13 @@ def main() -> None:
     sys.stderr = tee
 
     init_state_on_start()
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    reset_stale_hot_backup_after_restart()
+
+    threading.Thread(
+        target=proxy_server.start_proxy_server,
+        args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT),
+        daemon=True,
+    ).start()
     
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
