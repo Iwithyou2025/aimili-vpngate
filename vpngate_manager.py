@@ -3606,24 +3606,36 @@ def check_hot_backup_health(force: bool = False) -> bool:
     res = check_interface_health(dev)
 
     if res.get("ok"):
+        old_exit_ip = str((snap.get("info") or {}).get("exit_ip") or "")
+        new_exit_ip = str(res.get("ip") or old_exit_ip or "")
+
         with hot_backup_lock:
             hot_backup_info["last_health_ok_at"] = now
             hot_backup_info["last_health_latency_ms"] = res.get("latency_ms", 0)
-            hot_backup_info["exit_ip"] = res.get("ip") or hot_backup_info.get("exit_ip", "")
+            hot_backup_info["exit_ip"] = new_exit_ip
 
         mark_hot_backup_node_fields(node_id, {
             "hot_backup_status": "ready",
             "hot_backup_message": "热备用健康检测正常",
             "hot_backup_last_health_ok_at": now,
-            "hot_backup_exit_ip": res.get("ip") or "",
+            "hot_backup_exit_ip": new_exit_ip,
         })
+
         set_hot_backup_state(
             "ready",
             hot_backup_message="热备用健康检测正常",
-            hot_backup_exit_ip=res.get("ip") or "",
+            hot_backup_exit_ip=new_exit_ip,
             hot_backup_last_health_ok_at=now,
         )
-        log_hot_backup(f"热备用健康正常: node={node_id}, dev={dev}, ip={res.get('ip')}, latency={res.get('latency_ms')}ms")
+
+        # 普通 30 秒健康检测成功时只更新状态，不刷日志。
+        # 只有手动 force 检测，或者热备用出口 IP 发生变化时才打印日志。
+        if force or old_exit_ip != new_exit_ip:
+            log_hot_backup(
+                f"热备用健康正常: node={node_id}, dev={dev}, "
+                f"ip={new_exit_ip}, latency={res.get('latency_ms')}ms"
+            )
+
         return True
 
     reason = res.get("error", "热备用健康检测失败")
@@ -3632,7 +3644,7 @@ def check_hot_backup_health(force: bool = False) -> bool:
     return False
 
 
-def promote_hot_backup_if_available(reason: str = "") -> bool:
+def promote_hot_backup_if_available(reason: str = "", quiet: bool = False) -> bool:
     global active_openvpn_process, active_openvpn_node_id
     global hot_backup_process, hot_backup_node_id, hot_backup_dev, hot_backup_info
 
@@ -3645,7 +3657,8 @@ def promote_hot_backup_if_available(reason: str = "") -> bool:
     info = dict(snap.get("info") or {})
 
     if not node_id or not dev or not snap.get("running"):
-        log_hot_backup("没有可提升的热备用节点", "WARNING")
+        if not quiet:
+            log_hot_backup("没有可提升的热备用节点", "WARNING")
         return False
 
     last_ok = float(info.get("last_health_ok_at") or 0)
@@ -3753,7 +3766,7 @@ def start_waiting_for_hot_backup(reason: str = "") -> None:
         log_hot_backup(f"进入等待热备用状态: {reason}", "WARNING")
         try:
             while True:
-                if promote_hot_backup_if_available("等待热备用就绪后自动提升"):
+                if promote_hot_backup_if_available("等待热备用就绪后自动提升", quiet=True):
                     return
 
                 snap = hot_backup_snapshot()
@@ -6142,7 +6155,14 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                 to_test_ids: list[str] = []
                 log_hot_backup("热备用已存在，本轮维护不再做新节点质量检测和测速")
             else:
-                log_hot_backup("热备用为空，本轮维护开始串行构建 1 个热备用节点")
+                stale_count = len([
+                    n for n in current_nodes
+                    if str(n.get("hot_backup_status") or "") == "stale_after_restart"
+                ])
+
+                if stale_count <= 0:
+                    log_hot_backup("当前没有运行中的热备用，本轮维护开始串行构建 1 个新热备用节点")
+
                 build_hot_backup_from_nodes(current_nodes, target_country)
                 to_test_ids = []
 
