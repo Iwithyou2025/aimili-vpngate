@@ -336,6 +336,25 @@ IPAPI_REJECT_CONFIG = {
 # None  => 预检通过，但日志警告
 QUALITY_CHECK_IPIPSEEK_VPN_ENABLED = env_flag("QUALITY_CHECK_IPIPSEEK_VPN_ENABLED", "1")
 
+# 优先使用你手动测试成功的 venv python
+IPIPSEEK_PYTHON_BIN = os.environ.get(
+    "IPIPSEEK_PYTHON_BIN",
+    "/opt/aimilivpn/.venv/bin/python",
+).strip()
+
+IPIPSEEK_SCRIPT_PATH = Path(
+    os.environ.get(
+        "IPIPSEEK_SCRIPT_PATH",
+        str(ROOT_DIR / "catch_ip_result.py"),
+    )
+)
+
+# Selenium 查询比较慢，超时时间不要太短
+IPIPSEEK_PRECHECK_TIMEOUT_SECONDS = int(
+    os.environ.get("IPIPSEEK_PRECHECK_TIMEOUT_SECONDS", "150")
+)
+
+
 def ensure_openvpn_ca_bundle() -> None:
     """
     生成 OpenVPN 专用 CA bundle。
@@ -4716,6 +4735,48 @@ def apply_proxycheck_quality(quality_info: dict[str, Any], proxycheck_info: dict
     quality_info["proxycheck_ip"] = proxycheck_info.get("proxycheck_ip", "")
     quality_info["proxycheck_error"] = ""
 
+def parse_ipipseek_stdout(stdout: str) -> dict[str, Any]:
+    """
+    从 catch_ip_result.py 的 stdout 中提取 JSON。
+
+    正常输出：
+        {"1.2.3.4": false}
+
+    兼容情况：
+    - Selenium / Chrome 输出了一些杂音
+    - stdout 里有多行日志
+    - JSON 只在最后一行
+    """
+    text = str(stdout or "").strip()
+
+    if not text:
+        raise RuntimeError("catch_ip_result.py 没有 stdout 输出")
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+
+        raise RuntimeError(f"catch_ip_result.py 返回的不是 JSON 对象: {type(data)}")
+
+    except json.JSONDecodeError:
+        pass
+
+    # 兼容 stdout 里混入 Chrome / Selenium 日志的情况
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+
+        if not line.startswith("{") or not line.endswith("}"):
+            continue
+
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            continue
+
+    raise RuntimeError(f"无法从 catch_ip_result.py 输出中解析 JSON: {text[:300]}")
 
 def apply_ipipseek_vpn_precheck(
         quality_info: dict[str, Any],
@@ -4724,12 +4785,12 @@ def apply_ipipseek_vpn_precheck(
     """
     ipipseek VPN 预检。
 
-    从 catch_ip_result.py 调用 get_ip_vpn_status(ip)。
+    不在主进程里 import catch_ip_result.py，
+    而是通过 subprocess 调用：
 
-    判断规则：
-    - True  : VPN 命中，后续 evaluate_ip_quality 判定不通过
-    - False : 通过
-    - None  : 通过，但日志提示
+        /opt/aimilivpn/.venv/bin/python /opt/aimilivpn/catch_ip_result.py <ip>
+
+    这样可以完全复用你手动测试成功的 venv 环境。
     """
     quality_info["ipipseek_vpn_checked"] = False
     quality_info["ipipseek_vpn"] = None
@@ -4748,16 +4809,60 @@ def apply_ipipseek_vpn_precheck(
         return
 
     try:
-        # 延迟导入，避免 catch_ip_result.py / selenium 异常影响主程序启动
-        from catch_ip_result import get_ip_vpn_status
+        python_bin = IPIPSEEK_PYTHON_BIN
 
-        raw_text = get_ip_vpn_status(ip)
-        raw_data = json.loads(raw_text)
+        # 如果配置的 venv python 不存在，则退回当前 Python
+        if not python_bin or not Path(python_bin).exists():
+            python_bin = sys.executable
+
+        script_path = IPIPSEEK_SCRIPT_PATH
+
+        if not script_path.exists():
+            raise RuntimeError(f"catch_ip_result.py 不存在: {script_path}")
+
+        cmd = [
+            python_bin,
+            str(script_path),
+            ip,
+        ]
+
+        res = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=IPIPSEEK_PRECHECK_TIMEOUT_SECONDS,
+            env={
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
+
+        stdout = str(res.stdout or "").strip()
+        stderr = str(res.stderr or "").strip()
+
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"catch_ip_result.py 执行失败: returncode={res.returncode}, "
+                f"stderr={stderr[:300]}"
+            )
+
+        raw_data = parse_ipipseek_stdout(stdout)
+
+        # 关键校验：
+        # 必须确认返回结果里包含当前预检 IP。
+        # 否则可能是 catch_ip_result.py 仍然在查写死的测试 IP。
+        if ip not in raw_data:
+            raise RuntimeError(
+                f"catch_ip_result.py 返回结果不包含当前 IP: {ip}; "
+                f"raw={raw_data}"
+            )
 
         vpn_value = raw_data.get(ip)
 
         quality_info["ipipseek_vpn_checked"] = True
         quality_info["ipipseek_vpn"] = vpn_value if vpn_value in (True, False) else None
+        quality_info["ipipseek_vpn_error"] = ""
 
     except Exception as exc:
         quality_info["ipipseek_vpn_checked"] = False
@@ -4785,6 +4890,7 @@ def apply_ipipseek_vpn_precheck(
 
         print(msg, flush=True)
         log_to_json("WARNING", "Quality", msg)
+        
 
 def parse_ipapi_quality(raw: dict[str, Any]) -> dict[str, Any]:
     result = {
@@ -4963,6 +5069,7 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
     quality_info = fetch_ippure_quality_via_interface(iface)
 
     apply_ipipseek_vpn_precheck(quality_info, log_prefix="热备用")
+
 
     if QUALITY_CHECK_PROXYCHECK_ENABLED:
         try:

@@ -1,7 +1,4 @@
-import json
-import time
-from typing import Optional
-import subprocess
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -9,7 +6,10 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-
+import json
+import sys
+import time
+from typing import Optional
 
 def create_driver(headless: bool = True):
     options = Options()
@@ -318,10 +318,20 @@ def get_ip_vpn_status(
             driver.quit()
 
 
-if __name__ == "__main__":
 
-    result = get_ip_vpn_status(
-        "60.113.181.155",
-        "138.64.65.244"
-    )
+if __name__ == "__main__":
+    ips = [
+        arg.strip()
+        for arg in sys.argv[1:]
+        if arg.strip()
+    ]
+
+    # 不传参数时保留原来的测试 IP，方便你手动调试
+    if not ips:
+        ips = [
+            "60.113.181.155",
+            "138.64.65.244",
+        ]
+
+    result = get_ip_vpn_status(*ips)
     print(result)
