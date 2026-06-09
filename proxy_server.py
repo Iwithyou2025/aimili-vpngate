@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import ipaddress
 import os
 import select
 import socket
@@ -56,6 +57,50 @@ def bind_socket_to_interface(sock: socket.socket, interface: str) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
 
 
+
+
+def is_loopback_client(address: tuple[str, int] | tuple[str, int, int, int] | None) -> bool:
+    """
+    判断客户端是否来自本机回环地址。
+
+    - 127.0.0.0/8：IPv4 本机，包括 127.0.0.1
+    - ::1：IPv6 本机
+    - ::ffff:127.x.x.x：IPv4-mapped IPv6 本机
+    """
+    if not address:
+        return False
+
+    host = str(address[0] or "").strip()
+    if not host:
+        return False
+
+    if host.lower() == "localhost":
+        return True
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    if ip.is_loopback:
+        return True
+
+    ipv4_mapped = getattr(ip, "ipv4_mapped", None)
+    return bool(ipv4_mapped and ipv4_mapped.is_loopback)
+
+
+def proxy_auth_required_for(address: tuple[str, int] | tuple[str, int, int, int] | None) -> bool:
+    """
+    是否需要代理鉴权。
+
+    规则：
+    - 未开启 PROXY_AUTH_ENABLED：不需要鉴权
+    - 本机回环连接：不需要鉴权
+    - 非本机连接：需要用户名密码
+    """
+    return bool(PROXY_AUTH_ENABLED and not is_loopback_client(address))
+
+
 def proxy_auth_ready() -> bool:
     return bool(PROXY_USERNAME and PROXY_PASSWORD)
 
@@ -87,8 +132,8 @@ def parse_basic_proxy_auth(value: str) -> tuple[str, str] | None:
     return username, password
 
 
-def http_proxy_auth_ok(lines: list[str]) -> bool:
-    if not PROXY_AUTH_ENABLED:
+def http_proxy_auth_ok(lines: list[str], address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> bool:
+    if not proxy_auth_required_for(address):
         return True
 
     for line in lines[1:]:
@@ -116,8 +161,8 @@ def send_http_auth_required(client: socket.socket) -> None:
     )
 
 
-def socks5_auth(client: socket.socket, methods: bytes) -> bool:
-    if not PROXY_AUTH_ENABLED:
+def socks5_auth(client: socket.socket, methods: bytes, address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> bool:
+    if not proxy_auth_required_for(address):
         if 0x00 not in methods:
             client.sendall(b"\x05\xff")
             return False
@@ -296,13 +341,13 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes, address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
         methods = recv_exact(client, methods_count)
 
-        if not socks5_auth(client, methods):
+        if not socks5_auth(client, methods, address):
             return
         version, command, _, address_type = recv_exact(client, 4)
 
@@ -343,7 +388,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(client: socket.socket, first_byte: bytes, address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -351,7 +396,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
         method, target, version = lines[0].split(" ", 2)
 
-        if not http_proxy_auth_ok(lines):
+        if not http_proxy_auth_ok(lines, address):
             send_http_auth_required(client)
             return
         if method.upper() == "CONNECT":
@@ -398,9 +443,9 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, address)
         else:
-            http_client(client, first)
+            http_client(client, first, address)
     except Exception:
         try:
             client.close()
@@ -419,7 +464,7 @@ def start_proxy_server(host: str, port: int) -> None:
                 "All proxy requests will be rejected.",
                 flush=True
             )
-        auth_status = "auth enabled" if PROXY_AUTH_ENABLED else "no auth"
+        auth_status = "auth enabled, loopback bypass" if PROXY_AUTH_ENABLED else "no auth"
         print(f"HTTP/SOCKS5 proxy listening on {host}:{port} ({auth_status})", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
