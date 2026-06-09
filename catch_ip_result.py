@@ -331,9 +331,11 @@ def get_ip_vpn_status(
     driver = None
 
     try:
+        proxy_server = get_aimilivpn_proxy_server()
+
         driver = create_driver(
             headless=headless,
-            proxy_server="http://127.0.0.1:7928",
+            proxy_server=proxy_server,
         )
         driver.set_page_load_timeout(page_load_timeout)
 
