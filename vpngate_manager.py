@@ -3742,6 +3742,77 @@ def promote_hot_backup_if_available(reason: str = "", quiet: bool = False) -> bo
     log_hot_backup(f"热备用提升完成: node={node_id}, dev={dev}, exit_ip={exit_ip}")
     start_hot_backup_builder_thread()
     return True
+def try_promote_stale_hot_backup_before_fetch(reason: str = "") -> bool:
+    """
+    启动 / 当前无正式节点时，优先尝试恢复重启前旧热备用。
+
+    目的：
+    - 不拉取 VPNGate 新节点；
+    - 不并发检测 30 个节点；
+    - 直接重建 stale_after_restart 节点；
+    - 健康检测通过后直接提升为正式出口。
+    """
+    if not HOT_BACKUP_ENABLED:
+        return False
+
+    if active_openvpn_running() or has_confirmed_active_vpn_connection():
+        return False
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+
+    stale_nodes = [
+        n for n in nodes
+        if str(n.get("hot_backup_status") or "") == "stale_after_restart"
+    ]
+
+    # 如果内存中已经有运行中的热备用，也可以直接提升
+    if hot_backup_ready():
+        log_hot_backup("当前没有正式节点，但已有运行中的热备用，直接尝试提升为正式出口")
+        return promote_hot_backup_if_available(
+            reason or "当前无正式节点，直接提升已有热备用为正式出口"
+        )
+
+    if not stale_nodes:
+        return False
+
+    stale_ids = [str(n.get("id") or "") for n in stale_nodes]
+
+    log_hot_backup(
+        f"当前没有正式节点，发现 {len(stale_nodes)} 个重启前旧热备用，"
+        f"跳过 VPNGate 拉取和 30 节点并发检测，优先重建并提升: {stale_ids}"
+    )
+
+    set_state(
+        active_status="rebuilding_stale_hot_backup",
+        connection_stage="rebuilding_stale_hot_backup",
+        last_check_message="当前没有正式节点，正在优先重建重启前旧热备用...",
+        is_connecting=True,
+    )
+
+    try:
+        if not build_hot_backup_from_nodes(nodes, ""):
+            log_hot_backup(
+                "重启前旧热备用重建失败，继续进入原维护流程拉取新节点",
+                "WARNING",
+            )
+            return False
+
+        if promote_hot_backup_if_available(
+                reason or "重启前旧热备用重建成功，直接提升为正式出口"
+        ):
+            log_hot_backup("重启前旧热备用已成功恢复并提升为正式出口")
+            return True
+
+        log_hot_backup(
+            "旧热备用已重建，但提升为正式出口失败，继续进入原维护流程",
+            "WARNING",
+        )
+        return False
+
+    finally:
+        if not active_openvpn_running():
+            set_state(is_connecting=False)
 
 
 def start_waiting_for_hot_backup(reason: str = "") -> None:
@@ -6081,6 +6152,48 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                 is_connecting = False
                 auto_switch_node(record_switch=True)
                 is_connecting = True
+
+
+        # 当前没有正式节点时，先尝试恢复重启前旧热备用。
+        # 成功则直接提升为正式出口，不再拉取 VPNGate，也不再并发检测 30 个节点。
+        if not force and try_promote_stale_hot_backup_before_fetch(
+                "维护线程启动时优先恢复重启前旧热备用"
+        ):
+            is_connecting = False
+
+            msg = "已优先恢复重启前旧热备用，并提升为正式出口"
+            finish_maintenance_progress(msg)
+
+            set_state(
+                is_connecting=False,
+                last_check_at=time.time(),
+                last_check_message=msg,
+                active_openvpn_node_id=resolve_active_openvpn_node_id(),
+            )
+
+            return msg
+
+        # 正式节点正常，并且热备用已经存在：
+        # 本轮维护不拉取 VPNGate，也不检测新节点，只让后台健康检测负责热备用存活。
+        if (
+                not force
+                and HOT_BACKUP_ENABLED
+                and has_confirmed_active_vpn_connection()
+                and hot_backup_ready()
+        ):
+            check_hot_backup_health(force=False)
+
+            msg = "正式节点和热备用均正常，本轮维护跳过 VPNGate 拉取和新节点检测"
+            finish_maintenance_progress(msg)
+
+            set_state(
+                is_connecting=False,
+                last_check_at=time.time(),
+                last_check_message=msg,
+                active_openvpn_node_id=resolve_active_openvpn_node_id(),
+            )
+
+            return msg
 
         try:
             set_maintenance_progress(
