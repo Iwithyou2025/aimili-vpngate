@@ -427,9 +427,11 @@ def get_ip_vpn_status(
                 if browser is not None:
                     browser.close()
 
-    except Exception:
+    except Exception as exc:
         # 8. 如果浏览器启动、页面打开等全局流程失败
-        #    所有 IP 统一返回 None。
+        #    所有 IP 统一返回 None，但把真实错误打印到 stderr，方便服务端排查。
+        print(f"[PlaywrightError] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
         for ip in ips:
             ip = ip.strip()
             if ip:

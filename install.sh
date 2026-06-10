@@ -126,6 +126,20 @@ ensure_env_var_nonempty() {
     fi
 }
 
+set_env_var() {
+    local key="$1"
+    local value="$2"
+
+    mkdir -p "$(dirname "$ENV_FILE")"
+    touch "$ENV_FILE"
+
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    else
+        echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+}
+
 ensure_proxy_auth_env() {
     mkdir -p "$(dirname "$ENV_FILE")"
     touch "$ENV_FILE"
@@ -233,8 +247,15 @@ ensure_openvpn_ca_bundle() {
 ensure_playwright_env() {
     echo -e "\n${YELLOW}正在初始化 Playwright 环境...${PLAIN}"
 
-    # 1. 创建 Python 虚拟环境
     VENV_DIR="${INSTALL_DIR}/.venv"
+    PLAYWRIGHT_BROWSERS_DIR="${INSTALL_DIR}/.playwright-browsers"
+
+    mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
+
+    # 关键：
+    # 安装浏览器时指定固定目录；
+    # systemd 运行时也会通过 /etc/default/aimilivpn 读取同一个目录。
+    export PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR"
 
     if [ ! -d "$VENV_DIR" ]; then
         echo -e "  -> 正在创建 Python 虚拟环境: ${VENV_DIR}"
@@ -243,21 +264,35 @@ ensure_playwright_env() {
         echo -e "${GREEN}  -> Python 虚拟环境已存在，跳过创建。${PLAIN}"
     fi
 
-    # 2. 安装 / 更新 pip 与 Playwright
     echo -e "  -> 正在安装 / 更新 pip 与 Playwright..."
-
     "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel
     "${VENV_DIR}/bin/python" -m pip install -U playwright
 
-    # 3. 安装 Playwright Chromium 及系统依赖
     echo -e "  -> 正在安装 / 更新 Playwright Chromium 浏览器及系统依赖..."
     "${VENV_DIR}/bin/python" -m playwright install --with-deps chromium
 
-    # 4. 如果项目有 requirements.txt，也一起安装
     if [ -f "${INSTALL_DIR}/requirements.txt" ]; then
         echo -e "  -> 检测到 requirements.txt，正在安装项目依赖..."
         "${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt"
     fi
+
+    echo -e "  -> 正在验证 Playwright Chromium 是否可以正常启动..."
+    "${VENV_DIR}/bin/python" - <<'PY'
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    )
+    browser.close()
+
+print("Playwright Chromium 启动验证通过")
+PY
 
     echo -e "${GREEN} -> Playwright 环境初始化完成。${PLAIN}"
 }
@@ -270,13 +305,26 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
-        git fetch --all || true
-        BRANCH="main"
-        if git rev-parse --verify origin/main >/dev/null 2>&1; then
-            BRANCH="main"
-        elif git rev-parse --verify origin/master >/dev/null 2>&1; then
-            BRANCH="master"
+
+        if [ -d ".git" ]; then
+            echo -e "  -> 正在确认 GitHub 远程仓库地址: ${GITHUB_URL}"
+            git remote set-url origin "${GITHUB_URL}" || true
         fi
+
+        git fetch origin --prune || true
+        git remote set-head origin --auto >/dev/null 2>&1 || true
+
+        BRANCH="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+
+        if [ -z "$BRANCH" ]; then
+            BRANCH="main"
+            if git rev-parse --verify origin/main >/dev/null 2>&1; then
+                BRANCH="main"
+            elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+                BRANCH="master"
+            fi
+        fi
+
         echo -e "  -> 正在强制重置本地源码至 origin/${BRANCH} ..."
         if git reset --hard "origin/${BRANCH}"; then
             echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
@@ -301,6 +349,15 @@ fi
 # 5. Configure Systemd Service (direct python3 run)
 echo -e "\n${YELLOW}正在初始化代理认证配置...${PLAIN}"
 ensure_proxy_auth_env
+
+# 保存项目更新用的 GitHub 地址。
+# 否则服务器目录已存在时，可能仍然 fetch 旧的 origin。
+set_env_var "AIMILIVPN_GITHUB_URL" "$GITHUB_URL"
+
+# 保存 Playwright 浏览器目录。
+# 安装和 systemd 运行必须使用同一个 PLAYWRIGHT_BROWSERS_PATH。
+set_env_var "PLAYWRIGHT_BROWSERS_PATH" "${INSTALL_DIR}/.playwright-browsers"
+
 echo -e "${GREEN} -> 代理认证配置已准备完成: ${ENV_FILE}${PLAIN}"
 
 
@@ -351,6 +408,31 @@ import termios
 
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
+ENV_FILE = "/etc/default/aimilivpn"
+DEFAULT_GITHUB_URL = "https://github.com/Iwithyou2025/aimili-vpngate.git"
+
+def load_env_value(key, default=""):
+    if not os.path.exists(ENV_FILE):
+        return default
+
+    try:
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                k, v = line.split("=", 1)
+                if k == key:
+                    return v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+
+    return default
+
+
+def get_github_url():
+    return load_env_value("AIMILIVPN_GITHUB_URL", DEFAULT_GITHUB_URL)
 
 def generate_random_password():
     import random
@@ -719,15 +801,54 @@ def update_service():
                 return
             
             # Fetch remote origin updates
-            subprocess.run(["git", "fetch", "--all"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # Detect remote branch (check origin/main, then origin/master)
-            branch = "main"
-            for b in ["main", "master"]:
-                chk = subprocess.run(["git", "rev-parse", "--verify", f"origin/{b}"], capture_output=True, text=True)
-                if chk.returncode == 0:
-                    branch = b
-                    break
+            github_url = get_github_url()
+
+            print(f"当前更新仓库: {github_url}")
+
+            # 确保 origin 指向当前项目仓库，避免一直 fetch 旧仓库
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", github_url],
+                check=False,
+            )
+
+            subprocess.run(
+                ["git", "fetch", "origin", "--prune"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            subprocess.run(
+                ["git", "remote", "set-head", "origin", "--auto"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            branch = ""
+            head_ref = subprocess.run(
+                ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                capture_output=True,
+                text=True,
+            )
+
+            if head_ref.returncode == 0:
+                branch = head_ref.stdout.strip().replace("origin/", "", 1)
+
+            if not branch:
+                for b in ["main", "master"]:
+                    chk = subprocess.run(
+                        ["git", "rev-parse", "--verify", f"origin/{b}"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if chk.returncode == 0:
+                        branch = b
+                        break
+
+            if not branch:
+                raise RuntimeError("未找到 origin/main 或 origin/master，无法检测远程更新")
+
             
             local_commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
             remote_commit = subprocess.run(["git", "rev-parse", f"origin/{branch}"], capture_output=True, text=True).stdout.strip()

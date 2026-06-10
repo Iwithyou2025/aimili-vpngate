@@ -258,6 +258,8 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 PROJECT_UPDATE_CONFIG_FILE = DATA_DIR / "project_update.json"
 LAST_CONNECTED_NODE_FILE = DATA_DIR / "last_connected_node.json"
 OPENVPN_FAILURE_REASONS_FILE = DATA_DIR / "openvpn_failure_reasons.json"
+
+PROJECT_UPDATE_REMOTE_URL = os.environ.get("AIMILIVPN_GITHUB_URL", "").strip()
 PROJECT_AUTO_UPDATE_INTERVAL_SECONDS = max(
     3,
     int(os.environ.get("PROJECT_AUTO_UPDATE_INTERVAL_SECONDS", "3"))
@@ -328,6 +330,11 @@ IPIPSEEK_SCRIPT_PATH = Path(
         str(ROOT_DIR / "catch_ip_result.py"),
     )
 )
+
+IPIPSEEK_PLAYWRIGHT_BROWSERS_PATH = os.environ.get(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    str(ROOT_DIR / ".playwright-browsers"),
+).strip()
 
 # Playwright 查询比较慢，超时时间不要太短
 IPIPSEEK_PRECHECK_TIMEOUT_SECONDS = int(
@@ -816,28 +823,60 @@ def run_git_cmd(args: list[str], timeout: int = 30) -> subprocess.CompletedProce
         capture_output=True,
         text=True,
         timeout=timeout,
+        env={
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+        },
     )
 
+def ensure_project_git_remote() -> None:
+    """
+    确保自动更新检测使用正确的 GitHub origin。
 
-def detect_git_upstream_ref() -> str:
-    p = run_git_cmd(
-        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    如果 /etc/default/aimilivpn 里有 AIMILIVPN_GITHUB_URL，
+    就强制把当前仓库 origin 指过去。
+    """
+    if not PROJECT_UPDATE_REMOTE_URL:
+        return
+
+    run_git_cmd(
+        ["git", "remote", "set-url", "origin", PROJECT_UPDATE_REMOTE_URL],
         timeout=10,
     )
+
+def detect_git_upstream_ref() -> str:
+    """
+    检测远程默认分支。
+
+    不优先使用 @{u}，因为服务器仓库可能曾经 tracking 到旧分支。
+    这里优先使用 origin/HEAD，再回退 origin/main / origin/master。
+    """
+    ensure_project_git_remote()
+
+    run_git_cmd(["git", "remote", "set-head", "origin", "--auto"], timeout=20)
+
+    p = run_git_cmd(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        timeout=10,
+    )
+
     if p.returncode == 0 and p.stdout.strip():
-        return p.stdout.strip()
+        ref = p.stdout.strip()
+        if ref.startswith("origin/"):
+            return ref
 
     for ref in ("origin/main", "origin/master"):
         p = run_git_cmd(["git", "rev-parse", "--verify", ref], timeout=10)
         if p.returncode == 0:
             return ref
 
-    raise RuntimeError("未找到 origin/main 或 origin/master，无法检测项目更新")
+    raise RuntimeError("未找到 origin/HEAD、origin/main 或 origin/master，无法检测项目更新")
 
 
 def start_project_update_unit(upstream_ref: str) -> None:
     log_file = DATA_DIR / "project_update.log"
     lock_file = "/tmp/aimilivpn_project_update.lock"
+    remote_url = PROJECT_UPDATE_REMOTE_URL
 
     shell_script = f"""
 set -e
@@ -848,7 +887,13 @@ cd {shlex.quote(str(ROOT_DIR))}
 
 echo "[$(date '+%F %T')] 开始自动更新项目，目标版本: {shlex.quote(upstream_ref)}" >> {shlex.quote(str(log_file))}
 
-git fetch --all --prune >> {shlex.quote(str(log_file))} 2>&1
+if [ -n {shlex.quote(remote_url)} ]; then
+    git remote set-url origin {shlex.quote(remote_url)} >> {shlex.quote(str(log_file))} 2>&1 || true
+fi
+
+git fetch origin --prune >> {shlex.quote(str(log_file))} 2>&1
+git remote set-head origin --auto >> {shlex.quote(str(log_file))} 2>&1 || true
+git reset --hard {shlex.quote(upstream_ref)} >> {shlex.quote(str(log_file))} 2>&1
 git reset --hard {shlex.quote(upstream_ref)} >> {shlex.quote(str(log_file))} 2>&1
 find . -type d -name "__pycache__" -exec rm -rf {{}} + >> {shlex.quote(str(log_file))} 2>&1 || true
 
@@ -891,7 +936,7 @@ def check_and_start_project_update() -> dict[str, Any]:
                 last_message="当前目录不是 Git 仓库，无法自动更新项目",
             )
             return {"ok": False, **cfg}
-
+        ensure_project_git_remote()
         fetch = run_git_cmd(["git", "fetch", "--all", "--prune"], timeout=60)
         if fetch.returncode != 0:
             msg = fetch.stderr.strip() or fetch.stdout.strip() or "git fetch 失败"
@@ -4807,7 +4852,7 @@ import sys
 from pathlib import Path
 
 script_path = Path(sys.argv[1]).resolve()
-ip = sys.argv[2].strip()
+ips = [x.strip() for x in sys.argv[2:] if x.strip()]
 
 spec = importlib.util.spec_from_file_location("catch_ip_result_runtime", script_path)
 if spec is None or spec.loader is None:
@@ -4820,12 +4865,17 @@ get_ip_vpn_status = getattr(module, "get_ip_vpn_status", None)
 if not callable(get_ip_vpn_status):
     raise RuntimeError("catch_ip_result.py 中没有可调用的 get_ip_vpn_status")
 
-result = get_ip_vpn_status(ip)
+result = get_ip_vpn_status(
+    *ips,
+    proxy_server="http://127.0.0.1:7928",
+)
 
-if isinstance(result, dict):
+if isinstance(result, str):
+    data = json.loads(result)
+elif isinstance(result, dict):
     data = result
 else:
-    data = {ip: result}
+    data = {ip: None for ip in ips}
 
 print(json.dumps(data, ensure_ascii=False))
 """
@@ -4847,6 +4897,7 @@ print(json.dumps(data, ensure_ascii=False))
             env={
                 **os.environ,
                 "PYTHONUNBUFFERED": "1",
+                "PLAYWRIGHT_BROWSERS_PATH": IPIPSEEK_PLAYWRIGHT_BROWSERS_PATH,
             },
         )
 
