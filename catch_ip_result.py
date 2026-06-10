@@ -362,7 +362,7 @@ def get_ip_vpn_status(
 
 
 
-                # 4. 逐个查询 IP
+                # 4.逐个查询 IP
                 #    改成 while 循环：
                 #    - 每个 IP 查询到 True / False 后就结束该 IP
                 #    - 每个 IP 超过 30 秒仍然不是 True / False，则返回 None
