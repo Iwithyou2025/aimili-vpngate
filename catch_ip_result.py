@@ -290,6 +290,7 @@ def get_ip_vpn_status(
         try:
             driver.get("https://www.ipipseek.com/")
             driver.refresh()
+            driver.refresh()
         except TimeoutException:
             # 页面加载超时，但 DOM 可能已经可用，所以继续执行
             pass

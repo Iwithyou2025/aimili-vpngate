@@ -6287,6 +6287,51 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
 
             return msg
 
+        # 正式节点已经恢复，但当前没有运行中的热备用时，
+        # 如果存在服务重启前的旧热备用标记，必须先重建旧热备用。
+        # 重建成功后，本轮不再拉取 VPNGate，也不再寻找新热备用。
+        if (
+                not force
+                and HOT_BACKUP_ENABLED
+                and has_confirmed_active_vpn_connection()
+                and not hot_backup_ready()
+        ):
+            with lock:
+                current_nodes = read_json(NODES_FILE, [])
+                target_country = get_active_country_code(current_nodes, active_openvpn_node_id)
+
+            stale_nodes = [
+                n for n in current_nodes
+                if str(n.get("hot_backup_status") or "") == "stale_after_restart"
+            ]
+
+            if stale_nodes:
+                stale_ids = [str(n.get("id") or "") for n in stale_nodes]
+
+                log_hot_backup(
+                    f"正式节点已恢复，发现 {len(stale_nodes)} 个重启前旧热备用标记，"
+                    f"先尝试重建旧热备用，不拉取新节点: {stale_ids}"
+                )
+
+                if build_hot_backup_from_nodes(stale_nodes, target_country):
+                    msg = "正式节点正常，旧热备用已重建成功，本轮跳过 VPNGate 拉取和新节点检测"
+
+                    finish_maintenance_progress(msg)
+
+                    set_state(
+                        is_connecting=False,
+                        last_check_at=time.time(),
+                        last_check_message=msg,
+                        active_openvpn_node_id=resolve_active_openvpn_node_id(),
+                    )
+
+                    return msg
+
+                log_hot_backup(
+                    "重启前旧热备用重建失败，继续进入正常维护流程寻找新热备用",
+                    "WARNING",
+                )
+
         try:
             set_maintenance_progress(
                 "正在拉取最新的免费 VPN 节点列表...",
@@ -6328,6 +6373,19 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                 merged.append(active_node)
                 seen_ids.add(active_node["id"])
 
+            # 关键修复：
+            # 服务重启前的旧热备用节点，即使本次 VPNGate 拉取列表里没有出现，
+            # 也必须保留下来，否则 stale_after_restart 标记会被新列表覆盖掉。
+            for old_node in current_nodes:
+                old_id = str(old_node.get("id") or "")
+                if not old_id or old_id in seen_ids:
+                    continue
+
+                if str(old_node.get("hot_backup_status") or "") == "stale_after_restart":
+                    merged.append(old_node)
+                    seen_ids.add(old_id)
+                    log_hot_backup(f"保留重启前旧热备用标记节点: {old_id}")
+
             for cand in candidates:
                 if cand["id"] not in seen_ids:
                     cached_node = existing_by_id.get(str(cand["id"]))
@@ -6365,7 +6423,18 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                     if str(n.get("hot_backup_status") or "") == "stale_after_restart"
                 ])
 
-                if stale_count <= 0:
+                if stale_count > 0:
+                    stale_ids = [
+                        str(n.get("id") or "")
+                        for n in current_nodes
+                        if str(n.get("hot_backup_status") or "") == "stale_after_restart"
+                    ]
+
+                    log_hot_backup(
+                        f"当前没有运行中的热备用，但发现 {stale_count} 个重启前旧热备用标记，"
+                        f"将先尝试重建旧热备用: {stale_ids}"
+                    )
+                else:
                     log_hot_backup("当前没有运行中的热备用，本轮维护开始串行构建 1 个新热备用节点")
 
                 build_hot_backup_from_nodes(current_nodes, target_country)
