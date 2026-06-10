@@ -329,7 +329,7 @@ IPIPSEEK_SCRIPT_PATH = Path(
     )
 )
 
-# Selenium 查询比较慢，超时时间不要太短
+# Playwright 查询比较慢，超时时间不要太短
 IPIPSEEK_PRECHECK_TIMEOUT_SECONDS = int(
     os.environ.get("IPIPSEEK_PRECHECK_TIMEOUT_SECONDS", "150")
 )
@@ -4800,8 +4800,40 @@ def apply_ipipseek_vpn_precheck(
         if not script_path.exists():
             raise RuntimeError(f"catch_ip_result.py 不存在: {script_path}")
 
+        runner_code = r"""
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+script_path = Path(sys.argv[1]).resolve()
+ip = sys.argv[2].strip()
+
+spec = importlib.util.spec_from_file_location("catch_ip_result_runtime", script_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"无法加载 catch_ip_result.py: {script_path}")
+
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+get_ip_vpn_status = getattr(module, "get_ip_vpn_status", None)
+if not callable(get_ip_vpn_status):
+    raise RuntimeError("catch_ip_result.py 中没有可调用的 get_ip_vpn_status")
+
+result = get_ip_vpn_status(ip)
+
+if isinstance(result, dict):
+    data = result
+else:
+    data = {ip: result}
+
+print(json.dumps(data, ensure_ascii=False))
+"""
+
         cmd = [
             python_bin,
+            "-c",
+            runner_code,
             str(script_path),
             ip,
         ]
@@ -4823,7 +4855,7 @@ def apply_ipipseek_vpn_precheck(
 
         if res.returncode != 0:
             raise RuntimeError(
-                f"catch_ip_result.py 执行失败: returncode={res.returncode}, "
+                f"get_ip_vpn_status 执行失败: returncode={res.returncode}, "
                 f"stderr={stderr[:300]}"
             )
 

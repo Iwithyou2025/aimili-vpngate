@@ -1,254 +1,316 @@
+import time
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    Error as PlaywrightError,
+    expect,
+)
 import json
 import sys
-import time
 from typing import Optional
 
-def create_driver(headless: bool = True):
-    options = Options()
 
-    if headless:
-        # Chrome 新版无头模式
-        options.add_argument("--headless=new")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--proxy-server=http://127.0.0.1:7928")
-    else:
-        options.add_argument("--start-maximized")
-
-    # 提高无头模式稳定性
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
-
-    return webdriver.Chrome(options=options)
-
-
-def query_ip(driver, ip: str, timeout: int = 30):
-    wait = WebDriverWait(driver, timeout)
-
-    # 1. 等输入框可点击
-    ip_input = wait.until(
-        EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "input[placeholder='请输入查询IP']")
-        )
-    )
-
-    # 2. 清空原来的 IP
-    ip_input.click()
-    ip_input.send_keys(Keys.CONTROL, "a")
-    ip_input.send_keys(Keys.BACKSPACE)
-
-    # 3. 输入新的 IP
-    ip_input.send_keys(ip)
-
-    # 4. 等待输入框 value 真的变成目标 IP
-    wait.until(
-        lambda d: d.execute_script(
-            "return arguments[0].value;", ip_input
-        ) == ip
-    )
-
-    # 5. 找输入框后面的查询按钮
-    search_btn = wait.until(
-        lambda d: d.execute_script("""
-            const input = document.querySelector("input[placeholder='请输入查询IP']");
-            if (!input) return null;
-
-            const all = Array.from(
-                document.querySelectorAll("input[placeholder='请输入查询IP'], button")
-            );
-
-            const inputIndex = all.indexOf(input);
-            if (inputIndex === -1) return null;
-
-            const buttons = all.slice(inputIndex + 1).filter(el => {
-                return el.tagName === "BUTTON"
-                    && el.offsetWidth > 0
-                    && el.offsetHeight > 0
-                    && !el.disabled;
-            });
-
-            for (const btn of buttons) {
-                if ((btn.innerText || "").includes("查询")) {
-                    return btn;
-                }
-            }
-
-            return buttons[0] || null;
-        """)
-    )
-
-    # 6. 点击查询按钮
-    driver.execute_script("arguments[0].click();", search_btn)
-
-
-def wait_result_ip(driver, ip: str, timeout: int = 60) -> bool:
+def create_page(
+        playwright,
+        headless: bool = True,
+        proxy_server: Optional[str] = "http://127.0.0.1:7928",
+):
     """
-    等待页面结果区域出现当前查询的 IP。
-    目的：避免第二次查询时直接读到上一次的 vpn 结果。
+    创建 Chromium 浏览器、上下文和页面。
+
+    参数说明：
+        headless:
+            True  = 无头模式
+            False = 有头模式
+
+        proxy_server:
+            代理地址。
+            只要传入代理地址，无头和有头模式都会走代理。
+            如果不想走代理，传 None。
     """
-    wait = WebDriverWait(driver, timeout)
 
-    js = r"""
-    const targetIp = arguments[0];
+    # 1. Chromium 启动参数
+    launch_args = [
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+    ]
 
-    const elements = Array.from(document.querySelectorAll("span, div, p"));
+    # 2. 有头模式下最大化窗口
+    if not headless:
+        launch_args.append("--start-maximized")
 
-    for (const el of elements) {
-        const rect = el.getBoundingClientRect();
-        const text = (el.innerText || el.textContent || "").trim();
-
-        if (
-            text &&
-            text.includes(targetIp) &&
-            rect.width > 0 &&
-            rect.height > 0
-        ) {
-            return true;
+    # 3. 设置代理
+    #    这里不再判断 headless，所以无头/有头都会走代理
+    proxy = None
+    if proxy_server:
+        proxy = {
+            "server": proxy_server,
         }
-    }
 
-    return false;
+    # 4. 启动浏览器
+    browser = playwright.chromium.launch(
+        headless=headless,
+        args=launch_args,
+        proxy=proxy,
+    )
+
+    # 5. 创建浏览器上下文
+    #    无头模式指定窗口尺寸
+    #    有头模式使用真实窗口尺寸
+    if headless:
+        context = browser.new_context(
+            viewport={
+                "width": 1920,
+                "height": 1080,
+            }
+        )
+    else:
+        context = browser.new_context(
+            no_viewport=True,
+        )
+
+    # 6. 创建页面
+    page = context.new_page()
+
+    return browser, context, page
+
+
+def query_ip(page, ip: str):
+    """
+    在 ipipseek 页面输入 IP，并点击查询按钮。
+
+    注意：
+        这里不使用 time.sleep。
+        输入框 fill、按钮 click 都使用 Playwright 自带自动等待。
+    """
+
+    # 1. 找到 IP 输入框
+    #    Playwright 会自动等待元素可用。
+    ip_input = page.get_by_placeholder("请输入查询IP").first
+
+    # 2. 清空并输入 IP
+    #    fill() 本身会自动等待输入框可见、可编辑。
+    ip_input.fill(ip)
+
+    # 3. 确认输入框的值已经变成目标 IP
+    #    expect 会自动等待，不需要手动 sleep。
+    expect(ip_input).to_have_value(ip)
+
+    # 4. 找到页面中第一个 text=查询 的元素
+    #    按你的要求，直接使用 text=查询。
+    search_btn = page.locator("text=查询").first
+
+    # 5. 点击查询
+    #    click() 本身会自动等待元素可见、稳定、可点击。
+    search_btn.click()
+
+
+def wait_result_ip(page, ip: str) -> bool:
+    """
+    等待页面中出现当前查询的 IP。
+
+    这个等待不是人工 sleep，而是 Playwright 的自动等待。
+    如果页面一直没有出现当前 IP，说明查询结果没有正常出来。
     """
 
     try:
-        return wait.until(
-            lambda d: d.execute_script(js, ip)
-        )
-    except TimeoutException:
+        # 等待页面上出现当前 IP 文本
+        # 如果结果区更新成功，页面应该能看到这个 IP。
+        expect(
+            page.get_by_text(ip).first
+        ).to_be_visible()
+
+        return True
+
+    except Exception:
         return False
 
 
-def get_field_value(driver, key: str, timeout: int = 60) -> Optional[str]:
-    """
-    根据左侧字段名，例如 vpn，获取同一行右侧的值，例如 true。
-    找不到返回 None。
-    """
-    wait = WebDriverWait(driver, timeout)
-
-    js = r"""
-    const targetKey = arguments[0];
-
-    const clean = (s) => {
-        return (s || "")
-            .replace(/[“”]/g, '"')
-            .replace(/\s+/g, "")
-            .replace(/[":：,，]/g, "")
-            .toLowerCase();
-    };
-
-    const key = clean(targetKey);
-    const spans = Array.from(document.querySelectorAll("span"));
-
-    let keySpan = null;
-
-    for (const span of spans) {
-        const text = clean(span.innerText || span.textContent);
-
-        if (text === key) {
-            keySpan = span;
-            break;
-        }
-    }
-
-    if (!keySpan) {
-        return null;
-    }
-
-    const keyRect = keySpan.getBoundingClientRect();
-
-    const candidates = spans
-        .filter(span => span !== keySpan)
-        .map(span => {
-            const rect = span.getBoundingClientRect();
-            const text = (span.innerText || span.textContent || "").trim();
-
-            return {
-                span,
-                text,
-                rect,
-                topDiff: Math.abs(rect.top - keyRect.top),
-                leftDiff: rect.left - keyRect.right
-            };
-        })
-        .filter(item => {
-            return item.text
-                && item.rect.width > 0
-                && item.rect.height > 0
-                && item.leftDiff > 0
-                && item.topDiff < 12;
-        })
-        .sort((a, b) => a.leftDiff - b.leftDiff);
-
-    if (candidates.length > 0) {
-        return candidates[0].text;
-    }
-
-    return null;
-    """
-
-    try:
-        return wait.until(
-            lambda d: d.execute_script(js, key)
-        )
-    except TimeoutException:
-        return None
 
 
 def parse_bool(value: Optional[str]) -> Optional[bool]:
     """
     把页面里的 true / false 字符串转成 Python 布尔值。
-    其他情况返回 None。
+
+    返回：
+        "true"  -> True
+        "false" -> False
+        其他    -> None
     """
+
+    # 1. 没有读取到字段值
     if value is None:
         return None
 
+    # 2. 统一转成小写
     value = value.strip().lower()
 
+    # 3. 转换 true
     if value == "true":
         return True
 
+    # 4. 转换 false
     if value == "false":
         return False
 
+    # 5. 其他内容都视为未知
     return None
 
-
-def query_single_ip_vpn(
-        driver,
-        ip: str,
-        query_timeout: int = 30,
-        result_timeout: int = 60,
-) -> Optional[bool]:
+def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
     """
     查询单个 IP 的 vpn 字段。
-    返回：
+
+    成功时返回：
         True
         False
-        None
-    """
-    try:
-        query_ip(driver, ip, timeout=query_timeout)
 
-        # 先等当前 IP 的结果出来，避免读到旧结果
-        if not wait_result_ip(driver, ip, timeout=result_timeout):
+    失败时返回：
+        None
+
+    规则：
+        1. 查询前，先等待输入框自动出现一个 IP，最多等 15 秒
+        2. 如果 15 秒内出现了，就清空，再输入自己的 IP
+        3. 如果超过 15 秒还没出现，也直接输入自己的 IP
+        4. 查询后，15 秒内找到 true / false，立即 return
+        5. 查询后超过 15 秒没有明确结果，return None
+    """
+
+    try:
+        ip = ip.strip()
+        if not ip:
             return None
 
-        vpn_value = get_field_value(driver, "vpn", timeout=result_timeout)
+        # 1. 找到 IP 输入框
+        ip_input = page.get_by_placeholder("请输入查询IP").first
 
-        return parse_bool(vpn_value)
+        # 2. 查询前：等待输入框里自动出现一个 IP
+        wait_input_deadline = time.monotonic() + 15
 
-    except TimeoutException:
+        while time.monotonic() < wait_input_deadline:
+            try:
+                old_value = ip_input.input_value(timeout=500).strip()
+
+                # 输入框里已经出现了一个 IP
+                # 这个 IP 不是我们要查的，所以后面会清掉
+                if old_value:
+                    break
+
+            except Exception:
+                pass
+
+            page.wait_for_timeout(200)
+
+        # 3. 无论上面是否等到旧 IP，这里都清空并输入自己的 IP
+        ip_input.fill("")
+        ip_input.fill(ip)
+
+        # 4. 确认输入框的值已经变成目标 IP
+        expect(ip_input).to_have_value(ip)
+
+        # 5. 点击查询按钮
+        search_btn = page.locator("text=查询").first
+        search_btn.click()
+
+        # 6. 查询后：等待结果，最多 15 秒
+        result_deadline = time.monotonic() + 15
+
+        while time.monotonic() < result_deadline:
+
+            # 6.1 先确认页面中是否已经出现当前 IP
+            #     避免读取到上一次查询的旧结果
+            try:
+                if not page.get_by_text(ip).first.is_visible():
+                    page.wait_for_timeout(200)
+                    continue
+            except Exception:
+                page.wait_for_timeout(200)
+                continue
+
+            # 6.2 当前 IP 已出现，再读取 vpn 字段
+            vpn_value = page.evaluate(
+                r"""
+                (targetKey) => {
+                    const clean = (s) => {
+                        return (s || "")
+                            .replace(/[“”]/g, '"')
+                            .replace(/\s+/g, "")
+                            .replace(/[":：,，]/g, "")
+                            .toLowerCase();
+                    };
+
+                    const key = clean(targetKey);
+                    const spans = Array.from(document.querySelectorAll("span"));
+
+                    let keySpan = null;
+
+                    // 1. 找到字段名所在的 span，例如 vpn
+                    for (const span of spans) {
+                        const text = clean(span.innerText || span.textContent);
+
+                        if (text === key) {
+                            keySpan = span;
+                            break;
+                        }
+                    }
+
+                    if (!keySpan) {
+                        return null;
+                    }
+
+                    const keyRect = keySpan.getBoundingClientRect();
+
+                    // 2. 找同一行、位于字段名右侧的候选值
+                    const candidates = spans
+                        .filter(span => span !== keySpan)
+                        .map(span => {
+                            const rect = span.getBoundingClientRect();
+                            const text = (span.innerText || span.textContent || "").trim();
+
+                            return {
+                                text,
+                                rect,
+                                topDiff: Math.abs(rect.top - keyRect.top),
+                                leftDiff: rect.left - keyRect.right
+                            };
+                        })
+                        .filter(item => {
+                            return item.text
+                                && item.rect.width > 0
+                                && item.rect.height > 0
+                                && item.leftDiff > 0
+                                && item.topDiff < 12;
+                        })
+                        .sort((a, b) => a.leftDiff - b.leftDiff);
+
+                    if (candidates.length > 0) {
+                        return candidates[0].text;
+                    }
+
+                    return null;
+                }
+                """,
+                "vpn",
+            )
+
+            # 6.3 转成 Python 布尔值
+            result = parse_bool(vpn_value)
+
+            # 6.4 只有明确读到 True / False，才立即返回
+            if result is True or result is False:
+                return result
+
+            # 6.5 还没有结果，继续等一小段时间
+            page.wait_for_timeout(200)
+
+        # 7. 超过 15 秒仍然没有 true / false
         return None
 
-    except WebDriverException:
+    except PlaywrightTimeoutError:
+        return None
+
+    except PlaywrightError:
         return None
 
     except Exception:
@@ -258,81 +320,146 @@ def query_single_ip_vpn(
 def get_ip_vpn_status(
         *ips: str,
         headless: bool = True,
-        page_load_timeout: int = 30,
-        query_timeout: int = 30,
-        result_timeout: int = 60,
+        proxy_server: Optional[str] = "http://127.0.0.1:9999",
 ) -> str:
     """
-    批量查询 ipipseek 的 vpn 字段。
+    批量查询多个 IP 的 vpn 状态。
 
-    调用示例：
-        result = get_ip_vpn_status("60.113.181.155", "138.64.65.244")
-
-    返回 JSON 字符串：
+    返回格式固定为：
         {
             "60.113.181.155": true,
-            "138.64.65.244": false,
-            "1.1.1.1": null
+            "39.111.179.36": null
         }
 
     注意：
-        Python 内部是 True / False / None
-        JSON 输出后是 true / false / null
+        不再返回 error/message/failed_ip。
+        任意异常都只会让对应 IP 返回 null。
     """
 
+    # 1. 初始化结果字典
     results = {}
-    driver = None
 
     try:
-        driver = create_driver(headless=headless)
-        driver.set_page_load_timeout(page_load_timeout)
+        with sync_playwright() as playwright:
+            browser = None
+            context = None
 
-        try:
-            driver.get("https://www.ipipseek.com/")
-            driver.refresh()
-            driver.refresh()
-        except TimeoutException:
-            # 页面加载超时，但 DOM 可能已经可用，所以继续执行
-            pass
+            try:
+                # 2. 创建浏览器页面
+                browser, context, page = create_page(
+                    playwright,
+                    headless=headless,
+                    proxy_server=proxy_server,
+                )
 
-        for ip in ips:
+                # 3. 打开 ipipseek 页面
+                #    goto 会使用 Playwright 默认导航超时时间。
+                #    这里不手动 sleep。
+                page.goto(
+                    "https://www.ipipseek.com/",
+                    wait_until="domcontentloaded"
+                )
 
-            results[ip] = query_single_ip_vpn(
-                driver,
-                ip,
-                query_timeout=query_timeout,
-                result_timeout=result_timeout,
-            )
-            time.sleep(5)
 
-        return json.dumps(results, ensure_ascii=False)
+
+                # 4. 逐个查询 IP
+                #    改成 while 循环：
+                #    - 每个 IP 查询到 True / False 后就结束该 IP
+                #    - 每个 IP 超过 30 秒仍然不是 True / False，则返回 None
+                #    - 所有 IP 都结束后，退出 while
+
+                pending_ips = []
+
+                # 4.1 先整理 IP，并初始化结果
+                for ip in ips:
+                    ip = ip.strip()
+
+                    if not ip:
+                        continue
+
+                    results[ip] = None
+                    pending_ips.append(ip)
+
+                # 4.2 给每个 IP 设置独立 30 秒超时时间
+                deadlines = {
+                    ip: time.monotonic() + 30
+                    for ip in pending_ips
+                }
+
+                # 4.3 while 循环查询
+                while pending_ips:
+                    for ip in pending_ips[:]:
+                        # 当前 IP 已超过 30 秒，还没得到 True / False
+                        if time.monotonic() >= deadlines[ip]:
+                            results[ip] = None
+                            pending_ips.remove(ip)
+                            continue
+
+                        # 查询当前 IP
+                        value = query_single_ip_vpn(
+                            page,
+                            ip,
+                        )
+
+                        # 只有明确返回 True / False，才认为该 IP 查询结束
+                        if value is True or value is False:
+                            results[ip] = value
+                            pending_ips.remove(ip)
+                            continue
+
+                    # 如果所有 IP 都已经返回 True / False，或者超时结束，就退出 while
+                    if not pending_ips:
+                        break
+
+
+                # 5. 返回 JSON 字符串
+                return json.dumps(
+                    results,
+                    ensure_ascii=False,
+                )
+
+            finally:
+                # 6. 关闭上下文
+                if context is not None:
+                    context.close()
+
+                # 7. 关闭浏览器
+                if browser is not None:
+                    browser.close()
 
     except Exception:
-        # 如果浏览器初始化或打开页面失败，所有 IP 返回 None
+        # 8. 如果浏览器启动、页面打开等全局流程失败
+        #    所有 IP 统一返回 None。
         for ip in ips:
-            results[ip] = None
+            ip = ip.strip()
+            if ip:
+                results[ip] = None
 
-        return json.dumps(results, ensure_ascii=False)
-
-    finally:
-        if driver is not None:
-            driver.quit()
-
+        return json.dumps(
+            results,
+            ensure_ascii=False,
+        )
 
 
 if __name__ == "__main__":
+    # 1. 从命令行读取 IP 参数
     ips = [
         arg.strip()
         for arg in sys.argv[1:]
         if arg.strip()
     ]
 
-    # 不传参数时保留原来的测试 IP，方便你手动调试
+    # 2. 如果命令行没有传 IP，就使用默认测试 IP
     if not ips:
         ips = [
-            "60.113.181.155",
-            "138.64.65.244",
+            "60.113.181.155"
         ]
 
-    result = get_ip_vpn_status(*ips)
+    # 3. 执行查询
+    result = get_ip_vpn_status(
+        *ips,
+        proxy_server="http://127.0.0.1:9999",
+    )
+
+    # 4. 输出最终 JSON
     print(result)

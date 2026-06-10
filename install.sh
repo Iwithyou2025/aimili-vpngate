@@ -230,80 +230,10 @@ ensure_openvpn_ca_bundle() {
     rm -rf "$tmp_dir"
 }
 
-ensure_chrome_selenium_env() {
-    echo -e "\n${YELLOW}正在初始化 Chrome / ChromeDriver / Selenium 环境...${PLAIN}"
+ensure_playwright_env() {
+    echo -e "\n${YELLOW}正在初始化 Playwright 环境...${PLAIN}"
 
-    # 1. 安装 Google Chrome
-    if ! command -v google-chrome >/dev/null 2>&1; then
-        echo -e "  -> 未检测到 Google Chrome，正在安装..."
-
-        wget -O /tmp/google-chrome-stable_current_amd64.deb \
-          https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-
-        apt-get install -y /tmp/google-chrome-stable_current_amd64.deb
-
-        rm -f /tmp/google-chrome-stable_current_amd64.deb
-    else
-        echo -e "${GREEN}  -> Google Chrome 已安装，跳过。${PLAIN}"
-    fi
-
-    if ! command -v google-chrome >/dev/null 2>&1; then
-        echo -e "${RED}  -> 错误: Google Chrome 安装失败。${PLAIN}"
-        exit 1
-    fi
-
-    CHROME_VERSION="$(google-chrome --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)"
-    CHROME_MAJOR="$(echo "$CHROME_VERSION" | cut -d. -f1)"
-
-    echo -e "  -> 当前 Chrome 版本: ${GREEN}${CHROME_VERSION}${PLAIN}"
-    echo -e "  -> 当前 Chrome 主版本: ${GREEN}${CHROME_MAJOR}${PLAIN}"
-
-    # 2. 安装匹配版本 ChromeDriver
-    NEED_INSTALL_DRIVER=1
-
-    if command -v chromedriver >/dev/null 2>&1; then
-        DRIVER_VERSION="$(chromedriver --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
-        DRIVER_MAJOR="$(echo "$DRIVER_VERSION" | cut -d. -f1)"
-
-        if [ "$DRIVER_MAJOR" = "$CHROME_MAJOR" ]; then
-            NEED_INSTALL_DRIVER=0
-            echo -e "${GREEN}  -> ChromeDriver 已安装且版本匹配: ${DRIVER_VERSION}${PLAIN}"
-        else
-            echo -e "${YELLOW}  -> ChromeDriver 版本不匹配，将重新安装。当前: ${DRIVER_VERSION:-未知}${PLAIN}"
-        fi
-    fi
-
-    if [ "$NEED_INSTALL_DRIVER" = "1" ]; then
-        echo -e "  -> 正在下载匹配 Chrome ${CHROME_MAJOR} 的 ChromeDriver..."
-
-        DRIVER_VERSION="$(curl -fsSL --connect-timeout 10 --max-time 30 \
-          "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}")"
-
-        if [ -z "$DRIVER_VERSION" ]; then
-            echo -e "${RED}  -> 错误: 无法获取 ChromeDriver 版本号。${PLAIN}"
-            exit 1
-        fi
-
-        DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
-
-        TMP_DRIVER_DIR="$(mktemp -d)"
-
-        curl -fsSL --connect-timeout 10 --max-time 60 \
-          "$DRIVER_URL" \
-          -o "${TMP_DRIVER_DIR}/chromedriver.zip"
-
-        unzip -q "${TMP_DRIVER_DIR}/chromedriver.zip" -d "$TMP_DRIVER_DIR"
-
-        install -m 0755 \
-          "${TMP_DRIVER_DIR}/chromedriver-linux64/chromedriver" \
-          /usr/local/bin/chromedriver
-
-        rm -rf "$TMP_DRIVER_DIR"
-
-        echo -e "${GREEN}  -> ChromeDriver 安装完成: $(chromedriver --version)${PLAIN}"
-    fi
-
-    # 3. 创建 Python 虚拟环境
+    # 1. 创建 Python 虚拟环境
     VENV_DIR="${INSTALL_DIR}/.venv"
 
     if [ ! -d "$VENV_DIR" ]; then
@@ -313,21 +243,24 @@ ensure_chrome_selenium_env() {
         echo -e "${GREEN}  -> Python 虚拟环境已存在，跳过创建。${PLAIN}"
     fi
 
-    # 4. 安装 Selenium
-    echo -e "  -> 正在安装 / 更新 pip 与 Selenium..."
+    # 2. 安装 / 更新 pip 与 Playwright
+    echo -e "  -> 正在安装 / 更新 pip 与 Playwright..."
 
     "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel
-    "${VENV_DIR}/bin/python" -m pip install -U selenium
+    "${VENV_DIR}/bin/python" -m pip install -U playwright
 
-    # 5. 如果项目有 requirements.txt，也一起安装
+    # 3. 安装 Playwright Chromium 及系统依赖
+    echo -e "  -> 正在安装 / 更新 Playwright Chromium 浏览器及系统依赖..."
+    "${VENV_DIR}/bin/python" -m playwright install --with-deps chromium
+
+    # 4. 如果项目有 requirements.txt，也一起安装
     if [ -f "${INSTALL_DIR}/requirements.txt" ]; then
         echo -e "  -> 检测到 requirements.txt，正在安装项目依赖..."
         "${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt"
     fi
 
-    echo -e "${GREEN} -> Chrome / ChromeDriver / Selenium 环境初始化完成。${PLAIN}"
+    echo -e "${GREEN} -> Playwright 环境初始化完成。${PLAIN}"
 }
-
 
 
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
@@ -374,8 +307,8 @@ echo -e "${GREEN} -> 代理认证配置已准备完成: ${ENV_FILE}${PLAIN}"
 echo -e "\n${YELLOW}正在初始化 OpenVPN CA bundle...${PLAIN}"
 ensure_openvpn_ca_bundle
 
-echo -e "\n${YELLOW}正在初始化 Chrome / Selenium 环境...${PLAIN}"
-ensure_chrome_selenium_env
+echo -e "\n${YELLOW}正在初始化 Playwright 环境...${PLAIN}"
+ensure_playwright_env
 
 echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
 
