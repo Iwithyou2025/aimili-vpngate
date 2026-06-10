@@ -252,10 +252,11 @@ ensure_playwright_env() {
 
     mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
 
-    # 关键：
-    # 安装浏览器时指定固定目录；
-    # systemd 运行时也会通过 /etc/default/aimilivpn 读取同一个目录。
+    # 官方文档要求：
+    # 安装浏览器时设置 PLAYWRIGHT_BROWSERS_PATH；
+    # 运行脚本时也要设置同一个 PLAYWRIGHT_BROWSERS_PATH。
     export PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR"
+    export PLAYWRIGHT_SKIP_BROWSER_GC=1
 
     if [ ! -d "$VENV_DIR" ]; then
         echo -e "  -> 正在创建 Python 虚拟环境: ${VENV_DIR}"
@@ -268,8 +269,40 @@ ensure_playwright_env() {
     "${VENV_DIR}/bin/python" -m pip install -U pip setuptools wheel
     "${VENV_DIR}/bin/python" -m pip install -U playwright
 
-    echo -e "  -> 正在安装 / 更新 Playwright Chromium 浏览器及系统依赖..."
-    "${VENV_DIR}/bin/python" -m playwright install --with-deps chromium
+    echo -e "  -> 正在安装 Playwright Chromium 常用系统依赖..."
+    # 不使用 playwright install --with-deps chromium。
+    # 原因：--with-deps 内部会执行 apt-get update，
+    # 只要服务器里任意第三方源坏了，比如 Caddy 源缺 GPG key，
+    # 就会导致整个 Playwright 安装失败。
+    apt-get install -y --no-install-recommends \
+      libasound2 \
+      libatk-bridge2.0-0 \
+      libatk1.0-0 \
+      libcairo2 \
+      libcups2 \
+      libdbus-1-3 \
+      libdrm2 \
+      libgbm1 \
+      libglib2.0-0 \
+      libgtk-3-0 \
+      libnspr4 \
+      libnss3 \
+      libpango-1.0-0 \
+      libx11-6 \
+      libxcb1 \
+      libxcomposite1 \
+      libxdamage1 \
+      libxext6 \
+      libxfixes3 \
+      libxkbcommon0 \
+      libxrandr2 \
+      libxshmfence1 \
+      xdg-utils \
+      fonts-liberation \
+      fonts-noto-color-emoji
+
+    echo -e "  -> 正在安装 / 更新 Playwright Chromium 浏览器..."
+    "${VENV_DIR}/bin/python" -m playwright install chromium
 
     if [ -f "${INSTALL_DIR}/requirements.txt" ]; then
         echo -e "  -> 检测到 requirements.txt，正在安装项目依赖..."
@@ -289,6 +322,9 @@ with sync_playwright() as p:
             "--disable-gpu",
         ],
     )
+    page = browser.new_page()
+    page.goto("data:text/html,<title>ok</title>", wait_until="domcontentloaded")
+    assert page.title() == "ok"
     browser.close()
 
 print("Playwright Chromium 启动验证通过")
