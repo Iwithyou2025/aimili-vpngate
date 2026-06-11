@@ -3020,15 +3020,8 @@ def is_hard_quality_fail_reason(reason: str) -> bool:
         "IPPure 系数",
         "ipapi.is 风险命中",
         "ipipseek VPN 预检命中",
+        "出口 IP 命中历史 hard fail",
         "IP 类型不是住宅",
-        "IP 来源不是原生",
-        "人机流量比",
-        "Scamalytics 风险分",
-        "无法读取 Scamalytics",
-        "Scamalytics 检测异常",
-        "ProxyCheck 检测为代理",
-        "无法读取 ProxyCheck",
-        "ProxyCheck 检测异常",
     ]
 
     return any(keyword in reason for keyword in hard_keywords)
@@ -3122,6 +3115,89 @@ HOT_BACKUP_CACHE_FIELDS = {
     "hot_backup_updated_at",
     "hot_backup_stale_after_restart_at",
 }
+
+def find_hard_fail_node_by_exit_ip(exit_ip: str, now: float | None = None) -> dict[str, Any] | None:
+    """
+    根据 IPPure 返回的真实出口 IP，查找 nodes.json 中是否已有相同 exit_ip 的 hard fail 记录。
+
+    用途：
+    - 不再只按 node_id 拦截；
+    - 如果不同节点最终出口 IP 相同，也可以复用历史 hard fail 结果；
+    - 避免重复进入 ipipseek / speedtest。
+    """
+    exit_ip = str(exit_ip or "").strip()
+
+    if not exit_ip:
+        return None
+
+    now = now or time.time()
+
+    try:
+        nodes = read_json(NODES_FILE, [])
+    except Exception:
+        return None
+
+    if not isinstance(nodes, list):
+        return None
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        node_exit_ip = str(node.get("exit_ip") or "").strip()
+
+        if node_exit_ip != exit_ip:
+            continue
+
+        quality_fail_until = float(node.get("quality_fail_until") or 0)
+
+        if quality_fail_until <= now:
+            continue
+
+        if str(node.get("quality_fail_type") or "") == "hard":
+            return node
+
+    return None
+
+def apply_exit_ip_hard_fail_cache(
+        quality_info: dict[str, Any],
+        log_prefix: str = "质量检测",
+) -> bool:
+    """
+    IPPure 已经拿到真实出口 IP 后，检查这个出口 IP 是否历史命中过 hard fail。
+
+    如果命中：
+    - 当前节点不再执行 ipipseek；
+    - 当前节点后续会被 update_node_quality 写成 hard fail；
+    - 返回 True。
+    """
+    exit_ip = str(quality_info.get("ip") or "").strip()
+
+    if not exit_ip:
+        return False
+
+    hit = find_hard_fail_node_by_exit_ip(exit_ip)
+
+    if not hit:
+        return False
+
+    source_node_id = str(hit.get("id") or "")
+    source_reason = str(hit.get("quality_fail_reason") or "")
+    source_until = float(hit.get("quality_fail_until") or 0)
+
+    quality_info["exit_ip_hard_fail_cached"] = True
+    quality_info["exit_ip_hard_fail_source_node_id"] = source_node_id
+    quality_info["exit_ip_hard_fail_reason"] = source_reason
+    quality_info["exit_ip_hard_fail_until"] = source_until
+
+    msg = (
+        f"[{log_prefix}] 出口 IP 命中历史 hard fail 缓存："
+        f"exit_ip={exit_ip}, source_node={source_node_id}, reason={source_reason}"
+    )
+    print(msg, flush=True)
+    log_to_json("WARNING", "Quality", msg)
+
+    return True
 
 def log_hot_backup(message: str, level: str = "INFO") -> None:
     print(f"[热备用] {message}", flush=True)
@@ -5152,12 +5228,13 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
     print(f"[热备用] 开始通过 {iface} 进行 IPPure 预检", flush=True)
     quality_info = fetch_ippure_quality_via_interface(iface)
 
-    apply_ipipseek_vpn_precheck(
-        quality_info,
-        log_prefix="热备用",
-        proxy_server_url=f"http://127.0.0.1:{HOT_BACKUP_PROXY_PORT}",
-    )
 
+    if not apply_exit_ip_hard_fail_cache(quality_info, log_prefix="热备用"):
+        apply_ipipseek_vpn_precheck(
+            quality_info,
+            log_prefix="热备用",
+            proxy_server_url=f"http://127.0.0.1:{HOT_BACKUP_PROXY_PORT}",
+        )
 
     # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
     quality_info.update({
@@ -5808,6 +5885,11 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
     if not info.get("has_ippure_score"):
         return False, "无法读取 IPPure 风控系数"
 
+    if info.get("exit_ip_hard_fail_cached") is True:
+        return (
+            False,
+            f"出口 IP 命中历史 hard fail：{info.get('exit_ip_hard_fail_reason') or '未知原因'}"
+        )
     # ipipseek VPN 预检
     # 只有 True 才拦截；False / None 都放行
     if QUALITY_CHECK_IPIPSEEK_VPN_ENABLED and info.get("ipipseek_vpn") is True:
@@ -5986,8 +6068,9 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
     # 1. 先做原有 IPPure 检测，拿到实际出口 IP
     quality_info = fetch_ippure_quality()
 
-    # 新增：ipipseek VPN 预检
-    apply_ipipseek_vpn_precheck(quality_info, log_prefix="质量检测")
+    # 如果真实出口 IP 已经命中过历史 hard fail，就不再重复跑 ipipseek
+    if not apply_exit_ip_hard_fail_cache(quality_info, log_prefix="质量检测"):
+        apply_ipipseek_vpn_precheck(quality_info, log_prefix="质量检测")
 
     # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
     # 写默认值是为了清理旧状态，避免前端继续显示上一次的旧结果。
