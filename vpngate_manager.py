@@ -11470,12 +11470,22 @@ def main() -> None:
     init_state_on_start()
     reset_stale_hot_backup_after_restart()
 
+    # 启动正式出口代理：7928
+    # 这个端口给外部用户 / 正式出口使用，出口接口由 active_proxy_interface 动态控制。
+    threading.Thread(
+        target=proxy_server.start_proxy_server,
+        args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT),
+        daemon=True,
+    ).start()
+
+    # 启动热备用专用代理：7777
+    # 只给本机 ipipseek / Playwright 预检使用，出口接口由 hot_backup_proxy_interface 动态控制。
     threading.Thread(
         target=proxy_server.start_proxy_server,
         args=(HOT_BACKUP_PROXY_HOST, HOT_BACKUP_PROXY_PORT, "__hot_backup__"),
         daemon=True,
     ).start()
-    
+
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
     gateway_ready = False
@@ -11483,7 +11493,8 @@ def main() -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.settimeout(0.5)
-            s.connect((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT))
+            check_host = "127.0.0.1" if LOCAL_PROXY_HOST in ("0.0.0.0", "", "::") else LOCAL_PROXY_HOST
+            s.connect((check_host, LOCAL_PROXY_PORT))
             gateway_ready = True
             break
         except Exception:
@@ -11512,6 +11523,7 @@ def main() -> None:
     
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    print(f"HotBackup Proxy: http://{HOT_BACKUP_PROXY_HOST}:{HOT_BACKUP_PROXY_PORT}", flush=True)
     ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
