@@ -14,7 +14,7 @@ from typing import Optional
 def create_page(
         playwright,
         headless: bool = True,
-        proxy_server: Optional[str] = "http://127.0.0.1:7928",
+        proxy_server: Optional[str] = "http://127.0.0.1:7777",
 ):
     """
     创建 Chromium 浏览器、上下文和页面。
@@ -320,7 +320,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
 def get_ip_vpn_status(
         *ips: str,
         headless: bool = True,
-        proxy_server: Optional[str] = "http://127.0.0.1:7928",
+        proxy_server: Optional[str] = "http://127.0.0.1:7777",
 ) -> str:
     """
     批量查询多个 IP 的 vpn 状态。
@@ -460,7 +460,7 @@ if __name__ == "__main__":
     # 3. 执行查询
     result = get_ip_vpn_status(
         *ips,
-        proxy_server="http://127.0.0.1:7928",
+        proxy_server="http://127.0.0.1:7777",
     )
 
     # 4. 输出最终 JSON

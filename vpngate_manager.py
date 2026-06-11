@@ -68,6 +68,10 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
+
+HOT_BACKUP_PROXY_HOST = os.environ.get("HOT_BACKUP_PROXY_HOST", "127.0.0.1")
+HOT_BACKUP_PROXY_PORT = int(os.environ.get("HOT_BACKUP_PROXY_PORT", "7777"))
+
 PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() in {
     "1",
     "true",
@@ -143,7 +147,7 @@ QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
 QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
 QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
 
-# 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 7 天
+# 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 365 天
 QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
     os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(365 * 24 * 60 * 60))
 )
@@ -3427,6 +3431,14 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
 
                 setup_policy_routing(dev_name)
 
+                try:
+                    proxy_server.set_hot_backup_interface(dev_name)
+                    log_hot_backup(
+                        f"热备用专用代理 127.0.0.1:{HOT_BACKUP_PROXY_PORT} 出口接口已设置为 {dev_name}"
+                    )
+                except Exception as exc:
+                    log_hot_backup(f"设置热备用专用代理出口接口失败: {exc}", "WARNING")
+
                 health = check_interface_health(dev_name)
                 if not health.get("ok"):
                     reason = health.get("error", "热备用出口检测失败")
@@ -4812,16 +4824,16 @@ def parse_ipipseek_stdout(stdout: str) -> dict[str, Any]:
 def apply_ipipseek_vpn_precheck(
         quality_info: dict[str, Any],
         log_prefix: str = "质量检测",
+        proxy_server_url: str | None = None,
 ) -> None:
     """
     ipipseek VPN 预检。
 
-    不在主进程里 import catch_ip_result.py，
-    而是通过 subprocess 调用：
+    而是通过 subprocess 加载 catch_ip_result.py，
+    然后调用其中的 get_ip_vpn_status(ip, proxy_server=proxy_url)。
 
-        /opt/aimilivpn/.venv/bin/python /opt/aimilivpn/catch_ip_result.py <ip>
-
-    这样可以完全复用你手动测试成功的 venv 环境。
+    这样可以完全复用你手动测试成功的 venv 环境，
+    同时允许正式节点走 7928，热备用节点走 7777。
     """
     quality_info["ipipseek_vpn_checked"] = False
     quality_info["ipipseek_vpn"] = None
@@ -4840,6 +4852,7 @@ def apply_ipipseek_vpn_precheck(
         return
 
     try:
+        proxy_url = proxy_server_url or f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
         python_bin = IPIPSEEK_PYTHON_BIN
 
         # 如果配置的 venv python 不存在，则退回当前 Python
@@ -4858,7 +4871,8 @@ import sys
 from pathlib import Path
 
 script_path = Path(sys.argv[1]).resolve()
-ips = [x.strip() for x in sys.argv[2:] if x.strip()]
+proxy_url = sys.argv[2].strip()
+ips = [x.strip() for x in sys.argv[3:] if x.strip()]
 
 spec = importlib.util.spec_from_file_location("catch_ip_result_runtime", script_path)
 if spec is None or spec.loader is None:
@@ -4873,7 +4887,7 @@ if not callable(get_ip_vpn_status):
 
 result = get_ip_vpn_status(
     *ips,
-    proxy_server="http://127.0.0.1:7928",
+    proxy_server=proxy_url,
 )
 
 if isinstance(result, str):
@@ -4891,6 +4905,7 @@ print(json.dumps(data, ensure_ascii=False))
             "-c",
             runner_code,
             str(script_path),
+            proxy_url,
             ip,
         ]
 
@@ -5137,7 +5152,11 @@ def probe_quality_via_interface(interface: str, include_speed: bool = True) -> t
     print(f"[热备用] 开始通过 {iface} 进行 IPPure 预检", flush=True)
     quality_info = fetch_ippure_quality_via_interface(iface)
 
-    apply_ipipseek_vpn_precheck(quality_info, log_prefix="热备用")
+    apply_ipipseek_vpn_precheck(
+        quality_info,
+        log_prefix="热备用",
+        proxy_server_url=f"http://127.0.0.1:{HOT_BACKUP_PROXY_PORT}",
+    )
 
 
     # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
@@ -11453,7 +11472,7 @@ def main() -> None:
 
     threading.Thread(
         target=proxy_server.start_proxy_server,
-        args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT),
+        args=(HOT_BACKUP_PROXY_HOST, HOT_BACKUP_PROXY_PORT, "__hot_backup__"),
         daemon=True,
     ).start()
     

@@ -33,7 +33,8 @@ PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
 
 ACTIVE_PROXY_INTERFACE = os.environ.get("ACTIVE_PROXY_INTERFACE", "tun0")
 ACTIVE_PROXY_INTERFACE_LOCK = threading.RLock()
-
+HOT_BACKUP_PROXY_INTERFACE = os.environ.get("HOT_BACKUP_PROXY_INTERFACE", "tun1")
+HOT_BACKUP_PROXY_INTERFACE_LOCK = threading.RLock()
 
 def set_active_interface(interface: str) -> None:
     global ACTIVE_PROXY_INTERFACE
@@ -51,6 +52,32 @@ def get_active_interface() -> str:
     with ACTIVE_PROXY_INTERFACE_LOCK:
         return str(ACTIVE_PROXY_INTERFACE or "tun0")
 
+def set_hot_backup_interface(interface: str) -> None:
+    global HOT_BACKUP_PROXY_INTERFACE
+    iface = str(interface or "tun1").strip() or "tun1"
+
+    with HOT_BACKUP_PROXY_INTERFACE_LOCK:
+        if HOT_BACKUP_PROXY_INTERFACE != iface:
+            print(
+                f"[热备代理出口] 7777 代理出口接口切换: {HOT_BACKUP_PROXY_INTERFACE} -> {iface}",
+                flush=True,
+            )
+        HOT_BACKUP_PROXY_INTERFACE = iface
+
+
+def get_hot_backup_interface() -> str:
+    with HOT_BACKUP_PROXY_INTERFACE_LOCK:
+        return str(HOT_BACKUP_PROXY_INTERFACE or "tun1")
+
+
+def resolve_proxy_interface(interface: str | None = None) -> str:
+    if interface == "__hot_backup__":
+        return get_hot_backup_interface()
+
+    if interface:
+        return str(interface or "").strip() or "tun0"
+
+    return get_active_interface()
 
 def bind_socket_to_interface(sock: socket.socket, interface: str) -> None:
     iface = str(interface or "tun0").strip() or "tun0"
@@ -304,7 +331,7 @@ def resolve_dns_over_interface(host: str, interface: str, dns_server: str = "8.8
 
 def create_connection(address: tuple[str, int], timeout: float = 20, interface: str | None = None) -> socket.socket:
     host, port = address
-    iface = str(interface or get_active_interface() or "tun0").strip() or "tun0"
+    iface = resolve_proxy_interface(interface)
 
     resolved_ip = resolve_dns_over_interface(host, iface)
     if resolved_ip:
@@ -341,7 +368,12 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes, address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> None:
+def socks5_client(
+        client: socket.socket,
+        first_byte: bytes,
+        address: tuple[str, int] | tuple[str, int, int, int] | None = None,
+        proxy_interface: str | None = None,
+) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -365,7 +397,7 @@ def socks5_client(client: socket.socket, first_byte: bytes, address: tuple[str, 
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, interface=proxy_interface)
         except Exception:
             try:
                 client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -388,7 +420,12 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes, address: tuple[str, int] | tuple[str, int, int, int] | None = None) -> None:
+def http_client(
+        client: socket.socket,
+        first_byte: bytes,
+        address: tuple[str, int] | tuple[str, int, int, int] | None = None,
+        proxy_interface: str | None = None,
+) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -402,7 +439,7 @@ def http_client(client: socket.socket, first_byte: bytes, address: tuple[str, in
         if method.upper() == "CONNECT":
             host, _, port_text = target.partition(":")
             port = parse_int(port_text) or 443
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, interface=proxy_interface)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest:
                 upstream.sendall(rest)
@@ -425,7 +462,7 @@ def http_client(client: socket.socket, first_byte: bytes, address: tuple[str, in
             ))
         ]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((parsed.hostname, port), timeout=20)
+        upstream = create_connection((parsed.hostname, port), timeout=20, interface=proxy_interface)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception:
@@ -438,21 +475,21 @@ def http_client(client: socket.socket, first_byte: bytes, address: tuple[str, in
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], proxy_interface: str | None = None) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first, address)
+            socks5_client(client, first, address, proxy_interface=proxy_interface)
         else:
-            http_client(client, first, address)
+            http_client(client, first, address, proxy_interface=proxy_interface)
     except Exception:
         try:
             client.close()
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def start_proxy_server(host: str, port: int, proxy_interface: str | None = None) -> None:
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -465,7 +502,11 @@ def start_proxy_server(host: str, port: int) -> None:
                 flush=True
             )
         auth_status = "auth enabled, loopback bypass" if PROXY_AUTH_ENABLED else "no auth"
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port} ({auth_status})", flush=True)
+        iface_desc = proxy_interface or "active"
+        print(
+            f"HTTP/SOCKS5 proxy listening on {host}:{port} ({auth_status}, interface={iface_desc})",
+            flush=True,
+        )
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
         return
@@ -475,7 +516,7 @@ def start_proxy_server(host: str, port: int) -> None:
             client, address = server.accept()
             threading.Thread(
                 target=proxy_client,
-                args=(client, address),
+                args=(client, address, proxy_interface),
                 daemon=True,
             ).start()
 
