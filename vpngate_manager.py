@@ -145,7 +145,7 @@ QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECOND
 
 # 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 7 天
 QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
-    os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(7 * 24 * 60 * 60))
+    os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(365 * 24 * 60 * 60))
 )
 
 # 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
@@ -3015,6 +3015,7 @@ def is_hard_quality_fail_reason(reason: str) -> bool:
     hard_keywords = [
         "IPPure 系数",
         "ipapi.is 风险命中",
+        "ipipseek VPN 预检命中",
         "IP 类型不是住宅",
         "IP 来源不是原生",
         "人机流量比",
@@ -3265,6 +3266,7 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
     now = time.time()
 
     candidates = []
+    skipped_quality_count = 0
     for node in nodes:
         if not node or node.get("active"):
             continue
@@ -3273,6 +3275,7 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
         if node.get("id") == hot_backup_node_id:
             continue
         if should_skip_candidate_by_quality(node, now):
+            skipped_quality_count += 1
             continue
         if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and get_country_code(node) != target_country:
             continue
@@ -3284,7 +3287,10 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
                 continue
 
         candidates.append(node)
-
+    if skipped_quality_count > 0:
+        log_hot_backup(
+            f"构建热备用候选时跳过 {skipped_quality_count} 个 IPPure 超标或 hard fail 冷却期节点"
+        )
     candidates.sort(
         key=lambda n: (
             # 服务重启前的热备用节点优先重新尝试
