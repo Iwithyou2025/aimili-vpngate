@@ -2251,6 +2251,10 @@ def text_contains_any(value: Any, keywords: list[str]) -> bool:
 
 
 def fetch_api_text() -> str:
+    msg = "正请求gatevpn节点中心"
+    print(f"[Main] {msg}", flush=True)
+    log_to_json("INFO", "Main", msg)
+
     request = urllib.request.Request(
         API_URL,
         headers={
