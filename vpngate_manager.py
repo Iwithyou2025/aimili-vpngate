@@ -3361,8 +3361,12 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
         if should_skip_candidate_by_quality(node, now):
             skipped_quality_count += 1
             continue
-        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and get_country_code(node) != target_country:
-            continue
+        node_country = get_country_code(node)
+
+        # 热备用构建：优先同国家；同国家没有合适节点时，允许 PREFERRED_COUNTRIES 兜底
+        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and node_country != target_country:
+            if node_country not in PREFERRED_COUNTRIES:
+                continue
 
         # OpenVPN 探测失败的节点不要立刻反复尝试，但过了 INVALID_BACKOFF_SECONDS 可以再试。
         if node.get("probe_status") == "unavailable":
@@ -3375,10 +3379,26 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
         log_hot_backup(
             f"构建热备用候选时跳过 {skipped_quality_count} 个 IPPure 超标或 hard fail 冷却期节点"
         )
+
+    def hot_backup_country_priority(n: dict[str, Any]) -> int:
+        code = get_country_code(n)
+
+        # 当前正式节点国家永远最优先
+        if target_country and code == target_country:
+            return 0
+
+        # 其次按 PREFERRED_COUNTRIES 顺序兜底：JP, KR, US, CA
+        try:
+            return 1 + PREFERRED_COUNTRIES.index(code)
+        except ValueError:
+            return len(PREFERRED_COUNTRIES) + 1
     candidates.sort(
         key=lambda n: (
             # 服务重启前的热备用节点优先重新尝试
             0 if str(n.get("hot_backup_status") or "") == "stale_after_restart" else 1,
+
+            # 热备用优先同国家，失败后按 PREFERRED_COUNTRIES 顺序兜底
+            hot_backup_country_priority(n),
 
             # 其次优先质量检测通过的节点
             0 if n.get("quality_status") == "passed" else 1,
@@ -3929,7 +3949,7 @@ def try_promote_stale_hot_backup_before_fetch(reason: str = "") -> bool:
 
     log_hot_backup(
         f"当前没有正式节点，发现 {len(stale_nodes)} 个重启前旧热备用，"
-        f"跳过 VPNGate 拉取和 30 节点并发检测，优先重建并提升: {stale_ids}"
+        f"跳过 VPNGate 拉取和  节点并发检测，优先重建并提升: {stale_ids}"
     )
 
     set_state(
