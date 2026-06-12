@@ -229,7 +229,7 @@ HOT_BACKUP_TARGET_COUNT = max(1, int(os.environ.get("HOT_BACKUP_TARGET_COUNT", "
 HOT_BACKUP_HEALTH_INTERVAL_SECONDS = max(5, int(os.environ.get("HOT_BACKUP_HEALTH_INTERVAL_SECONDS", "30")))
 HOT_BACKUP_HEALTH_MAX_AGE_SECONDS = max(10, int(os.environ.get("HOT_BACKUP_HEALTH_MAX_AGE_SECONDS", "45")))
 HOT_BACKUP_WAIT_CHECK_SECONDS = max(2, int(os.environ.get("HOT_BACKUP_WAIT_CHECK_SECONDS", "5")))
-HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "30")))
+HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "100")))
 
 # 自动切换策略：默认只在当前活动节点的同一国家内切换
 AUTO_SWITCH_SAME_COUNTRY_ONLY = env_flag("AUTO_SWITCH_SAME_COUNTRY_ONLY", "1")
@@ -3363,9 +3363,10 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
             continue
         node_country = get_country_code(node)
 
-        # 热备用构建：优先同国家；同国家没有合适节点时，允许 PREFERRED_COUNTRIES 兜底
-        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and node_country != target_country:
-            if node_country not in PREFERRED_COUNTRIES:
+        # 热备用构建：不再只限制当前正式国家；
+        # 按 PREFERRED_COUNTRIES 允许候选，例如 JP -> KR -> US -> CA。
+        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
+            if node_country != target_country and node_country not in PREFERRED_COUNTRIES:
                 continue
 
         # OpenVPN 探测失败的节点不要立刻反复尝试，但过了 INVALID_BACKOFF_SECONDS 可以再试。
@@ -3380,25 +3381,16 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
             f"构建热备用候选时跳过 {skipped_quality_count} 个 IPPure 超标或 hard fail 冷却期节点"
         )
 
-    def hot_backup_country_priority(n: dict[str, Any]) -> int:
-        code = get_country_code(n)
 
-        # 当前正式节点国家永远最优先
-        if target_country and code == target_country:
-            return 0
-
-        # 其次按 PREFERRED_COUNTRIES 顺序兜底：JP, KR, US, CA
-        try:
-            return 1 + PREFERRED_COUNTRIES.index(code)
-        except ValueError:
-            return len(PREFERRED_COUNTRIES) + 1
     candidates.sort(
         key=lambda n: (
+
             # 服务重启前的热备用节点优先重新尝试
             0 if str(n.get("hot_backup_status") or "") == "stale_after_restart" else 1,
 
-            # 热备用优先同国家，失败后按 PREFERRED_COUNTRIES 顺序兜底
-            hot_backup_country_priority(n),
+            # 热备用构建按 PREFERRED_COUNTRIES 顺序：JP -> KR -> US -> CA
+            0 if get_country_code(n) in PREFERRED_COUNTRIES else 1,
+            preferred_country_priority(n),
 
             # 其次优先质量检测通过的节点
             0 if n.get("quality_status") == "passed" else 1,
