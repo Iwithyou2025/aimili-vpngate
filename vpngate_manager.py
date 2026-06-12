@@ -3351,6 +3351,12 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
 
     candidates = []
     skipped_quality_count = 0
+    skipped_ipipseek_direct_count = 0
+    skipped_exit_ip_cache_count = 0
+    skipped_ipapi_risk_count = 0
+    skipped_ippure_scamalytics_count = 0
+    skipped_quality_other_count = 0
+
     for node in nodes:
         if not node or node.get("active"):
             continue
@@ -3360,6 +3366,25 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
             continue
         if should_skip_candidate_by_quality(node, now):
             skipped_quality_count += 1
+
+            quality_fail_reason = str(node.get("quality_fail_reason") or "")
+            ippure_score = parse_int(node.get("ippure_score"))
+
+            if "出口 IP 命中历史 hard fail" in quality_fail_reason:
+                skipped_exit_ip_cache_count += 1
+            elif "ipipseek VPN 预检命中：vpn=true" in quality_fail_reason:
+                skipped_ipipseek_direct_count += 1
+            elif "ipapi.is 风险命中" in quality_fail_reason:
+                skipped_ipapi_risk_count += 1
+            elif (
+                    "IPPure 系数" in quality_fail_reason
+                    or "Scamalytics 风险分" in quality_fail_reason
+                    or ippure_score > QUALITY_MAX_FRAUD_SCORE
+            ):
+                skipped_ippure_scamalytics_count += 1
+            else:
+                skipped_quality_other_count += 1
+
             continue
         node_country = get_country_code(node)
 
@@ -3377,10 +3402,20 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
 
         candidates.append(node)
     if skipped_quality_count > 0:
-        log_hot_backup(
-            f"构建热备用候选时跳过 {skipped_quality_count} 个 IPPure 超标或 hard fail 冷却期节点"
+        detail = (
+            f"ipipseek直接命中: {skipped_ipipseek_direct_count}，"
+            f"出口IP缓存命中: {skipped_exit_ip_cache_count}，"
+            f"ipapi风险: {skipped_ipapi_risk_count}，"
+            f"IPPure/Scamalytics超标: {skipped_ippure_scamalytics_count}"
         )
 
+        if skipped_quality_other_count > 0:
+            detail += f"，其他: {skipped_quality_other_count}"
+
+        log_hot_backup(
+            f"构建热备用候选时跳过 {skipped_quality_count} 个质量冷却节点"
+            f"【详情如下：{detail}】"
+        )
 
     candidates.sort(
         key=lambda n: (
