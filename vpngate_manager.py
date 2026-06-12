@@ -147,9 +147,9 @@ QUALITY_REQUIRE_NATIVE = env_flag("QUALITY_REQUIRE_NATIVE", "1")
 QUALITY_MIN_HUMAN_RATIO = int(os.environ.get("QUALITY_MIN_HUMAN_RATIO", "0"))
 QUALITY_FAIL_COOLDOWN_SECONDS = int(os.environ.get("QUALITY_FAIL_COOLDOWN_SECONDS", str(30 * 60)))
 
-# 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 365 天
+# 硬质量失败冷却：IPPure 超标 / ipapi 风险命中 / 非住宅 / 非原生等，默认 1000 天
 QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
-    os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(365 * 24 * 60 * 60))
+    os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(1000 * 24 * 60 * 60))
 )
 
 # 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
@@ -218,7 +218,7 @@ PROXY_HEALTH_CONFIRM_TIMES = max(
 
 PROXY_HEALTH_CONFIRM_DELAY_SECONDS = max(
     0,
-    int(os.environ.get("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", "2"))
+    int(os.environ.get("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", "6"))
 )
 
 # 热备用：只维护 1 个已拨号、已质检、已测速通过的备用 OpenVPN 出口。
