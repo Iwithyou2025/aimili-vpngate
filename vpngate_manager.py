@@ -229,7 +229,7 @@ HOT_BACKUP_TARGET_COUNT = max(1, int(os.environ.get("HOT_BACKUP_TARGET_COUNT", "
 HOT_BACKUP_HEALTH_INTERVAL_SECONDS = max(5, int(os.environ.get("HOT_BACKUP_HEALTH_INTERVAL_SECONDS", "30")))
 HOT_BACKUP_HEALTH_MAX_AGE_SECONDS = max(10, int(os.environ.get("HOT_BACKUP_HEALTH_MAX_AGE_SECONDS", "45")))
 HOT_BACKUP_WAIT_CHECK_SECONDS = max(2, int(os.environ.get("HOT_BACKUP_WAIT_CHECK_SECONDS", "5")))
-HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "20")))
+HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "30")))
 
 # 自动切换策略：默认只在当前活动节点的同一国家内切换
 AUTO_SWITCH_SAME_COUNTRY_ONLY = env_flag("AUTO_SWITCH_SAME_COUNTRY_ONLY", "1")
@@ -8800,9 +8800,18 @@ const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
 
-function formatSpeedTestResult(state) {
-  const checked = !!state.proxy_speed_test_checked;
-  const speed = Number(state.proxy_download_speed_mib_s || 0);
+function formatSpeedTestResult(state, activeNode) {
+  let checked = false;
+  let speed = 0;
+
+  // 优先使用当前活动节点自己的测速结果，避免显示旧 state 里的测速值
+  if (activeNode) {
+    checked = !!activeNode.speed_test_checked;
+    speed = Number(activeNode.download_speed_mib_s || 0);
+  } else {
+    checked = !!state.proxy_speed_test_checked;
+    speed = Number(state.proxy_download_speed_mib_s || 0);
+  }
 
   if (!checked || !Number.isFinite(speed) || speed <= 0) {
     return "";
@@ -9783,11 +9792,15 @@ function stableSortNodes() {
 }
 
 function render(){
-  const connectionStage = state.connection_stage || (state.connected_at ? "connected" : (state.is_connecting ? "connecting" : "idle"));
-  const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = connectionStage === "connected" ? nodes.find(n => n.active || n.id === activeNodeId) : null;
-  const pendingNode = activeNodeId ? nodes.find(n => n.id === activeNodeId) : null;
-  const isQualityChecking = connectionStage === "quality_checking";
+    const connectionStage = state.connection_stage || (state.connected_at ? "connected" : (state.is_connecting ? "connecting" : "idle"));
+    const activeNodeId = state.active_openvpn_node_id;
+    const isQualityChecking = connectionStage === "quality_checking";
+    
+    const activeNode = (!state.is_connecting && !isQualityChecking)
+      ? (nodes.find(n => n.active || (activeNodeId && n.id === activeNodeId)) || null)
+      : null;
+    
+    const pendingNode = activeNodeId ? nodes.find(n => n.id === activeNodeId) : null;
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
@@ -9945,7 +9958,7 @@ function render(){
          </span>`;
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
-const speedTestText = formatSpeedTestResult(state);
+const speedTestText = formatSpeedTestResult(state, activeNode);
 const speedTestInfo = speedTestText
   ? ` | <span class="speed-test-info">${esc(speedTestText)}</span>`
   : "";
@@ -11115,8 +11128,8 @@ class Handler(BaseHTTPRequestHandler):
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_json(NODES_FILE, [])
             current_state = read_json(STATE_FILE, {})
-            is_confirmed_connected = current_state.get("connection_stage") == "connected"
-            resolved_active_id = resolve_active_openvpn_node_id() if is_confirmed_connected else ""
+
+            resolved_active_id = resolve_active_openvpn_node_id()
 
             active_node = next(
                 (n for n in nodes if resolved_active_id and n.get("id") == resolved_active_id),
