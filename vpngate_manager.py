@@ -6641,6 +6641,30 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                     merged.append(merge_cached_quality_fields(cand, cached_node))
                     seen_ids.add(cand["id"])
 
+
+            # 保留仍在冷却期的质量失败节点，避免 VPNGate 本轮未返回时被新列表冲掉。
+            # 同 ID 已在 candidates 中出现的节点，上面已经通过 merge_cached_quality_fields 保留了质量缓存；
+            # 这里只补充“本轮未出现但仍在冷却期”的旧节点。
+            now = time.time()
+            preserved_quality_cooldown_count = 0
+
+            for old_node in current_nodes:
+                old_id = str(old_node.get("id") or "")
+                if not old_id or old_id in seen_ids:
+                    continue
+
+                if should_skip_candidate_by_quality(old_node, now):
+                    merged.append(old_node)
+                    seen_ids.add(old_id)
+                    preserved_quality_cooldown_count += 1
+
+            if preserved_quality_cooldown_count > 0:
+                log_to_json(
+                    "INFO",
+                    "Main",
+                    f"保留 {preserved_quality_cooldown_count} 个仍在冷却期的质量失败节点，避免被本轮 VPNGate 列表冲掉"
+                )
+
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
