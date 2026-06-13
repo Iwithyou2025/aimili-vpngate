@@ -3423,7 +3423,7 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
             # 服务重启前的热备用节点优先重新尝试
             0 if str(n.get("hot_backup_status") or "") == "stale_after_restart" else 1,
 
-            # 热备用构建按 PREFERRED_COUNTRIES 顺序：JP -> KR -> US -> CA
+            # 候选已限制为当前正式节点同国家；这里保留原排序作为同国家内的稳定排序兜底
             0 if get_country_code(n) in PREFERRED_COUNTRIES else 1,
             preferred_country_priority(n),
 
@@ -6676,6 +6676,7 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
             # 这里只补充“本轮未出现但仍在冷却期”的旧节点。
             now = time.time()
             preserved_quality_cooldown_count = 0
+            preserved_quality_cooldown_ids: set[str] = set()
 
             for old_node in current_nodes:
                 old_id = str(old_node.get("id") or "")
@@ -6685,17 +6686,29 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
                 if should_skip_candidate_by_quality(old_node, now):
                     merged.append(old_node)
                     seen_ids.add(old_id)
+                    preserved_quality_cooldown_ids.add(old_id)
                     preserved_quality_cooldown_count += 1
 
             if preserved_quality_cooldown_count > 0:
-                log_to_json(
-                    "INFO",
-                    "Main",
-                    f"保留 {preserved_quality_cooldown_count} 个仍在冷却期的质量失败节点，避免被本轮 VPNGate 列表冲掉"
-                )
+                msg = f"保留 {preserved_quality_cooldown_count} 个仍在冷却期的质量失败节点，避免被本轮 VPNGate 列表冲掉"
+                print(f"[Main] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
 
             if len(merged) > 1000:
-                merged = merged[:1000]
+                preserved_nodes = [
+                    n for n in merged
+                    if str(n.get("id") or "") in preserved_quality_cooldown_ids
+                ]
+
+                normal_nodes = [
+                    n for n in merged
+                    if str(n.get("id") or "") not in preserved_quality_cooldown_ids
+                ]
+
+                preserved_nodes = preserved_nodes[:1000]
+                normal_limit = max(0, 1000 - len(preserved_nodes))
+
+                merged = normal_nodes[:normal_limit] + preserved_nodes
                 
             for n in merged:
                 config_path = Path(n["config_file"])
