@@ -53,7 +53,7 @@ PREFERRED_COUNTRIES = [
     if c.strip()
 ]
 
-PREFERRED_COUNTRY_MIN_NODES = int(os.environ.get("PREFERRED_COUNTRY_MIN_NODES", "10"))
+PREFERRED_COUNTRY_MIN_NODES = int(os.environ.get("PREFERRED_COUNTRY_MIN_NODES", "100"))
 PREFERRED_COUNTRY_SCAN_ROWS = int(os.environ.get("PREFERRED_COUNTRY_SCAN_ROWS", "2000"))
 TEST_BATCH_SIZE = int(os.environ.get("TEST_BATCH_SIZE", "30"))
 
@@ -3388,11 +3388,11 @@ def choose_hot_backup_candidates(nodes: list[dict[str, Any]], country_code: str 
             continue
         node_country = get_country_code(node)
 
-        # 热备用构建：不再只限制当前正式国家；
-        # 按 PREFERRED_COUNTRIES 允许候选，例如 JP -> KR -> US -> CA。
-        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country:
-            if node_country != target_country and node_country not in PREFERRED_COUNTRIES:
-                continue
+
+
+        # 热备用构建：只允许和当前正式节点同国家
+        if AUTO_SWITCH_SAME_COUNTRY_ONLY and target_country and node_country != target_country:
+            continue
 
         # OpenVPN 探测失败的节点不要立刻反复尝试，但过了 INVALID_BACKOFF_SECONDS 可以再试。
         if node.get("probe_status") == "unavailable":
@@ -6396,8 +6396,37 @@ def connect_node_with_quality_check(node_id: str) -> str:
     )
 
     if HOT_BACKUP_ENABLED:
-        log_hot_backup("正式节点已连接，触发后台补齐 1 个热备用节点")
-        start_hot_backup_builder_thread()
+        new_country = get_country_code(node).upper() if node else ""
+
+        snap = hot_backup_snapshot()
+        backup_id = str(snap.get("node_id") or "")
+        backup_country = ""
+
+        if backup_id:
+            try:
+                current_nodes = read_json(NODES_FILE, [])
+                backup_node = next(
+                    (item for item in current_nodes if str(item.get("id") or "") == backup_id),
+                    None,
+                )
+                if backup_node:
+                    backup_country = get_country_code(backup_node).upper()
+            except Exception:
+                backup_country = ""
+
+        # 如果当前已有热备，但热备国家和新正式节点国家不一致，先清理旧热备。
+        # 例如：原来正式 JP + 热备 JP，手动切到 KR 后，旧 JP 热备必须清理并重建 KR 热备。
+        if backup_id and new_country and backup_country != new_country:
+            cleanup_hot_backup(
+                f"正式节点已切换到 {new_country}，清理不同国家热备用 "
+                f"{backup_id}({backup_country or '未知国家'})，准备重建同国家热备"
+            )
+
+        log_hot_backup(
+            f"正式节点已连接，触发后台补齐 1 个"
+            f"{new_country or '同国家'}热备用节点"
+        )
+        start_hot_backup_builder_thread(new_country)
 
     return result
 
