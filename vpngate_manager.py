@@ -226,7 +226,18 @@ PROXY_HEALTH_CONFIRM_DELAY_SECONDS = max(
 HOT_BACKUP_ENABLED = env_flag("HOT_BACKUP_ENABLED", "1")
 HOT_BACKUP_DEV = os.environ.get("HOT_BACKUP_DEV", "tun1")
 HOT_BACKUP_TARGET_COUNT = max(1, int(os.environ.get("HOT_BACKUP_TARGET_COUNT", "1")))
-HOT_BACKUP_HEALTH_INTERVAL_SECONDS = max(5, int(os.environ.get("HOT_BACKUP_HEALTH_INTERVAL_SECONDS", "30")))
+HOT_BACKUP_HEALTH_INTERVAL_SECONDS = max(5, int(os.environ.get("HOT_BACKUP_HEALTH_INTERVAL_SECONDS", "15")))
+
+HOT_BACKUP_HEALTH_CONFIRM_TIMES = max(
+    1,
+    int(os.environ.get("HOT_BACKUP_HEALTH_CONFIRM_TIMES", "1"))
+)
+
+HOT_BACKUP_HEALTH_CONFIRM_DELAY_SECONDS = max(
+    0,
+    int(os.environ.get("HOT_BACKUP_HEALTH_CONFIRM_DELAY_SECONDS", "2"))
+)
+
 HOT_BACKUP_HEALTH_MAX_AGE_SECONDS = max(10, int(os.environ.get("HOT_BACKUP_HEALTH_MAX_AGE_SECONDS", "45")))
 HOT_BACKUP_WAIT_CHECK_SECONDS = max(2, int(os.environ.get("HOT_BACKUP_WAIT_CHECK_SECONDS", "5")))
 HOT_BACKUP_BUILD_MAX_ATTEMPTS = max(1, int(os.environ.get("HOT_BACKUP_BUILD_MAX_ATTEMPTS", "100")))
@@ -3835,7 +3846,33 @@ def check_hot_backup_health(force: bool = False) -> bool:
         return True
 
     reason = res.get("error", "热备用健康检测失败")
-    cleanup_hot_backup(f"热备用 {node_id} 失效: {reason}")
+
+    log_hot_backup(
+        f"热备用 {node_id} 检测失败，开始追加确认: {reason}",
+        "WARNING",
+    )
+
+    final_reason = reason
+
+    for i in range(HOT_BACKUP_HEALTH_CONFIRM_TIMES):
+        if HOT_BACKUP_HEALTH_CONFIRM_DELAY_SECONDS > 0:
+            time.sleep(HOT_BACKUP_HEALTH_CONFIRM_DELAY_SECONDS)
+
+        confirm_res = check_interface_health(dev)
+
+        if confirm_res.get("ok"):
+            log_hot_backup(
+                f"热备用 {node_id} 追加检测已恢复正常，判定为临时抖动，不清理热备"
+            )
+            return True
+
+        final_reason = confirm_res.get("error", final_reason)
+        log_hot_backup(
+            f"热备用 {node_id} 第 {i + 1}/{HOT_BACKUP_HEALTH_CONFIRM_TIMES} 次确认失败: {final_reason}",
+            "WARNING",
+        )
+
+    cleanup_hot_backup(f"热备用 {node_id} 失效: {final_reason}")
     start_hot_backup_builder_thread()
     return False
 
