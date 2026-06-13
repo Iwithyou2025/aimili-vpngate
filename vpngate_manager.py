@@ -3913,6 +3913,13 @@ def promote_hot_backup_if_available(reason: str = "", quiet: bool = False) -> bo
     set_hot_backup_state("empty", hot_backup_message="热备用已提升为正式出口")
 
     finish_node_switch_duration(f"热备用 {node_id} 已提升为正式出口")
+
+    # 热备用提升为正式出口也属于自动切换，计入每日自动更换节点次数
+    record_auto_node_switch(
+        node_id,
+        f"热备用提升为正式出口: {reason}",
+    )
+
     begin_or_continue_ip_uptime(
         exit_ip,
         node_id=node_id,
