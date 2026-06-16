@@ -3925,10 +3925,11 @@ def build_kr_extra_proxy_once() -> bool:
     if process is not None and process.poll() is None and node_id:
         health = check_interface_health(KR_EXTRA_DEV)
         if health.get("ok"):
-            log_kr_extra(
+            msg = (
                 f"KR 旁路代理正常: node={node_id}, dev={KR_EXTRA_DEV}, "
                 f"ip={health.get('ip')}, latency={health.get('latency_ms')}ms"
             )
+            log_to_json("INFO", "KRExtra", msg)
             return True
 
     cleanup_kr_extra_proxy("KR 旁路代理不存在或检测失败，准备重新构建")
