@@ -3996,6 +3996,14 @@ def build_kr_extra_proxy_once() -> bool:
                     "kr_extra_proxy_message": message,
                     "kr_extra_proxy_updated_at": time.time(),
                 })
+            
+                if is_kr_stale_after_restart:
+                    log_kr_extra(
+                        f"旧 KR 旁路节点 {node_id} 重建失败: {message}，"
+                        f"开始尝试其他 {KR_EXTRA_COUNTRY} 候选节点",
+                        "WARNING",
+                    )
+
                 continue
 
             setup_policy_routing(KR_EXTRA_DEV)
