@@ -88,6 +88,11 @@ KR_EXTRA_MAX_ATTEMPTS = max(
     int(os.environ.get("KR_EXTRA_MAX_ATTEMPTS", "20"))
 )
 
+KR_EXTRA_HEALTH_INTERVAL_SECONDS = max(
+    5,
+    int(os.environ.get("KR_EXTRA_HEALTH_INTERVAL_SECONDS", "30"))
+)
+
 PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() in {
     "1",
     "true",
@@ -3855,6 +3860,12 @@ def choose_kr_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, An
 
     candidates.sort(
         key=lambda n: (
+            # 服务重启后，优先尝试上次已经成功建立过 KR 旁路代理的节点
+            0 if n.get("kr_extra_proxy_status") == "ready" else 1,
+
+            # 如果有多个历史 ready 节点，优先最近成功的那个
+            -parse_float(n.get("kr_extra_proxy_updated_at")),
+
             0 if n.get("quality_status") == "passed" else 1,
             parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
             -parse_int(n.get("human_ratio")),
@@ -4045,11 +4056,15 @@ def kr_extra_proxy_loop() -> None:
 
     while True:
         try:
-            build_kr_extra_proxy_once()
+            ok = build_kr_extra_proxy_once()
         except Exception as exc:
             log_kr_extra(f"KR 旁路代理线程异常: {exc}", "ERROR")
+            ok = False
 
-        time.sleep(KR_EXTRA_INTERVAL_SECONDS)
+        if ok:
+            time.sleep(KR_EXTRA_HEALTH_INTERVAL_SECONDS)
+        else:
+            time.sleep(KR_EXTRA_INTERVAL_SECONDS)
 
 def check_hot_backup_health(force: bool = False) -> bool:
     global hot_backup_info, last_hot_backup_health_check_at
