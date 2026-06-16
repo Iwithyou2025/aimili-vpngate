@@ -1,3 +1,4 @@
+import os
 import time
 
 from playwright.sync_api import (
@@ -14,7 +15,7 @@ from typing import Optional
 def create_page(
         playwright,
         headless: bool = True,
-        proxy_server: Optional[str] = "http://127.0.0.1:7777",
+        proxy_server: Optional[str] = None,
 ):
     """
     创建 Chromium 浏览器、上下文和页面。
@@ -43,6 +44,9 @@ def create_page(
 
     # 3. 设置代理
     #    这里不再判断 headless，所以无头/有头都会走代理
+
+
+    proxy_server = resolve_proxy_server(proxy_server)
     proxy = None
     if proxy_server:
         proxy = {
@@ -128,6 +132,28 @@ def wait_result_ip(page, ip: str) -> bool:
         return False
 
 
+def resolve_proxy_server(proxy_server: Optional[str] = None) -> Optional[str]:
+    """
+    解析 Playwright 浏览器代理地址。
+
+    优先级：
+        1. 函数显式传入 proxy_server
+        2. 环境变量 IPIPSEEK_PROXY_SERVER
+        3. 默认 http://127.0.0.1:7777
+
+    如果传入空字符串或环境变量为空，则视为不使用代理。
+    """
+
+    if proxy_server is not None:
+        proxy_server = proxy_server.strip()
+        return proxy_server or None
+
+    proxy_server = os.environ.get(
+        "IPIPSEEK_PROXY_SERVER",
+        "http://127.0.0.1:7777",
+    ).strip()
+
+    return proxy_server or None
 
 
 def parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -320,7 +346,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
 def get_ip_vpn_status(
         *ips: str,
         headless: bool = True,
-        proxy_server: Optional[str] = "http://127.0.0.1:7777",
+        proxy_server: Optional[str] = None,
 ) -> str:
     """
     批量查询多个 IP 的 vpn 状态。
@@ -336,7 +362,12 @@ def get_ip_vpn_status(
         任意异常都只会让对应 IP 返回 null。
     """
 
-    # 1. 初始化结果字典
+
+    # 3. 设置代理
+    #    这里不再判断 headless，所以无头/有头都会走代理
+    proxy_server = resolve_proxy_server(proxy_server)
+
+    # 2. 初始化结果字典
     results = {}
 
     try:
@@ -444,24 +475,41 @@ def get_ip_vpn_status(
 
 
 if __name__ == "__main__":
-    # 1. 从命令行读取 IP 参数
-    ips = [
-        arg.strip()
-        for arg in sys.argv[1:]
-        if arg.strip()
-    ]
+    proxy_server = None
+    ips = []
 
-    # 2. 如果命令行没有传 IP，就使用默认测试 IP
+    args = sys.argv[1:]
+    i = 0
+
+    while i < len(args):
+        arg = args[i].strip()
+
+        if not arg:
+            i += 1
+            continue
+
+        if arg == "--proxy" and i + 1 < len(args):
+            proxy_server = args[i + 1].strip()
+            i += 2
+            continue
+
+        if arg.startswith("--proxy="):
+            proxy_server = arg.split("=", 1)[1].strip()
+            i += 1
+            continue
+
+        ips.append(arg)
+        i += 1
+
+    # 如果命令行没有传 IP，就使用默认测试 IP
     if not ips:
         ips = [
             "60.113.181.155"
         ]
 
-    # 3. 执行查询
     result = get_ip_vpn_status(
         *ips,
-        proxy_server="http://127.0.0.1:7777",
+        proxy_server=proxy_server,
     )
 
-    # 4. 输出最终 JSON
     print(result)

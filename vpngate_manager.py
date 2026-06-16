@@ -72,6 +72,22 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 HOT_BACKUP_PROXY_HOST = os.environ.get("HOT_BACKUP_PROXY_HOST", "127.0.0.1")
 HOT_BACKUP_PROXY_PORT = int(os.environ.get("HOT_BACKUP_PROXY_PORT", "7777"))
 
+
+# KR 旁路远程代理：独立于正式节点 / 热备节点，固定使用 tun9 + 8888。
+KR_EXTRA_PROXY_ENABLED = env_flag("KR_EXTRA_PROXY_ENABLED", "1")
+KR_EXTRA_COUNTRY = os.environ.get("KR_EXTRA_COUNTRY", "KR").strip().upper() or "KR"
+KR_EXTRA_DEV = os.environ.get("KR_EXTRA_DEV", "tun9").strip() or "tun9"
+KR_EXTRA_PROXY_HOST = os.environ.get("KR_EXTRA_PROXY_HOST", "0.0.0.0")
+KR_EXTRA_PROXY_PORT = int(os.environ.get("KR_EXTRA_PROXY_PORT", "8888"))
+KR_EXTRA_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("KR_EXTRA_INTERVAL_SECONDS", str(30 * 60)))
+)
+KR_EXTRA_MAX_ATTEMPTS = max(
+    1,
+    int(os.environ.get("KR_EXTRA_MAX_ATTEMPTS", "20"))
+)
+
 PROXY_AUTH_ENABLED = os.environ.get("PROXY_AUTH_ENABLED", "0").strip().lower() in {
     "1",
     "true",
@@ -3467,6 +3483,14 @@ def mark_hot_backup_node_fields(node_id: str, fields: dict[str, Any]) -> None:
                 break
         write_json(NODES_FILE, sort_all_nodes(nodes))
 
+def mark_node_fields(node_id: str, fields: dict[str, Any]) -> None:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        for item in nodes:
+            if str(item.get("id") or "") == str(node_id):
+                item.update(fields)
+                break
+        write_json(NODES_FILE, sort_all_nodes(nodes))
 
 def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str = "") -> bool:
     global hot_backup_process, hot_backup_node_id, hot_backup_dev, hot_backup_info, hot_backup_building
@@ -3789,6 +3813,243 @@ def start_hot_backup_builder_thread(country_code: str = "") -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
+kr_extra_process: subprocess.Popen[str] | None = None
+kr_extra_node_id = ""
+kr_extra_lock = threading.RLock()
+
+
+def log_kr_extra(message: str, level: str = "INFO") -> None:
+    print(f"[KR旁路代理] {message}", flush=True)
+    log_to_json(level, "KRExtra", message)
+
+
+def choose_kr_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = time.time()
+    candidates: list[dict[str, Any]] = []
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+
+        if node.get("active"):
+            continue
+        if node_id == active_openvpn_node_id:
+            continue
+        if node_id == hot_backup_node_id:
+            continue
+        if get_country_code(node).upper() != KR_EXTRA_COUNTRY:
+            continue
+        if should_skip_candidate_by_quality(node, now):
+            continue
+
+        if node.get("probe_status") == "unavailable":
+            probed_at = float(node.get("probed_at") or 0)
+            if now - probed_at < INVALID_BACKOFF_SECONDS:
+                continue
+
+        candidates.append(node)
+
+    candidates.sort(
+        key=lambda n: (
+            0 if n.get("quality_status") == "passed" else 1,
+            parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
+            -parse_int(n.get("human_ratio")),
+            parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999,
+            -parse_int(n.get("score")),
+        )
+    )
+    return candidates
+
+
+def cleanup_kr_extra_proxy(reason: str = "") -> None:
+    global kr_extra_process, kr_extra_node_id
+
+    with kr_extra_lock:
+        process = kr_extra_process
+        node_id = kr_extra_node_id
+        kr_extra_process = None
+        kr_extra_node_id = ""
+
+    if process is not None:
+        stop_process(process)
+
+    cleanup_policy_routing(KR_EXTRA_DEV)
+
+    if node_id:
+        mark_node_fields(node_id, {
+            "kr_extra_proxy_status": "empty",
+            "kr_extra_proxy_message": reason or "KR 旁路代理已清理",
+            "kr_extra_proxy_updated_at": time.time(),
+        })
+
+    if reason:
+        log_kr_extra(reason)
+
+
+def build_kr_extra_proxy_once() -> bool:
+    global kr_extra_process, kr_extra_node_id
+
+    if not KR_EXTRA_PROXY_ENABLED:
+        return False
+
+    with kr_extra_lock:
+        process = kr_extra_process
+        node_id = kr_extra_node_id
+
+    if process is not None and process.poll() is None and node_id:
+        health = check_interface_health(KR_EXTRA_DEV)
+        if health.get("ok"):
+            log_kr_extra(
+                f"KR 旁路代理正常: node={node_id}, dev={KR_EXTRA_DEV}, "
+                f"ip={health.get('ip')}, latency={health.get('latency_ms')}ms"
+            )
+            return True
+
+    cleanup_kr_extra_proxy("KR 旁路代理不存在或检测失败，准备重新构建")
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+
+    candidates = choose_kr_extra_candidates(nodes)
+    if not candidates:
+        log_kr_extra(f"没有符合条件的 {KR_EXTRA_COUNTRY} 旁路代理候选节点", "WARNING")
+        return False
+
+    total_attempts = min(len(candidates), KR_EXTRA_MAX_ATTEMPTS)
+
+    for attempts, node in enumerate(candidates[:KR_EXTRA_MAX_ATTEMPTS], start=1):
+        node_id = str(node.get("id") or "")
+        config_file = node.get("config_file")
+        config_text = node.get("config_text") or ""
+
+        if not node_id or not config_file or not config_text:
+            continue
+
+        process: subprocess.Popen[str] | None = None
+        keep_process = False
+
+        try:
+            cleanup_policy_routing(KR_EXTRA_DEV)
+
+            try:
+                subprocess.run(
+                    ["pkill", "-f", f"openvpn.*{KR_EXTRA_DEV}"],
+                    capture_output=True,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+            Path(config_file).write_text(config_text, encoding="utf-8")
+
+            log_kr_extra(
+                f"开始构建 {KR_EXTRA_COUNTRY} 旁路代理 {node_id}，"
+                f"接口 {KR_EXTRA_DEV}，第 {attempts}/{total_attempts} 个候选"
+            )
+
+            ok, message, process = run_openvpn_until_ready(
+                str(config_file),
+                keep_alive=True,
+                route_nopull=True,
+                timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                dev=KR_EXTRA_DEV,
+            )
+
+            if not ok or process is None:
+                mark_node_fields(node_id, {
+                    "probe_status": "unavailable",
+                    "probe_message": message,
+                    "probed_at": time.time(),
+                    "kr_extra_proxy_status": "probe_failed",
+                    "kr_extra_proxy_message": message,
+                    "kr_extra_proxy_updated_at": time.time(),
+                })
+                continue
+
+            setup_policy_routing(KR_EXTRA_DEV)
+
+            health = check_interface_health(KR_EXTRA_DEV)
+            if not health.get("ok"):
+                reason = health.get("error", f"{KR_EXTRA_DEV} 出口检测失败")
+                mark_node_fields(node_id, {
+                    "probe_status": "unavailable",
+                    "probe_message": reason,
+                    "probed_at": time.time(),
+                    "kr_extra_proxy_status": "health_failed",
+                    "kr_extra_proxy_message": reason,
+                    "kr_extra_proxy_updated_at": time.time(),
+                })
+                continue
+
+            passed, reason, quality_info = probe_quality_via_interface(
+                KR_EXTRA_DEV,
+                include_speed=True,
+                proxy_server_url=f"http://127.0.0.1:{KR_EXTRA_PROXY_PORT}",
+                log_prefix="KR旁路代理",
+            )
+
+            update_node_quality(node_id, quality_info, passed, reason)
+
+            if not passed:
+                mark_node_fields(node_id, {
+                    "kr_extra_proxy_status": "quality_failed",
+                    "kr_extra_proxy_message": reason,
+                    "kr_extra_proxy_updated_at": time.time(),
+                })
+                continue
+
+            with kr_extra_lock:
+                kr_extra_process = process
+                kr_extra_node_id = node_id
+
+            keep_process = True
+            exit_ip = quality_info.get("ip") or health.get("ip") or ""
+
+            mark_node_fields(node_id, {
+                "probe_status": "available",
+                "probe_message": f"KR 旁路代理已建立，出口 IP {exit_ip}",
+                "probed_at": time.time(),
+                "kr_extra_proxy_status": "ready",
+                "kr_extra_proxy_message": f"KR 旁路代理已建立: {KR_EXTRA_PROXY_HOST}:{KR_EXTRA_PROXY_PORT}",
+                "kr_extra_proxy_interface": KR_EXTRA_DEV,
+                "kr_extra_proxy_exit_ip": exit_ip,
+                "kr_extra_proxy_updated_at": time.time(),
+            })
+
+            log_kr_extra(
+                f"KR 旁路代理已就绪: node={node_id}, dev={KR_EXTRA_DEV}, "
+                f"proxy=http://{KR_EXTRA_PROXY_HOST}:{KR_EXTRA_PROXY_PORT}, ip={exit_ip}"
+            )
+            return True
+
+        except Exception as exc:
+            log_kr_extra(f"KR 旁路代理候选 {node_id} 构建异常: {exc}", "WARNING")
+
+        finally:
+            if process is not None and not keep_process:
+                stop_process(process)
+                cleanup_policy_routing(KR_EXTRA_DEV)
+
+    log_kr_extra(f"已尝试 {KR_EXTRA_COUNTRY} 候选节点，但没有找到可用旁路代理", "WARNING")
+    return False
+
+
+def kr_extra_proxy_loop() -> None:
+    if not KR_EXTRA_PROXY_ENABLED:
+        return
+
+    while True:
+        try:
+            build_kr_extra_proxy_once()
+        except Exception as exc:
+            log_kr_extra(f"KR 旁路代理线程异常: {exc}", "ERROR")
+
+        time.sleep(KR_EXTRA_INTERVAL_SECONDS)
 
 def check_hot_backup_health(force: bool = False) -> bool:
     global hot_backup_info, last_hot_backup_health_check_at
@@ -5313,22 +5574,27 @@ def check_interface_health(interface: str, timeout_seconds: int = 6) -> dict[str
         return {"ok": False, "error": f"备用出口 {iface} 检测异常: {exc}"}
 
 
-def probe_quality_via_interface(interface: str, include_speed: bool = True) -> tuple[bool, str, dict[str, Any]]:
+def probe_quality_via_interface(
+        interface: str,
+        include_speed: bool = True,
+        proxy_server_url: str | None = None,
+        log_prefix: str = "热备用",
+) -> tuple[bool, str, dict[str, Any]]:
     iface = str(interface or "").strip()
     if not iface:
         return False, "缺少备用出口接口", {}
 
     quality_info: dict[str, Any] = {}
 
-    print(f"[热备用] 开始通过 {iface} 进行 IPPure 预检", flush=True)
+    print(f"[{log_prefix}] 开始通过 {iface} 进行 IPPure 预检", flush=True)
     quality_info = fetch_ippure_quality_via_interface(iface)
 
 
     if not apply_exit_ip_hard_fail_cache(quality_info, log_prefix="热备用"):
         apply_ipipseek_vpn_precheck(
             quality_info,
-            log_prefix="热备用",
-            proxy_server_url=f"http://127.0.0.1:{HOT_BACKUP_PROXY_PORT}",
+            log_prefix=log_prefix,
+            proxy_server_url=proxy_server_url or f"http://127.0.0.1:{HOT_BACKUP_PROXY_PORT}",
         )
 
     # Scamalytics / ProxyCheck 已移除，不再做这两个第三方预检。
@@ -11743,6 +12009,23 @@ def main() -> None:
         daemon=True,
     ).start()
 
+
+    if KR_EXTRA_PROXY_ENABLED:
+        # 启动 KR 旁路远程代理：8888。
+        # 认证逻辑复用 7928 的 proxy_server 全局配置：
+        # - PROXY_AUTH_ENABLED=1 时，外部访问服务器IP:8888 需要用户名密码
+        # - 本机 127.0.0.1:8888 访问跳过认证，方便 Playwright / ipipseek 内部检测
+        threading.Thread(
+            target=proxy_server.start_proxy_server,
+            args=(KR_EXTRA_PROXY_HOST, KR_EXTRA_PROXY_PORT, KR_EXTRA_DEV),
+            daemon=True,
+        ).start()
+
+        threading.Thread(
+            target=kr_extra_proxy_loop,
+            daemon=True,
+        ).start()
+
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
     gateway_ready = False
@@ -11782,6 +12065,13 @@ def main() -> None:
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
     print(f"HotBackup Proxy: http://{HOT_BACKUP_PROXY_HOST}:{HOT_BACKUP_PROXY_PORT}", flush=True)
     ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
+
+    if KR_EXTRA_PROXY_ENABLED:
+        print(
+            f"KR Extra Proxy: http://{KR_EXTRA_PROXY_HOST}:{KR_EXTRA_PROXY_PORT} "
+            f"via {KR_EXTRA_DEV}",
+            flush=True,
+        )
 
 if __name__ == "__main__":
     main()
