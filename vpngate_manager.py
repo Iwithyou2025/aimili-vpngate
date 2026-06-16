@@ -3974,10 +3974,21 @@ def build_kr_extra_proxy_once() -> bool:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             Path(config_file).write_text(config_text, encoding="utf-8")
 
-            log_kr_extra(
-                f"开始构建 {KR_EXTRA_COUNTRY} 旁路代理 {node_id}，"
-                f"接口 {KR_EXTRA_DEV}，第 {attempts}/{total_attempts} 个候选"
-            )
+            if is_kr_stale_after_restart:
+                log_to_json(
+                    "INFO",
+                    "KRExtra",
+                    (
+                        f"服务重启后静默尝试恢复上次 KR 旁路节点: "
+                        f"node={node_id}, dev={KR_EXTRA_DEV}, "
+                        f"第 {attempts}/{total_attempts} 个候选"
+                    ),
+                )
+            else:
+                log_kr_extra(
+                    f"开始构建 {KR_EXTRA_COUNTRY} 旁路代理 {node_id}，"
+                    f"接口 {KR_EXTRA_DEV}，第 {attempts}/{total_attempts} 个候选"
+                )
 
             ok, message, process = run_openvpn_until_ready(
                 str(config_file),
