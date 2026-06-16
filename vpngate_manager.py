@@ -3152,6 +3152,17 @@ HOT_BACKUP_CACHE_FIELDS = {
     "hot_backup_stale_after_restart_at",
 }
 
+KR_EXTRA_CACHE_FIELDS = {
+    "kr_extra_proxy_status",
+    "kr_extra_proxy_message",
+    "kr_extra_proxy_interface",
+    "kr_extra_proxy_exit_ip",
+    "kr_extra_proxy_last_health_ok_at",
+    "kr_extra_proxy_updated_at",
+    "kr_extra_proxy_restored_after_restart",
+}
+
+
 def find_hard_fail_node_by_exit_ip(exit_ip: str, now: float | None = None) -> dict[str, Any] | None:
     """
     根据 IPPure 返回的真实出口 IP，查找 nodes.json 中是否已有相同 exit_ip 的 hard fail 记录。
@@ -3940,6 +3951,10 @@ def build_kr_extra_proxy_once() -> bool:
         if not node_id or not config_file or not config_text:
             continue
 
+        is_kr_stale_after_restart = (
+                str(node.get("kr_extra_proxy_status") or "") == "ready"
+                and str(node.get("kr_extra_proxy_interface") or KR_EXTRA_DEV) == KR_EXTRA_DEV
+        )
         process: subprocess.Popen[str] | None = None
         keep_process = False
 
@@ -3996,6 +4011,65 @@ def build_kr_extra_proxy_once() -> bool:
                     "kr_extra_proxy_updated_at": time.time(),
                 })
                 continue
+
+
+            # ── 服务重启后的 KR 旁路快速恢复 ─────────────────────────────
+            # 上次 KR 旁路已经是 ready；
+            # 本次重启后只要 OpenVPN 重新拨号成功，并且 tun9 轻量健康检测通过，
+            # 就复用原质量/测速缓存恢复 ready，不重新跑 ipipseek / speedtest。
+            if is_kr_stale_after_restart:
+                now = time.time()
+
+                cached_quality_info: dict[str, Any] = {}
+
+                for field in QUALITY_CACHE_FIELDS:
+                    if field in node:
+                        cached_quality_info[field] = node.get(field)
+
+                for field in IPAPI_RISK_FIELD_LABELS:
+                    if field in node:
+                        cached_quality_info[field] = node.get(field)
+
+                old_exit_ip = str(node.get("kr_extra_proxy_exit_ip") or node.get("exit_ip") or node.get("ip") or "")
+                current_exit_ip = str(health.get("ip") or old_exit_ip or "")
+
+                cached_quality_info["ip"] = current_exit_ip
+                cached_quality_info["quality_source"] = "kr_extra_stale_after_restart_reused"
+
+                with kr_extra_lock:
+                    kr_extra_process = process
+                    kr_extra_node_id = node_id
+
+                keep_process = True
+
+                mark_node_fields(node_id, {
+                    "probe_status": "available",
+                    "probe_message": f"KR 旁路代理重启后恢复成功，出口 IP {current_exit_ip}",
+                    "probed_at": now,
+                    "kr_extra_proxy_status": "ready",
+                    "kr_extra_proxy_message": "服务重启后 KR 旁路重建成功，已通过健康检测并复用原质量缓存",
+                    "kr_extra_proxy_interface": KR_EXTRA_DEV,
+                    "kr_extra_proxy_exit_ip": current_exit_ip,
+                    "kr_extra_proxy_last_health_ok_at": now,
+                    "kr_extra_proxy_updated_at": now,
+                    "kr_extra_proxy_restored_after_restart": True,
+                })
+
+                if old_exit_ip and current_exit_ip and old_exit_ip != current_exit_ip:
+                    log_kr_extra(
+                        f"旧 KR 旁路 {node_id} 重建成功，出口 IP 有变化: "
+                        f"{old_exit_ip} -> {current_exit_ip}，仍按健康检测结果恢复 ready",
+                        "WARNING",
+                    )
+                else:
+                    log_kr_extra(
+                        f"旧 KR 旁路 {node_id} 重建成功，出口 IP {current_exit_ip}，"
+                        f"已复用原质量/测速缓存并恢复 ready"
+                    )
+
+                return True
+                # ── KR 旁路快速恢复结束 ─────────────────────────────────────
+
 
             passed, reason, quality_info = probe_quality_via_interface(
                 KR_EXTRA_DEV,
@@ -4395,6 +4469,10 @@ def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, An
             merged[field] = old_node.get(field)
 
     for field in HOT_BACKUP_CACHE_FIELDS:
+        if field in old_node:
+            merged[field] = old_node.get(field)
+
+    for field in KR_EXTRA_CACHE_FIELDS:
         if field in old_node:
             merged[field] = old_node.get(field)
 
@@ -5605,7 +5683,7 @@ def probe_quality_via_interface(
     quality_info = fetch_ippure_quality_via_interface(iface)
 
 
-    if not apply_exit_ip_hard_fail_cache(quality_info, log_prefix="热备用"):
+    if not apply_exit_ip_hard_fail_cache(quality_info, log_prefix=log_prefix):
         apply_ipipseek_vpn_precheck(
             quality_info,
             log_prefix=log_prefix,
@@ -5651,10 +5729,16 @@ def probe_quality_via_interface(
 
     # 质量不通过：不测速，直接输出一次总结果
     if not passed:
-        log_hot_backup(
-            f"{iface} 总检测结果: "
-            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
-        )
+        if log_prefix == "热备用":
+            log_hot_backup(
+                f"{iface} 总检测结果: "
+                f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
+            )
+        else:
+            log_kr_extra(
+                f"{iface} 总检测结果: "
+                f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
+            )
         return passed, reason, quality_info
 
     # 质量通过后才测速
@@ -5690,10 +5774,16 @@ def probe_quality_via_interface(
             passed, reason = evaluate_ip_quality(quality_info)
 
     # 最终只输出一次总结果
-    log_hot_backup(
-        f"{iface} 总检测结果: "
-        f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
-    )
+    if log_prefix == "热备用":
+        log_hot_backup(
+            f"{iface} 总检测结果: "
+            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
+        )
+    else:
+        log_kr_extra(
+            f"{iface} 总检测结果: "
+            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
+        )
 
     return passed, reason, quality_info
 
