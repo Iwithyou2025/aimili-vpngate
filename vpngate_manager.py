@@ -3952,6 +3952,8 @@ def build_kr_extra_proxy_once() -> bool:
         process = kr_extra_process
         node_id = kr_extra_node_id
 
+    had_runtime = process is not None or bool(node_id)
+
     if process is not None and process.poll() is None and node_id:
         health = check_interface_health(KR_EXTRA_DEV)
         if health.get("ok"):
@@ -3962,7 +3964,17 @@ def build_kr_extra_proxy_once() -> bool:
             log_to_json("INFO", "KRExtra", msg)
             return True
 
-    cleanup_kr_extra_proxy("KR 旁路代理不存在或检测失败，准备重新构建")
+        reason = health.get("error", f"{KR_EXTRA_DEV} 出口检测失败")
+        cleanup_kr_extra_proxy(f"KR 旁路代理检测失败: {reason}，准备重新构建")
+    else:
+        # 服务刚重启时，kr_extra_process / kr_extra_node_id 是内存变量，必然为空。
+        # 这里不刷终端，只写 JSON；后面会读取 nodes.json，优先恢复上次 ready 节点。
+        cleanup_kr_extra_proxy("")
+        log_to_json(
+            "INFO",
+            "KRExtra",
+            "KR 旁路代理当前没有运行态，准备读取缓存并尝试恢复/构建",
+        )
 
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -4512,6 +4524,7 @@ def build_us_extra_proxy_once() -> bool:
                 "us_extra_proxy_interface": US_EXTRA_DEV,
                 "us_extra_proxy_exit_ip": exit_ip,
                 "us_extra_proxy_updated_at": time.time(),
+                "us_extra_proxy_restored_after_restart": False,
             })
 
             log_us_extra(
@@ -6141,16 +6154,17 @@ def probe_quality_via_interface(
 
     # 质量不通过：不测速，直接输出一次总结果
     if not passed:
+        msg = (
+            f"{iface} 总检测结果: "
+            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
+        )
+
         if log_prefix == "热备用":
-            log_hot_backup(
-                f"{iface} 总检测结果: "
-                f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
-            )
+            log_hot_backup(msg)
         else:
-            log_kr_extra(
-                f"{iface} 总检测结果: "
-                f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
-            )
+            print(f"[{log_prefix}] {msg}", flush=True)
+            log_to_json("INFO", log_prefix, msg)
+
         return passed, reason, quality_info
 
     # 质量通过后才测速
