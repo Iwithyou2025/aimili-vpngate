@@ -6200,16 +6200,17 @@ def probe_quality_via_interface(
             passed, reason = evaluate_ip_quality(quality_info)
 
     # 最终只输出一次总结果
+    msg = (
+        f"{iface} 总检测结果: "
+        f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
+    )
+
     if log_prefix == "热备用":
-        log_hot_backup(
-            f"{iface} 总检测结果: "
-            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
-        )
+        log_hot_backup(msg)
     else:
-        log_kr_extra(
-            f"{iface} 总检测结果: "
-            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
-        )
+        print(f"[{log_prefix}] {msg}", flush=True)
+        log_to_json("INFO", log_prefix, msg)
+        
 
     return passed, reason, quality_info
 
