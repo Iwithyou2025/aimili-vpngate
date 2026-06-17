@@ -4212,6 +4212,13 @@ def choose_us_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, An
     now = time.time()
     candidates: list[dict[str, Any]] = []
 
+    total_country_count = 0
+    skipped_active_count = 0
+    skipped_hot_backup_count = 0
+    skipped_kr_extra_count = 0
+    skipped_quality_count = 0
+    skipped_unavailable_count = 0
+
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -4220,22 +4227,31 @@ def choose_us_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, An
         if not node_id:
             continue
 
-        if node.get("active"):
-            continue
-        if node_id == active_openvpn_node_id:
-            continue
-        if node_id == hot_backup_node_id:
-            continue
-        if node_id == kr_extra_node_id:
-            continue
         if get_country_code(node).upper() != US_EXTRA_COUNTRY:
             continue
+
+        total_country_count += 1
+
+        if node.get("active") or node_id == active_openvpn_node_id:
+            skipped_active_count += 1
+            continue
+
+        if node_id == hot_backup_node_id:
+            skipped_hot_backup_count += 1
+            continue
+
+        if node_id == kr_extra_node_id:
+            skipped_kr_extra_count += 1
+            continue
+
         if should_skip_candidate_by_quality(node, now):
+            skipped_quality_count += 1
             continue
 
         if node.get("probe_status") == "unavailable":
             probed_at = float(node.get("probed_at") or 0)
             if now - probed_at < INVALID_BACKOFF_SECONDS:
+                skipped_unavailable_count += 1
                 continue
 
         candidates.append(node)
@@ -4251,6 +4267,20 @@ def choose_us_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, An
             -parse_int(n.get("score")),
         )
     )
+
+
+
+    log_us_extra(
+        f"US 旁路候选筛选统计："
+        f"{US_EXTRA_COUNTRY} 总节点 {total_country_count} 个，"
+        f"可尝试 {len(candidates)} 个，"
+        f"跳过正式节点 {skipped_active_count} 个，"
+        f"跳过热备节点 {skipped_hot_backup_count} 个，"
+        f"跳过 KR 旁路节点 {skipped_kr_extra_count} 个，"
+        f"跳过质量冷却/hard fail {skipped_quality_count} 个，"
+        f"跳过短期不可用回退 {skipped_unavailable_count} 个"
+    )
+
     return candidates
 
 
