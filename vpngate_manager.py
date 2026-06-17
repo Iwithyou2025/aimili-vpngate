@@ -85,7 +85,7 @@ KR_EXTRA_INTERVAL_SECONDS = max(
 )
 KR_EXTRA_MAX_ATTEMPTS = max(
     1,
-    int(os.environ.get("KR_EXTRA_MAX_ATTEMPTS", "20"))
+    int(os.environ.get("KR_EXTRA_MAX_ATTEMPTS", "100"))
 )
 
 KR_EXTRA_HEALTH_INTERVAL_SECONDS = max(
@@ -390,7 +390,7 @@ US_EXTRA_INTERVAL_SECONDS = max(
 )
 US_EXTRA_MAX_ATTEMPTS = max(
     1,
-    int(os.environ.get("US_EXTRA_MAX_ATTEMPTS", "20"))
+    int(os.environ.get("US_EXTRA_MAX_ATTEMPTS", "100"))
 )
 
 US_EXTRA_HEALTH_INTERVAL_SECONDS = max(
