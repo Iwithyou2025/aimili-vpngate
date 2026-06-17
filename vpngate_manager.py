@@ -378,6 +378,26 @@ IPIPSEEK_PRECHECK_TIMEOUT_SECONDS = int(
 )
 
 
+# US 旁路远程代理：独立于正式节点 / 热备节点 / KR 旁路，固定使用 tun8 + 6666。
+US_EXTRA_PROXY_ENABLED = env_flag("US_EXTRA_PROXY_ENABLED", "1")
+US_EXTRA_COUNTRY = os.environ.get("US_EXTRA_COUNTRY", "US").strip().upper() or "US"
+US_EXTRA_DEV = os.environ.get("US_EXTRA_DEV", "tun8").strip() or "tun8"
+US_EXTRA_PROXY_HOST = os.environ.get("US_EXTRA_PROXY_HOST", "0.0.0.0")
+US_EXTRA_PROXY_PORT = int(os.environ.get("US_EXTRA_PROXY_PORT", "6666"))
+US_EXTRA_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("US_EXTRA_INTERVAL_SECONDS", str(30 * 60)))
+)
+US_EXTRA_MAX_ATTEMPTS = max(
+    1,
+    int(os.environ.get("US_EXTRA_MAX_ATTEMPTS", "20"))
+)
+
+US_EXTRA_HEALTH_INTERVAL_SECONDS = max(
+    5,
+    int(os.environ.get("US_EXTRA_HEALTH_INTERVAL_SECONDS", "30"))
+)
+
 def ensure_openvpn_ca_bundle() -> None:
     """
     生成 OpenVPN 专用 CA bundle。
@@ -3162,6 +3182,16 @@ KR_EXTRA_CACHE_FIELDS = {
     "kr_extra_proxy_restored_after_restart",
 }
 
+US_EXTRA_CACHE_FIELDS = {
+    "us_extra_proxy_status",
+    "us_extra_proxy_message",
+    "us_extra_proxy_interface",
+    "us_extra_proxy_exit_ip",
+    "us_extra_proxy_last_health_ok_at",
+    "us_extra_proxy_updated_at",
+    "us_extra_proxy_restored_after_restart",
+}
+
 
 def find_hard_fail_node_by_exit_ip(exit_ip: str, now: float | None = None) -> dict[str, Any] | None:
     """
@@ -4168,6 +4198,326 @@ def kr_extra_proxy_loop() -> None:
         else:
             time.sleep(KR_EXTRA_INTERVAL_SECONDS)
 
+us_extra_process: subprocess.Popen[str] | None = None
+us_extra_node_id = ""
+us_extra_lock = threading.RLock()
+
+
+def log_us_extra(message: str, level: str = "INFO") -> None:
+    print(f"[US旁路代理] {message}", flush=True)
+    log_to_json(level, "USExtra", message)
+
+
+def choose_us_extra_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = time.time()
+    candidates: list[dict[str, Any]] = []
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+
+        if node.get("active"):
+            continue
+        if node_id == active_openvpn_node_id:
+            continue
+        if node_id == hot_backup_node_id:
+            continue
+        if node_id == kr_extra_node_id:
+            continue
+        if get_country_code(node).upper() != US_EXTRA_COUNTRY:
+            continue
+        if should_skip_candidate_by_quality(node, now):
+            continue
+
+        if node.get("probe_status") == "unavailable":
+            probed_at = float(node.get("probed_at") or 0)
+            if now - probed_at < INVALID_BACKOFF_SECONDS:
+                continue
+
+        candidates.append(node)
+
+    candidates.sort(
+        key=lambda n: (
+            0 if n.get("us_extra_proxy_status") == "ready" else 1,
+            -parse_float(n.get("us_extra_proxy_updated_at")),
+            0 if n.get("quality_status") == "passed" else 1,
+            parse_int(n.get("ippure_score")) if n.get("quality_status") == "passed" else 999,
+            -parse_int(n.get("human_ratio")),
+            parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999,
+            -parse_int(n.get("score")),
+        )
+    )
+    return candidates
+
+
+def cleanup_us_extra_proxy(reason: str = "") -> None:
+    global us_extra_process, us_extra_node_id
+
+    with us_extra_lock:
+        process = us_extra_process
+        node_id = us_extra_node_id
+        us_extra_process = None
+        us_extra_node_id = ""
+
+    if process is not None:
+        stop_process(process)
+
+    cleanup_policy_routing(US_EXTRA_DEV)
+
+    if node_id:
+        mark_node_fields(node_id, {
+            "us_extra_proxy_status": "empty",
+            "us_extra_proxy_message": reason or "US 旁路代理已清理",
+            "us_extra_proxy_updated_at": time.time(),
+        })
+
+    if reason:
+        log_us_extra(reason)
+
+
+def build_us_extra_proxy_once() -> bool:
+    global us_extra_process, us_extra_node_id
+
+    if not US_EXTRA_PROXY_ENABLED:
+        return False
+
+    with us_extra_lock:
+        process = us_extra_process
+        node_id = us_extra_node_id
+
+    if process is not None and process.poll() is None and node_id:
+        health = check_interface_health(US_EXTRA_DEV)
+        if health.get("ok"):
+            msg = (
+                f"US 旁路代理正常: node={node_id}, dev={US_EXTRA_DEV}, "
+                f"ip={health.get('ip')}, latency={health.get('latency_ms')}ms"
+            )
+            log_to_json("INFO", "USExtra", msg)
+            return True
+
+    cleanup_us_extra_proxy("US 旁路代理不存在或检测失败，准备重新构建")
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+
+    candidates = choose_us_extra_candidates(nodes)
+    if not candidates:
+        log_us_extra(f"没有符合条件的 {US_EXTRA_COUNTRY} 旁路代理候选节点", "WARNING")
+        return False
+
+    total_attempts = min(len(candidates), US_EXTRA_MAX_ATTEMPTS)
+
+    for attempts, node in enumerate(candidates[:US_EXTRA_MAX_ATTEMPTS], start=1):
+        node_id = str(node.get("id") or "")
+        config_file = node.get("config_file")
+        config_text = node.get("config_text") or ""
+
+        if not node_id or not config_file or not config_text:
+            continue
+
+        is_us_stale_after_restart = (
+                str(node.get("us_extra_proxy_status") or "") == "ready"
+                and str(node.get("us_extra_proxy_interface") or US_EXTRA_DEV) == US_EXTRA_DEV
+        )
+
+        process: subprocess.Popen[str] | None = None
+        keep_process = False
+
+        try:
+            cleanup_policy_routing(US_EXTRA_DEV)
+
+            try:
+                subprocess.run(
+                    ["pkill", "-f", f"openvpn.*{US_EXTRA_DEV}"],
+                    capture_output=True,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+            Path(config_file).write_text(config_text, encoding="utf-8")
+
+            if is_us_stale_after_restart:
+                log_to_json(
+                    "INFO",
+                    "USExtra",
+                    (
+                        f"服务重启后静默尝试恢复上次 US 旁路节点: "
+                        f"node={node_id}, dev={US_EXTRA_DEV}, "
+                        f"第 {attempts}/{total_attempts} 个候选"
+                    ),
+                )
+            else:
+                log_us_extra(
+                    f"开始构建 {US_EXTRA_COUNTRY} 旁路代理 {node_id}，"
+                    f"接口 {US_EXTRA_DEV}，第 {attempts}/{total_attempts} 个候选"
+                )
+
+            ok, message, process = run_openvpn_until_ready(
+                str(config_file),
+                keep_alive=True,
+                route_nopull=True,
+                timeout=OPENVPN_PROBE_TIMEOUT_SECONDS,
+                dev=US_EXTRA_DEV,
+            )
+
+            if not ok or process is None:
+                mark_node_fields(node_id, {
+                    "probe_status": "unavailable",
+                    "probe_message": message,
+                    "probed_at": time.time(),
+                    "us_extra_proxy_status": "probe_failed",
+                    "us_extra_proxy_message": message,
+                    "us_extra_proxy_updated_at": time.time(),
+                })
+
+                if is_us_stale_after_restart:
+                    log_us_extra(
+                        f"旧 US 旁路节点 {node_id} 重建失败: {message}，"
+                        f"开始尝试其他 {US_EXTRA_COUNTRY} 候选节点",
+                        "WARNING",
+                    )
+
+                continue
+
+            setup_policy_routing(US_EXTRA_DEV)
+
+            health = check_interface_health(US_EXTRA_DEV)
+            if not health.get("ok"):
+                reason = health.get("error", f"{US_EXTRA_DEV} 出口检测失败")
+                mark_node_fields(node_id, {
+                    "probe_status": "unavailable",
+                    "probe_message": reason,
+                    "probed_at": time.time(),
+                    "us_extra_proxy_status": "health_failed",
+                    "us_extra_proxy_message": reason,
+                    "us_extra_proxy_updated_at": time.time(),
+                })
+
+                if is_us_stale_after_restart:
+                    log_us_extra(
+                        f"旧 US 旁路节点 {node_id} 重建后健康检测失败: {reason}，"
+                        f"开始尝试其他 {US_EXTRA_COUNTRY} 候选节点",
+                        "WARNING",
+                    )
+
+                continue
+
+            # 服务重启后的 US 旁路快速恢复：
+            # 上次 US 旁路已经 ready，本次只要 tun8 健康检测通过，就复用原质量/测速缓存恢复 ready。
+            if is_us_stale_after_restart:
+                now = time.time()
+
+                old_exit_ip = str(node.get("us_extra_proxy_exit_ip") or node.get("exit_ip") or node.get("ip") or "")
+                current_exit_ip = str(health.get("ip") or old_exit_ip or "")
+
+                with us_extra_lock:
+                    us_extra_process = process
+                    us_extra_node_id = node_id
+
+                keep_process = True
+
+                mark_node_fields(node_id, {
+                    "probe_status": "available",
+                    "probe_message": f"US 旁路代理重启后恢复成功，出口 IP {current_exit_ip}",
+                    "probed_at": now,
+                    "us_extra_proxy_status": "ready",
+                    "us_extra_proxy_message": "服务重启后 US 旁路重建成功，已通过健康检测并复用原质量缓存",
+                    "us_extra_proxy_interface": US_EXTRA_DEV,
+                    "us_extra_proxy_exit_ip": current_exit_ip,
+                    "us_extra_proxy_last_health_ok_at": now,
+                    "us_extra_proxy_updated_at": now,
+                    "us_extra_proxy_restored_after_restart": True,
+                })
+
+                if old_exit_ip and current_exit_ip and old_exit_ip != current_exit_ip:
+                    log_us_extra(
+                        f"旧 US 旁路 {node_id} 重建成功，出口 IP 有变化: "
+                        f"{old_exit_ip} -> {current_exit_ip}，仍按健康检测结果恢复 ready",
+                        "WARNING",
+                    )
+                else:
+                    log_us_extra(
+                        f"旧 US 旁路 {node_id} 重建成功，出口 IP {current_exit_ip}，"
+                        f"已复用原质量/测速缓存并恢复 ready"
+                    )
+
+                return True
+
+            passed, reason, quality_info = probe_quality_via_interface(
+                US_EXTRA_DEV,
+                include_speed=True,
+                proxy_server_url=f"http://127.0.0.1:{US_EXTRA_PROXY_PORT}",
+                log_prefix="US旁路代理",
+            )
+
+            update_node_quality(node_id, quality_info, passed, reason)
+
+            if not passed:
+                mark_node_fields(node_id, {
+                    "us_extra_proxy_status": "quality_failed",
+                    "us_extra_proxy_message": reason,
+                    "us_extra_proxy_updated_at": time.time(),
+                })
+                continue
+
+            with us_extra_lock:
+                us_extra_process = process
+                us_extra_node_id = node_id
+
+            keep_process = True
+            exit_ip = quality_info.get("ip") or health.get("ip") or ""
+
+            mark_node_fields(node_id, {
+                "probe_status": "available",
+                "probe_message": f"US 旁路代理已建立，出口 IP {exit_ip}",
+                "probed_at": time.time(),
+                "us_extra_proxy_status": "ready",
+                "us_extra_proxy_message": f"US 旁路代理已建立: {US_EXTRA_PROXY_HOST}:{US_EXTRA_PROXY_PORT}",
+                "us_extra_proxy_interface": US_EXTRA_DEV,
+                "us_extra_proxy_exit_ip": exit_ip,
+                "us_extra_proxy_updated_at": time.time(),
+            })
+
+            log_us_extra(
+                f"US 旁路代理已就绪: node={node_id}, dev={US_EXTRA_DEV}, "
+                f"proxy=http://{US_EXTRA_PROXY_HOST}:{US_EXTRA_PROXY_PORT}, ip={exit_ip}"
+            )
+            return True
+
+        except Exception as exc:
+            log_us_extra(f"US 旁路代理候选 {node_id} 构建异常: {exc}", "WARNING")
+
+        finally:
+            if process is not None and not keep_process:
+                stop_process(process)
+                cleanup_policy_routing(US_EXTRA_DEV)
+
+    log_us_extra(f"已尝试 {US_EXTRA_COUNTRY} 候选节点，但没有找到可用旁路代理", "WARNING")
+    return False
+
+
+def us_extra_proxy_loop() -> None:
+    if not US_EXTRA_PROXY_ENABLED:
+        return
+
+    while True:
+        try:
+            ok = build_us_extra_proxy_once()
+        except Exception as exc:
+            log_us_extra(f"US 旁路代理线程异常: {exc}", "ERROR")
+            ok = False
+
+        if ok:
+            time.sleep(US_EXTRA_HEALTH_INTERVAL_SECONDS)
+        else:
+            time.sleep(US_EXTRA_INTERVAL_SECONDS)
+
 def check_hot_backup_health(force: bool = False) -> bool:
     global hot_backup_info, last_hot_backup_health_check_at
 
@@ -4501,6 +4851,10 @@ def merge_cached_quality_fields(new_node: dict[str, Any], old_node: dict[str, An
             merged[field] = old_node.get(field)
 
     for field in KR_EXTRA_CACHE_FIELDS:
+        if field in old_node:
+            merged[field] = old_node.get(field)
+
+    for field in US_EXTRA_CACHE_FIELDS:
         if field in old_node:
             merged[field] = old_node.get(field)
 
@@ -12159,6 +12513,22 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    if US_EXTRA_PROXY_ENABLED:
+        # 启动 US 旁路远程代理：6666。
+        # 认证逻辑复用 7928 的 proxy_server 全局配置：
+        # - PROXY_AUTH_ENABLED=1 时，外部访问服务器IP:6666 需要用户名密码
+        # - 本机 127.0.0.1:6666 访问跳过认证，方便 Playwright / ipipseek 内部检测
+        threading.Thread(
+            target=proxy_server.start_proxy_server,
+            args=(US_EXTRA_PROXY_HOST, US_EXTRA_PROXY_PORT, US_EXTRA_DEV),
+            daemon=True,
+        ).start()
+
+        threading.Thread(
+            target=us_extra_proxy_loop,
+            daemon=True,
+        ).start()
+
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
     gateway_ready = False
@@ -12203,6 +12573,13 @@ def main() -> None:
         print(
             f"KR Extra Proxy: http://{KR_EXTRA_PROXY_HOST}:{KR_EXTRA_PROXY_PORT} "
             f"via {KR_EXTRA_DEV}",
+            flush=True,
+        )
+
+    if US_EXTRA_PROXY_ENABLED:
+        print(
+            f"US Extra Proxy: http://{US_EXTRA_PROXY_HOST}:{US_EXTRA_PROXY_PORT} "
+            f"via {US_EXTRA_DEV}",
             flush=True,
         )
 
