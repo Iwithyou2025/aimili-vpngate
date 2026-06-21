@@ -255,7 +255,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
                 continue
 
             # 6.2 当前 IP 已出现，再读取 vpn 字段
-            vpn_value = page.evaluate(
+            vpn_values = page.evaluate(
                 r"""
                 (targetKey) => {
                     const clean = (s) => {
@@ -265,67 +265,80 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
                             .replace(/[":：,，]/g, "")
                             .toLowerCase();
                     };
-
+            
                     const key = clean(targetKey);
                     const spans = Array.from(document.querySelectorAll("span"));
-
-                    let keySpan = null;
-
-                    // 1. 找到字段名所在的 span，例如 vpn
-                    for (const span of spans) {
+            
+                    // 1. 找到页面上所有可见的 vpn 字段
+                    const keySpans = spans.filter(span => {
+                        const rect = span.getBoundingClientRect();
                         const text = clean(span.innerText || span.textContent);
-
-                        if (text === key) {
-                            keySpan = span;
-                            break;
+            
+                        return text === key
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+            
+                    const values = [];
+            
+                    // 2. 对每一个 vpn 字段，读取同一行右侧最近的值
+                    for (const keySpan of keySpans) {
+                        const keyRect = keySpan.getBoundingClientRect();
+            
+                        const candidates = spans
+                            .filter(span => span !== keySpan)
+                            .map(span => {
+                                const rect = span.getBoundingClientRect();
+                                const text = (span.innerText || span.textContent || "").trim();
+            
+                                return {
+                                    text,
+                                    rect,
+                                    topDiff: Math.abs(rect.top - keyRect.top),
+                                    leftDiff: rect.left - keyRect.right
+                                };
+                            })
+                            .filter(item => {
+                                return item.text
+                                    && item.rect.width > 0
+                                    && item.rect.height > 0
+                                    && item.leftDiff > 0
+                                    && item.topDiff < 12;
+                            })
+                            .sort((a, b) => a.leftDiff - b.leftDiff);
+            
+                        if (candidates.length > 0) {
+                            values.push(candidates[0].text);
                         }
                     }
-
-                    if (!keySpan) {
-                        return null;
-                    }
-
-                    const keyRect = keySpan.getBoundingClientRect();
-
-                    // 2. 找同一行、位于字段名右侧的候选值
-                    const candidates = spans
-                        .filter(span => span !== keySpan)
-                        .map(span => {
-                            const rect = span.getBoundingClientRect();
-                            const text = (span.innerText || span.textContent || "").trim();
-
-                            return {
-                                text,
-                                rect,
-                                topDiff: Math.abs(rect.top - keyRect.top),
-                                leftDiff: rect.left - keyRect.right
-                            };
-                        })
-                        .filter(item => {
-                            return item.text
-                                && item.rect.width > 0
-                                && item.rect.height > 0
-                                && item.leftDiff > 0
-                                && item.topDiff < 12;
-                        })
-                        .sort((a, b) => a.leftDiff - b.leftDiff);
-
-                    if (candidates.length > 0) {
-                        return candidates[0].text;
-                    }
-
-                    return null;
+            
+                    return values;
                 }
                 """,
                 "vpn",
             )
 
-            # 6.3 转成 Python 布尔值
-            result = parse_bool(vpn_value)
+            # 把所有 vpn 值转成 Python 布尔值
+            parsed_values = [
+                parse_bool(value)
+                for value in vpn_values
+            ]
 
-            # 6.4 只有明确读到 True / False，才立即返回
-            if result is True or result is False:
-                return result
+            # 去掉没有明确解析出来的值
+            known_values = [
+                value
+                for value in parsed_values
+                if value is True or value is False
+            ]
+
+            # 规则：
+            # 1. 只要任意一个 vpn=true，立即返回 True
+            if any(value is True for value in known_values):
+                return True
+
+            # 2. 只有读取到至少一个明确值，并且全部都是 false，才返回 False
+            if known_values and all(value is False for value in known_values):
+                return False
 
             # 6.5 还没有结果，继续等一小段时间
             page.wait_for_timeout(200)
@@ -337,7 +350,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
         return None
 
     except PlaywrightError:
-        return None
+        return PlaywrightError
 
     except Exception:
         return None
