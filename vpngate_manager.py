@@ -176,10 +176,7 @@ QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
 # 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
 QUALITY_CHECK_SPEED_ENABLED = env_flag("QUALITY_CHECK_SPEED_ENABLED", "1")
 
-QUALITY_SPEED_TEST_URL = os.environ.get(
-    "QUALITY_SPEED_TEST_URL",
-    "https://raw.githubusercontent.com/Iwithyou2025/aimili-vpngate/main/speedtest_80m.bin"
-)
+
 
 QUALITY_SPEED_TEST_BYTES = max(
     1024 * 1024,
@@ -380,7 +377,7 @@ IPIPSEEK_PRECHECK_TIMEOUT_SECONDS = int(
 
 # US 旁路远程代理：独立于正式节点 / 热备节点 / KR 旁路，固定使用 tun8 + 6666。
 US_EXTRA_PROXY_ENABLED = env_flag("US_EXTRA_PROXY_ENABLED", "1")
-US_EXTRA_COUNTRY = os.environ.get("US_EXTRA_COUNTRY", "AU").strip().upper() or "AU"
+US_EXTRA_COUNTRY = os.environ.get("US_EXTRA_COUNTRY", "AR").strip().upper() or "AR"
 US_EXTRA_DEV = os.environ.get("US_EXTRA_DEV", "tun8").strip() or "tun8"
 US_EXTRA_PROXY_HOST = os.environ.get("US_EXTRA_PROXY_HOST", "0.0.0.0")
 US_EXTRA_PROXY_PORT = int(os.environ.get("US_EXTRA_PROXY_PORT", "6666"))
