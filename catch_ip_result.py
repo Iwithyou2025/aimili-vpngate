@@ -240,7 +240,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
         search_btn.click()
 
         # 6. 查询后：等待结果，最多 15 秒
-        result_deadline = time.monotonic() + 15
+        result_deadline = time.monotonic() + 30
 
         while time.monotonic() < result_deadline:
 
@@ -426,7 +426,7 @@ def get_ip_vpn_status(
 
                 # 4.2 给每个 IP 设置独立 30 秒超时时间
                 deadlines = {
-                    ip: time.monotonic() + 30
+                    ip: time.monotonic() + 60
                     for ip in pending_ips
                 }
 
