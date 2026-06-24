@@ -212,7 +212,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
         ip_input = page.get_by_placeholder("请输入查询IP").first
 
         # 2. 查询前：等待输入框里自动出现一个 IP
-        wait_input_deadline = time.monotonic() + 15
+        wait_input_deadline = time.monotonic() + 30
 
         while time.monotonic() < wait_input_deadline:
             try:
@@ -240,7 +240,7 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
         search_btn.click()
 
         # 6. 查询后：等待结果，最多 15 秒
-        result_deadline = time.monotonic() + 30
+        result_deadline = time.monotonic() + 45
 
         while time.monotonic() < result_deadline:
 
@@ -266,22 +266,25 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
                             .toLowerCase();
                     };
             
-                    const key = clean(targetKey);
+                    const keys = Array.isArray(targetKey)
+                        ? targetKey.map(k => clean(k))
+                        : [clean(targetKey)];
+            
                     const spans = Array.from(document.querySelectorAll("span"));
             
-                    // 1. 找到页面上所有可见的 vpn 字段
+                    // 1. 找到页面上所有可见的 vpn / proxy 字段
                     const keySpans = spans.filter(span => {
                         const rect = span.getBoundingClientRect();
                         const text = clean(span.innerText || span.textContent);
             
-                        return text === key
+                        return keys.includes(text)
                             && rect.width > 0
                             && rect.height > 0;
                     });
             
                     const values = [];
             
-                    // 2. 对每一个 vpn 字段，读取同一行右侧最近的值
+                    // 2. 对每一个 vpn / proxy 字段，读取同一行右侧最近的值
                     for (const keySpan of keySpans) {
                         const keyRect = keySpan.getBoundingClientRect();
             
@@ -308,16 +311,19 @@ def query_single_ip_vpn(page, ip: str) -> Optional[bool]:
                             .sort((a, b) => a.leftDiff - b.leftDiff);
             
                         if (candidates.length > 0) {
-                            values.push(candidates[0].text);
+                            const value = clean(candidates[0].text);
+                        
+                            if (value === "true" || value === "false") {
+                                values.push(value);
+                            }
                         }
                     }
             
                     return values;
                 }
                 """,
-                "vpn",
+                ["vpn", "proxy"],
             )
-
             # 把所有 vpn 值转成 Python 布尔值
             parsed_values = [
                 parse_bool(value)
