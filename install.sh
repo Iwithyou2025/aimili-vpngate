@@ -258,8 +258,14 @@ ensure_playwright_env() {
     # 原因：--with-deps 内部会执行 apt-get update，
     # 只要服务器里任意第三方源坏了，比如 Caddy 源缺 GPG key，
     # 就会导致整个 Playwright 安装失败。
+    # Ubuntu 24.04 使用 libasound2t64；旧版本保留 libasound2。
+    local asound_package="libasound2"
+    if LC_ALL=C apt-cache policy libasound2t64 2>/dev/null | \
+       awk '/Candidate:/ && $2 != "(none)" { found = 1 } END { exit !found }'; then
+        asound_package="libasound2t64"
+    fi
     apt-get install -y --no-install-recommends \
-      libasound2 \
+      "$asound_package" \
       libatk-bridge2.0-0 \
       libatk1.0-0 \
       libcairo2 \
