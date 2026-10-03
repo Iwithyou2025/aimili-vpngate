@@ -7,7 +7,6 @@ import json
 import os
 import queue
 import re
-import select
 import shlex
 import socket
 import subprocess
@@ -173,62 +172,6 @@ QUALITY_HARD_FAIL_COOLDOWN_SECONDS = int(
     os.environ.get("QUALITY_HARD_FAIL_COOLDOWN_SECONDS", str(1000 * 24 * 60 * 60))
 )
 
-# 7928 代理出口测速：只下载前 16MB，低于 1MB/s 判定节点过慢
-QUALITY_CHECK_SPEED_ENABLED = env_flag("QUALITY_CHECK_SPEED_ENABLED", "1")
-
-
-
-QUALITY_SPEED_TEST_BYTES = max(
-    1024 * 1024,
-    int(os.environ.get("QUALITY_SPEED_TEST_BYTES", str(16 * 1024 * 1024)))
-)
-
-QUALITY_MIN_DOWNLOAD_SPEED_BPS = max(
-    1,
-    int(os.environ.get("QUALITY_MIN_DOWNLOAD_SPEED_BPS", str(500 * 1024)))
-)
-
-QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS = max(
-    3,
-    int(os.environ.get("QUALITY_SPEED_CONNECT_TIMEOUT_SECONDS", "8"))
-)
-
-QUALITY_SPEED_HTTP_TIMEOUT_SECONDS = max(
-    15,
-    int(os.environ.get("QUALITY_SPEED_HTTP_TIMEOUT_SECONDS", "25"))
-)
-
-# 测速接口异常是否直接判定失败
-# 默认 0：测速异常只记录，不误杀节点
-QUALITY_SPEED_STRICT = env_flag("QUALITY_SPEED_STRICT", "0")
-
-# 使用 Ookla speedtest CLI 通过 tun0 测速
-SPEEDTEST_CMD = os.environ.get("SPEEDTEST_CMD", "speedtest")
-SPEEDTEST_INTERFACE = os.environ.get("SPEEDTEST_INTERFACE", "tun0")
-
-SPEEDTEST_TIMEOUT_SECONDS = max(
-    30,
-    int(os.environ.get("SPEEDTEST_TIMEOUT_SECONDS", "90"))
-)
-
-SPEEDTEST_RETRY_TIMES = max(
-    1,
-    int(os.environ.get("SPEEDTEST_RETRY_TIMES", "3"))
-)
-
-SPEEDTEST_RETRY_DELAY_SECONDS = max(
-    0,
-    int(os.environ.get("SPEEDTEST_RETRY_DELAY_SECONDS", "3"))
-)
-
-# speedtest 不存在时，是否自动安装
-SPEEDTEST_AUTO_INSTALL = env_flag("SPEEDTEST_AUTO_INSTALL", "1")
-
-SPEEDTEST_INSTALL_TIMEOUT_SECONDS = max(
-    60,
-    int(os.environ.get("SPEEDTEST_INSTALL_TIMEOUT_SECONDS", "240"))
-)
-
 PROXY_HEALTH_CONFIRM_TIMES = max(
     1,
     int(os.environ.get("PROXY_HEALTH_CONFIRM_TIMES", "2"))
@@ -239,7 +182,7 @@ PROXY_HEALTH_CONFIRM_DELAY_SECONDS = max(
     int(os.environ.get("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", "6"))
 )
 
-# 热备用：只维护 1 个已拨号、已质检、已测速通过的备用 OpenVPN 出口。
+# 热备用：只维护 1 个已拨号、已质检通过的备用 OpenVPN 出口。
 # 正式节点故障时，直接把 7928 的出站接口切到这个备用 tun。
 HOT_BACKUP_ENABLED = env_flag("HOT_BACKUP_ENABLED", "1")
 HOT_BACKUP_DEV = os.environ.get("HOT_BACKUP_DEV", "tun1")
@@ -1266,7 +1209,7 @@ def mark_node_switch_start(reason: str = "") -> None:
     注意：
     如果已经存在开始时间，不重复覆盖。
     这样连续切换多个失败节点时，统计的是：
-    第一次发现故障 -> 最终新节点测速达标 的总耗时。
+    第一次发现故障 -> 最终新节点IP质量达标 的总耗时。
     """
     state = read_json(STATE_FILE, {})
 
@@ -1281,7 +1224,7 @@ def mark_node_switch_start(reason: str = "") -> None:
 
 def finish_node_switch_duration(reason: str = "") -> None:
     """
-    新节点连接成功，并且质量 / 测速达标后，结算本轮切换耗时。
+    新节点连接成功，并且IP质量达标后，结算本轮切换耗时。
     结果写入 state.json，所以服务重启后仍然显示上次耗时。
     """
     state = read_json(STATE_FILE, {})
@@ -2884,7 +2827,7 @@ def has_active_vpn_connection() -> bool:
 
 def has_confirmed_active_vpn_connection() -> bool:
     """
-    只有“质量检测/测速已经通过”的节点，才算 UI 层面的已连接。
+    只有“质量检测已经通过”的节点，才算 UI 层面的已连接。
     OpenVPN 刚建立只是质量检测所需的底层通道，不能直接显示为已连接。
     """
     state = read_json(STATE_FILE, {})
@@ -2993,12 +2936,6 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         return score
 
-    def speed_rank(node: dict[str, Any]) -> int:
-        speed = parse_int(node.get("download_speed_bps"))
-
-        # 速度越高越靠前
-        return -speed if speed > 0 else 0
-
     available_nodes = sorted(
         [
             n for n in nodes
@@ -3013,7 +2950,6 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             0 if n.get("is_residential") is True else 1,
             0 if n.get("native_ip") is True else 1,
             -parse_int(n.get("human_ratio")),
-            speed_rank(n),
             parse_int(n.get("latency_ms")) or 999999,
             -parse_int(n.get("score")),
         )
@@ -3065,7 +3001,7 @@ def is_hard_quality_fail_reason(reason: str) -> bool:
     判断是否属于“硬质量失败”。
     这类失败短时间内重复检测意义不大，因此使用更长冷却期。
 
-    注意：测速低于阈值不放进 hard，避免因为临时带宽波动长期跳过节点。
+    注意：临时检测失败不放进 hard，避免长期跳过节点。
     """
     reason = str(reason or "")
 
@@ -3088,7 +3024,7 @@ def should_skip_candidate_by_quality(node: dict[str, Any], now: float | None = N
     1. hard fail 冷却期内的节点；
     2. 兼容旧数据：IPPure 超标且仍在冷却期内的节点。
 
-    不跳过测速失败/测速低速等 soft fail，避免临时波动导致候选池过窄。
+    不跳过 soft fail，避免临时波动导致候选池过窄。
     """
     if not node:
         return True
@@ -3197,7 +3133,7 @@ def find_hard_fail_node_by_exit_ip(exit_ip: str, now: float | None = None) -> di
     用途：
     - 不再只按 node_id 拦截；
     - 如果不同节点最终出口 IP 相同，也可以复用历史 hard fail 结果；
-    - 避免重复进入 ipipseek / speedtest。
+    - 避免重复进入 ipipseek。
     """
     exit_ip = str(exit_ip or "").strip()
 
@@ -3667,10 +3603,10 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
                 # stale_after_restart 表示：
                 # - 这个节点在服务重启前已经是 ready 热备用；
                 # - 重启后 OpenVPN 进程 / tun 接口丢失；
-                # - 但 nodes.json 里还保留了它之前的质量检测和测速结果。
+                # - 但 nodes.json 里还保留了它之前的质量检测结果。
                 #
                 # 所以只要现在重新拨号成功，并且通过一次轻量健康检测，
-                # 就直接恢复为 ready，不重新跑 IPPure / Scamalytics / ipapi / speedtest。
+                # 就直接恢复为 ready，不重新跑 IPPure / Scamalytics / ipapi。
                 if is_stale_after_restart:
                     now = time.time()
 
@@ -3738,18 +3674,18 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
                     else:
                         log_hot_backup(
                             f"旧热备用 {node_id} 重建成功，出口 IP {current_exit_ip}，"
-                            f"已复用原质量/测速缓存并恢复 ready"
+                            f"已复用原质量缓存并恢复 ready"
                         )
 
                     return True
                 # ── 旧热备用快速恢复结束 ─────────────────────────────────────
 
                 log_hot_backup(f"热备用 {node_id} OpenVPN 可用，出口 IP {health.get('ip', '')}，开始质量预检")
-                passed, reason, quality_info = probe_quality_via_interface(dev_name, include_speed=True)
+                passed, reason, quality_info = probe_quality_via_interface(dev_name)
                 update_node_quality(node_id, quality_info, passed, reason)
 
                 if not passed:
-                    log_hot_backup(f"热备用 {node_id} 质量/测速不达标: {reason}", "WARNING")
+                    log_hot_backup(f"热备用 {node_id} 质量不达标: {reason}", "WARNING")
                     mark_hot_backup_node_fields(node_id, {
                         "hot_backup_status": "quality_failed",
                         "hot_backup_message": reason,
@@ -3805,8 +3741,7 @@ def build_hot_backup_from_nodes(nodes: list[dict[str, Any]], country_code: str =
                 )
                 log_hot_backup(
                     f"热备用已就绪: node={node_id}, dev={dev_name}, "
-                    f"exit_ip={quality_info.get('ip') or health.get('ip') or ''}, "
-                    f"speed={parse_float(quality_info.get('download_speed_mib_s')):.2f} MB/s"
+                    f"exit_ip={quality_info.get('ip') or health.get('ip') or ''}"
                 )
                 return True
 
@@ -4083,7 +4018,7 @@ def build_kr_extra_proxy_once() -> bool:
             # ── 服务重启后的 KR 旁路快速恢复 ─────────────────────────────
             # 上次 KR 旁路已经是 ready；
             # 本次重启后只要 OpenVPN 重新拨号成功，并且 tun9 轻量健康检测通过，
-            # 就复用原质量/测速缓存恢复 ready，不重新跑 ipipseek / speedtest。
+            # 就复用原质量缓存恢复 ready，不重新跑 ipipseek。
             if is_kr_stale_after_restart:
                 now = time.time()
 
@@ -4131,7 +4066,7 @@ def build_kr_extra_proxy_once() -> bool:
                 else:
                     log_kr_extra(
                         f"旧 KR 旁路 {node_id} 重建成功，出口 IP {current_exit_ip}，"
-                        f"已复用原质量/测速缓存并恢复 ready"
+                        f"已复用原质量缓存并恢复 ready"
                     )
 
                 return True
@@ -4140,7 +4075,6 @@ def build_kr_extra_proxy_once() -> bool:
 
             passed, reason, quality_info = probe_quality_via_interface(
                 KR_EXTRA_DEV,
-                include_speed=True,
                 proxy_server_url=f"http://127.0.0.1:{KR_EXTRA_PROXY_PORT}",
                 log_prefix="KR旁路代理",
             )
@@ -4448,7 +4382,7 @@ def build_us_extra_proxy_once() -> bool:
                 continue
 
             # 服务重启后的 US 旁路快速恢复：
-            # 上次 US 旁路已经 ready，本次只要 tun8 健康检测通过，就复用原质量/测速缓存恢复 ready。
+            # 上次 US 旁路已经 ready，本次只要 tun8 健康检测通过，就复用原质量缓存恢复 ready。
             if is_us_stale_after_restart:
                 now = time.time()
 
@@ -4483,14 +4417,13 @@ def build_us_extra_proxy_once() -> bool:
                 else:
                     log_us_extra(
                         f"旧 US 旁路 {node_id} 重建成功，出口 IP {current_exit_ip}，"
-                        f"已复用原质量/测速缓存并恢复 ready"
+                        f"已复用原质量缓存并恢复 ready"
                     )
 
                 return True
 
             passed, reason, quality_info = probe_quality_via_interface(
                 US_EXTRA_DEV,
-                include_speed=True,
                 proxy_server_url=f"http://127.0.0.1:{US_EXTRA_PROXY_PORT}",
                 log_prefix="US旁路代理",
             )
@@ -5424,12 +5357,12 @@ def connect_node(node_id: str) -> str:
         except Exception:
             pass
 
-        # OpenVPN 已建立只代表底层通道可用；此时还没有通过 IP 质量/测速，
+        # OpenVPN 已建立只代表底层通道可用；此时还没有通过 IP 质量，
         # 不要把节点标记为 active，否则 UI 会提前显示“已连接”。
         for item in nodes:
             item["active"] = False
             if item.get("id") == node_id:
-                item["probe_message"] = "OpenVPN 已建立，正在进行出口 IP 质量与测速验证"
+                item["probe_message"] = "OpenVPN 已建立，正在进行出口 IP 质量验证"
         write_json(NODES_FILE, nodes)
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
@@ -6091,7 +6024,6 @@ def check_interface_health(interface: str, timeout_seconds: int = 6) -> dict[str
 
 def probe_quality_via_interface(
         interface: str,
-        include_speed: bool = True,
         proxy_server_url: str | None = None,
         log_prefix: str = "热备用",
 ) -> tuple[bool, str, dict[str, Any]]:
@@ -6146,14 +6078,14 @@ def probe_quality_via_interface(
             quality_info["ipapi_checked"] = False
             quality_info["ipapi_error"] = str(exc)
 
-    # 先做质量预检，但不打印“通过”，也不作为最终结论
+    # 执行 IP 质量检测
     passed, reason = evaluate_ip_quality(quality_info)
 
-    # 质量不通过：不测速，直接输出一次总结果
+    # 质量不通过：直接输出一次总结果
     if not passed:
         msg = (
             f"{iface} 总检测结果: "
-            f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=False)}"
+            f"{format_hot_backup_total_result(quality_info, passed, reason)}"
         )
 
         if log_prefix == "热备用":
@@ -6164,42 +6096,10 @@ def probe_quality_via_interface(
 
         return passed, reason, quality_info
 
-    # 质量通过后才测速
-    need_speed = include_speed and QUALITY_CHECK_SPEED_ENABLED
-
-    if need_speed:
-        try:
-            speed_info = fetch_proxy_speed_quality(iface)
-
-            quality_info["speed_test_checked"] = True
-            quality_info["speed_test_error"] = ""
-            quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
-            quality_info["speed_test_http_code"] = speed_info.get("speed_test_http_code", "")
-            quality_info["speed_test_size_bytes"] = speed_info.get("speed_test_size_bytes", 0)
-            quality_info["speed_test_time_seconds"] = speed_info.get("speed_test_time_seconds", 0)
-            quality_info["download_speed_bps"] = speed_info.get("download_speed_bps", 0)
-            quality_info["download_speed_mbps"] = speed_info.get("download_speed_mbps", 0)
-            quality_info["download_speed_mib_s"] = speed_info.get("download_speed_mib_s", 0)
-
-        except Exception as exc:
-            quality_info["speed_test_checked"] = False
-            quality_info["speed_test_error"] = str(exc)
-            log_to_json("WARNING", "HotBackup", f"{iface} speedtest 测速失败: {exc}")
-
-        # 热备用最终验收：测速没完成/测速异常，必须判不通过
-        if quality_info.get("speed_test_error"):
-            passed = False
-            reason = f"出口测速异常: {quality_info.get('speed_test_error')}"
-        elif not quality_info.get("speed_test_checked"):
-            passed = False
-            reason = "出口测速未完成"
-        else:
-            passed, reason = evaluate_ip_quality(quality_info)
-
     # 最终只输出一次总结果
     msg = (
         f"{iface} 总检测结果: "
-        f"{format_hot_backup_total_result(quality_info, passed, reason, include_speed=need_speed)}"
+        f"{format_hot_backup_total_result(quality_info, passed, reason)}"
     )
 
     if log_prefix == "热备用":
@@ -6210,432 +6110,6 @@ def probe_quality_via_interface(
 
 
     return passed, reason, quality_info
-
-def strip_ansi(text: str) -> str:
-    """
-    去掉 speedtest 输出里的 ANSI 颜色控制字符。
-    """
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text or ""))
-
-
-def parse_data_used_to_bytes(value: str, unit: str) -> int:
-    """
-    把 speedtest 输出里的 data used 转成 bytes。
-    例如：
-    98.7 MB -> 103494451
-    """
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return 0
-
-    unit = str(unit or "").upper()
-
-    if unit == "KB":
-        return int(n * 1024)
-
-    if unit == "MB":
-        return int(n * 1024 * 1024)
-
-    if unit == "GB":
-        return int(n * 1024 * 1024 * 1024)
-
-    if unit == "B":
-        return int(n)
-
-    return 0
-
-
-def convert_speed_to_mbps(value: str, unit: str) -> float:
-    """
-    把 speedtest 输出的速度统一转为 Mbps。
-    常见单位：
-    Kbps / Mbps / Gbps
-    """
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-    unit = str(unit or "").lower()
-
-    if unit == "kbps":
-        return n / 1000
-
-    if unit == "mbps":
-        return n
-
-    if unit == "gbps":
-        return n * 1000
-
-    return 0.0
-
-
-def check_speedtest_available() -> bool:
-    try:
-        res = subprocess.run(
-            ["which", SPEEDTEST_CMD],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return res.returncode == 0
-    except Exception:
-        return False
-
-
-def install_speedtest_cli() -> None:
-    """
-    自动安装 Ookla speedtest CLI。
-
-    注意：
-    - 项目本身只支持 Ubuntu，所以这里按 Ubuntu packagecloud 源安装；
-    - 如果系统不是 root 运行，会直接失败；
-    - 正常情况下建议在 install.sh 里安装，这里只是兜底。
-    """
-    if check_speedtest_available():
-        return
-
-    if not SPEEDTEST_AUTO_INSTALL:
-        raise RuntimeError("speedtest 未安装，且 SPEEDTEST_AUTO_INSTALL=0，跳过自动安装")
-
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        raise RuntimeError("speedtest 未安装，当前进程不是 root，无法自动安装")
-
-    print("[测速] speedtest 未安装，正在自动安装 Ookla speedtest CLI...", flush=True)
-    log_to_json("INFO", "Speed", "speedtest 未安装，正在自动安装 Ookla speedtest CLI")
-
-    install_cmd = r"""
-set -e
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update -qq
-apt-get install -y curl gnupg ca-certificates lsb-release
-
-curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
-  | gpg --dearmor -o /usr/share/keyrings/ookla-speedtest.gpg
-
-echo "deb [signed-by=/usr/share/keyrings/ookla-speedtest.gpg] https://packagecloud.io/ookla/speedtest-cli/ubuntu/ $(lsb_release -cs) main" \
-  > /etc/apt/sources.list.d/ookla-speedtest.list
-
-apt-get update -qq
-apt-get install -y speedtest
-"""
-
-    res = subprocess.run(
-        ["bash", "-lc", install_cmd],
-        capture_output=True,
-        text=True,
-        timeout=SPEEDTEST_INSTALL_TIMEOUT_SECONDS,
-    )
-
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"安装 speedtest 失败: returncode={res.returncode}, stderr={res.stderr.strip()}"
-        )
-
-    if not check_speedtest_available():
-        raise RuntimeError("speedtest 安装后仍不可用")
-
-    print("[测速] speedtest 安装完成", flush=True)
-    log_to_json("INFO", "Speed", "speedtest 安装完成")
-
-def ensure_speedtest_interface_exists(interface: str) -> None:
-    """
-    确认测速网卡存在。
-    默认要求 tun0 已经创建成功，否则不进行测速。
-    """
-    iface = str(interface or "").strip()
-    if not iface:
-        raise RuntimeError("speedtest 测速接口为空")
-
-    iface_path = Path("/sys/class/net") / iface
-
-    if not iface_path.exists():
-        raise RuntimeError(f"speedtest 测速接口 {iface} 不存在，请确认 OpenVPN 已成功创建 tun0")
-
-def build_speedtest_env() -> dict[str, str]:
-    """
-    给 Ookla speedtest CLI 补齐运行环境。
-
-    修复：
-    systemd 服务环境下 HOME / USER / LOGNAME 等变量可能为空，
-    speedtest CLI 可能因此崩溃：
-    basic_string::_M_construct null not valid
-    """
-    env = os.environ.copy()
-
-    env.setdefault("HOME", "/root")
-    env.setdefault("USER", "root")
-    env.setdefault("LOGNAME", "root")
-    env.setdefault("LANG", "C.UTF-8")
-    env.setdefault("LC_ALL", "C.UTF-8")
-
-    # 给 speedtest 写配置 / 缓存用，避免 HOME 异常
-    config_home = DATA_DIR / ".config"
-    cache_home = DATA_DIR / ".cache"
-
-    try:
-        config_home.mkdir(parents=True, exist_ok=True)
-        cache_home.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    env.setdefault("XDG_CONFIG_HOME", str(config_home))
-    env.setdefault("XDG_CACHE_HOME", str(cache_home))
-
-    return env
-
-
-def ensure_speedtest_interface_ready(interface: str) -> None:
-    """
-    确认 tun0 已存在并且已有 IPv4 地址。
-    """
-    iface = str(interface or "").strip()
-    if not iface:
-        raise RuntimeError("speedtest 测速接口为空")
-
-    iface_path = Path("/sys/class/net") / iface
-    if not iface_path.exists():
-        raise RuntimeError(f"speedtest 测速接口 {iface} 不存在，请确认 OpenVPN 已成功创建 tun0")
-
-    res = subprocess.run(
-        ["ip", "-4", "addr", "show", "dev", iface],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-
-    if res.returncode != 0 or "inet " not in res.stdout:
-        raise RuntimeError(f"speedtest 测速接口 {iface} 没有 IPv4 地址，请确认 OpenVPN 已完成初始化")
-
-def is_retryable_speedtest_error(message: str) -> bool:
-    """
-    判断 speedtest 错误是否适合重试。
-
-    重点处理：
-    - Cannot open socket
-    - Download: FAILED
-    """
-    s = str(message or "").lower()
-
-    retry_keywords = [
-        "cannot open socket",
-        "download: failed",
-        "download failed",
-        "unable to connect",
-        "connection timed out",
-        "timed out",
-        "network is unreachable",
-        "temporary failure",
-    ]
-
-    return any(k in s for k in retry_keywords)
-
-def run_speedtest_once(speedtest_env: dict[str, str], attempt: int, max_attempts: int, interface: str | None = None) -> dict[str, Any]:
-    """
-    单次 speedtest 测速。
-    失败时抛 RuntimeError，由 fetch_proxy_speed_quality() 负责判断是否重试。
-    """
-    iface = str(interface or SPEEDTEST_INTERFACE or "tun0").strip() or "tun0"
-
-    print(
-        f"[测速] 开始使用 speedtest 通过 {iface} 测试出口下载速度..."
-        f" 第 {attempt}/{max_attempts} 次",
-        flush=True,
-    )
-    log_to_json(
-        "INFO",
-        "Speed",
-        f"开始使用 speedtest 通过 {iface} 测试出口下载速度，第 {attempt}/{max_attempts} 次",
-    )
-
-    cmd = [
-        SPEEDTEST_CMD,
-        "--interface", iface,
-        "--accept-license",
-        "--accept-gdpr",
-        "--progress=no",
-    ]
-
-    started_at = time.time()
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=speedtest_env,
-        cwd=str(DATA_DIR),
-    )
-
-    download_mbps = None
-    data_used_bytes = 0
-    last_lines: list[str] = []
-
-    try:
-        assert process.stdout is not None
-
-        for raw_line in process.stdout:
-            line = strip_ansi(raw_line).strip()
-
-            if line:
-                last_lines.append(line)
-                last_lines = last_lines[-20:]
-
-            for part in re.split(r"[\r\n]+", line):
-                part = part.strip()
-                if not part:
-                    continue
-
-                # 只接受完整下载结果：
-                # Download: 67.45 Mbps (data used: 98.7 MB)
-                match = re.search(
-                    r"Download:\s+([\d.]+)\s+([KMG]bps)\s+\(data used:\s+([\d.]+)\s+([KMG]?B)\)",
-                    part,
-                    re.IGNORECASE,
-                )
-
-                if not match:
-                    continue
-
-                download_mbps = convert_speed_to_mbps(match.group(1), match.group(2))
-                data_used_bytes = parse_data_used_to_bytes(match.group(3), match.group(4))
-
-            if download_mbps and download_mbps > 0 and data_used_bytes > 0:
-                try:
-                    process.terminate()
-                    process.wait(timeout=3)
-                except Exception:
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
-                break
-
-            if time.time() - started_at > SPEEDTEST_TIMEOUT_SECONDS:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-
-                raise RuntimeError(
-                    f"speedtest 超时，超过 {SPEEDTEST_TIMEOUT_SECONDS}s 未获取下载速度，最近输出: "
-                    + " | ".join(last_lines[-8:])
-                )
-
-        if download_mbps is None or download_mbps <= 0 or data_used_bytes <= 0:
-            try:
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-
-            raise RuntimeError(
-                "未能从 speedtest 输出中获取完整下载速度，最近输出: "
-                + " | ".join(last_lines[-8:])
-            )
-
-        time_total = time.time() - started_at
-
-        speed_bps = int(download_mbps * 1000 * 1000 / 8)
-        speed_mib_s = speed_bps / 1024 / 1024
-
-        print(
-            f"[测速] speedtest 下载测速完成: "
-            f"{speed_mib_s:.2f} MB/s | {download_mbps:.2f} Mbps, "
-            f"数据量 {data_used_bytes} bytes, 耗时 {time_total:.2f}s",
-            flush=True,
-        )
-        log_to_json(
-            "INFO",
-            "Speed",
-            f"speedtest 下载测速完成: {speed_mib_s:.2f} MB/s | {download_mbps:.2f} Mbps, "
-            f"数据量 {data_used_bytes} bytes, 耗时 {time_total:.2f}s",
-        )
-
-        return {
-            "speed_test_checked": True,
-            "speed_test_url": f"speedtest://interface/{iface}",
-            "speed_test_http_code": "speedtest",
-            "speed_test_size_bytes": data_used_bytes,
-            "speed_test_time_seconds": round(time_total, 2),
-            "download_speed_bps": speed_bps,
-            "download_speed_mbps": round(download_mbps, 2),
-            "download_speed_mib_s": round(speed_mib_s, 2),
-            "speed_test_timeout": False,
-        }
-
-    finally:
-        if process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-
-
-def fetch_proxy_speed_quality(interface: str | None = None) -> dict[str, Any]:
-    """
-    使用 Ookla speedtest CLI 通过 tun0 测试下载速度。
-
-    增强：
-    - Cannot open socket / Download: FAILED 自动重试；
-    - 只接受包含 data used 的完整下载结果；
-    - 数据量为 0 不算测速完成。
-    """
-    iface = str(interface or SPEEDTEST_INTERFACE or "tun0").strip() or "tun0"
-
-    install_speedtest_cli()
-    ensure_speedtest_interface_ready(iface)
-
-    speedtest_env = build_speedtest_env()
-
-    last_error: Exception | None = None
-
-    for attempt in range(1, SPEEDTEST_RETRY_TIMES + 1):
-        try:
-            return run_speedtest_once(
-                speedtest_env=speedtest_env,
-                attempt=attempt,
-                max_attempts=SPEEDTEST_RETRY_TIMES,
-                interface=iface,
-            )
-
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc)
-
-            can_retry = is_retryable_speedtest_error(msg)
-            is_last = attempt >= SPEEDTEST_RETRY_TIMES
-
-            if not can_retry or is_last:
-                raise
-
-            print(
-                f"[测速] speedtest 第 {attempt}/{SPEEDTEST_RETRY_TIMES} 次失败，可重试错误: {msg}，"
-                f"{SPEEDTEST_RETRY_DELAY_SECONDS}s 后重试...",
-                flush=True,
-            )
-            log_to_json(
-                "WARNING",
-                "Speed",
-                f"speedtest 第 {attempt}/{SPEEDTEST_RETRY_TIMES} 次失败，可重试错误: {msg}，"
-                f"{SPEEDTEST_RETRY_DELAY_SECONDS}s 后重试",
-            )
-
-            time.sleep(SPEEDTEST_RETRY_DELAY_SECONDS)
-
-    raise RuntimeError(f"speedtest 测速失败: {last_error}")
-
 
 def bool_zh(value: Any) -> str:
     if value is True:
@@ -6659,7 +6133,6 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
         ipapi_parts.append(f"{short_label}:{bool_zh(info.get(field))}")
 
     proxycheck_text = "-"
-    speed_text = "-"
 
     if info.get("proxycheck_checked"):
         proxycheck_text = f"proxy:{info.get('proxycheck_proxy') or '-'}"
@@ -6667,14 +6140,6 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
             proxycheck_text += f", type:{info.get('proxycheck_type')}"
     elif info.get("proxycheck_error"):
         proxycheck_text = f"失败:{info.get('proxycheck_error')}"
-
-    if info.get("speed_test_checked"):
-        speed_text = (
-            f"{parse_float(info.get('download_speed_mib_s')):.2f} MB/s "
-            f"({parse_float(info.get('download_speed_mbps')):.2f} Mbps)"
-        )
-    elif info.get("speed_test_error"):
-        speed_text = f"失败: {info.get('speed_test_error')}"
 
     return (
         f"出口IP:{info.get('ip') or info.get('ipapi_ip') or '-'} | "
@@ -6685,19 +6150,8 @@ def format_quality_check_result(info: dict[str, Any]) -> str:
         f"Scamalytics:{parse_int(info.get('scamalytics_score'))}/{QUALITY_MAX_SCAMALYTICS_SCORE} | "
         f"ProxyCheck:{proxycheck_text} | "
         f"Scam风险:{info.get('scamalytics_risk') or '-'} | "
-        f"ipapi.is: {'，'.join(ipapi_parts)} | "
-        f"测速:{speed_text}"
+        f"ipapi.is: {'，'.join(ipapi_parts)}"
     )
-
-def format_speed_brief(info: dict[str, Any]) -> str:
-    if info.get("speed_test_checked"):
-        return f"{parse_float(info.get('download_speed_mib_s')):.2f} MB/s"
-
-    if info.get("speed_test_error"):
-        return f"失败:{info.get('speed_test_error')}"
-
-    return "未测速"
-
 
 def format_quality_fail_brief(info: dict[str, Any], reason: str) -> str:
     reason = str(reason or "").strip()
@@ -6747,24 +6201,11 @@ def format_hot_backup_total_result(
         info: dict[str, Any],
         passed: bool,
         reason: str,
-        include_speed: bool = True,
 ) -> str:
     if passed:
-        if include_speed and QUALITY_CHECK_SPEED_ENABLED:
-            return f"质量预检和测速通过，测速:{format_speed_brief(info)}，结论:通过"
-
         return "质量预检通过，结论:通过"
 
     reason = str(reason or "").strip()
-
-    if reason == "出口测速未完成":
-        return "测速:未完成 不符合要求，结论:不通过"
-
-    if info.get("speed_test_error"):
-        return f"测速:{format_speed_brief(info)} 不符合要求，结论:不通过"
-
-    if info.get("speed_test_checked") and ("速度" in reason or "测速" in reason):
-        return f"测速:{format_speed_brief(info)} 不符合要求，结论:不通过"
 
     return f"{format_quality_fail_brief(info, reason)}，结论:不通过"
 
@@ -6786,7 +6227,7 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
         return False, "ipipseek VPN 预检命中：vpn=true"
 
     # Scamalytics / ProxyCheck 已移除。
-    # 后续只继续执行 IPPure / ipapi / speedtest 判断。
+    # 后续只继续执行 IPPure / ipapi 判断。
 
 
     if score > QUALITY_MAX_FRAUD_SCORE:
@@ -6801,26 +6242,6 @@ def evaluate_ip_quality(info: dict[str, Any]) -> tuple[bool, str]:
 
             if reject_enabled and info.get(field) is True:
                 return False, f"ipapi.is 风险命中: {label}=true"
-
-    if QUALITY_SPEED_STRICT and info.get("speed_test_error"):
-        return False, f"出口测速异常: {info.get('speed_test_error')}"
-
-    if QUALITY_CHECK_SPEED_ENABLED and info.get("speed_test_checked"):
-        speed_bps = parse_int(info.get("download_speed_bps"))
-
-        # 允许测速存在少量波动，避免 0.998 MB/s 被显示成 1.00 MB/s 后仍判定失败
-        SPEED_TEST_TOLERANCE_RATIO = 0.02  # 2% 容差
-
-        speed_mib = speed_bps / 1024 / 1024
-        min_mib = QUALITY_MIN_DOWNLOAD_SPEED_BPS / 1024 / 1024
-
-        effective_min_bps = QUALITY_MIN_DOWNLOAD_SPEED_BPS * (1 - SPEED_TEST_TOLERANCE_RATIO)
-
-        if speed_bps < effective_min_bps:
-            return (
-                False,
-                f"出口下载速度 {speed_mib:.3f} MB/s 低于阈值 {min_mib:.3f} MB/s"
-            )
 
     if QUALITY_REQUIRE_RESIDENTIAL and info.get("is_residential") is not True:
         return False, "IP 类型不是住宅/家庭宽带 IP"
@@ -6910,16 +6331,16 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         for field in IPAPI_RISK_FIELD_LABELS:
             node[field] = quality_info.get(field)
 
-        # 7928 出口测速字段
-        node["speed_test_checked"] = quality_info.get("speed_test_checked", False)
-        node["speed_test_error"] = quality_info.get("speed_test_error", "")
-        node["speed_test_url"] = quality_info.get("speed_test_url", "")
-        node["speed_test_http_code"] = quality_info.get("speed_test_http_code", "")
-        node["speed_test_size_bytes"] = parse_int(quality_info.get("speed_test_size_bytes"))
-        node["speed_test_time_seconds"] = parse_float(quality_info.get("speed_test_time_seconds"))
-        node["download_speed_bps"] = parse_int(quality_info.get("download_speed_bps"))
-        node["download_speed_mbps"] = parse_float(quality_info.get("download_speed_mbps"))
-        node["download_speed_mib_s"] = parse_float(quality_info.get("download_speed_mib_s"))
+        # 保留旧字段并清空测速结果，兼容已有 nodes.json
+        node["speed_test_checked"] = False
+        node["speed_test_error"] = ""
+        node["speed_test_url"] = ""
+        node["speed_test_http_code"] = ""
+        node["speed_test_size_bytes"] = 0
+        node["speed_test_time_seconds"] = 0
+        node["download_speed_bps"] = 0
+        node["download_speed_mbps"] = 0
+        node["download_speed_mib_s"] = 0
 
         # 质量来源
         quality_sources = ["ippure"]
@@ -6927,8 +6348,6 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         if quality_info.get("ipapi_checked"):
             quality_sources.append("ipapi")
 
-        if quality_info.get("speed_test_checked"):
-            quality_sources.append("speedtest")
 
 
         quality_sources = ["ippure"]
@@ -6939,8 +6358,6 @@ def update_node_quality(node_id: str, quality_info: dict[str, Any], passed: bool
         if quality_info.get("ipapi_checked"):
             quality_sources.append("ipapi")
 
-        if quality_info.get("speed_test_checked"):
-            quality_sources.append("speedtest")
 
         node["quality_source"] = "+".join(quality_sources)
 
@@ -7001,63 +6418,13 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
             quality_info["ipapi_checked"] = False
             quality_info["ipapi_error"] = str(exc)
 
-    # 5. 先按 IPPure + Scamalytics + ipapi 质量逻辑判断
-    # 如果这里已经不达标，就不要再测速，减少对节点的影响
+    # 按原有 IP 质量逻辑判断
     passed, reason = evaluate_ip_quality(quality_info)
 
-    # 6. 只有前面的 IP 质量通过后，才进行 7928 出口测速
-    if passed and QUALITY_CHECK_SPEED_ENABLED:
-        set_state(
-            last_check_message=(
-                f"正在通过 {get_active_proxy_interface()} 使用 speedtest 进行出口下载测速..."
-            )
-        )
-
-        try:
-            speed_info = fetch_proxy_speed_quality(get_active_proxy_interface())
-
-            quality_info["speed_test_checked"] = True
-            quality_info["speed_test_error"] = ""
-            quality_info["speed_test_url"] = speed_info.get("speed_test_url", "")
-            quality_info["speed_test_http_code"] = speed_info.get(
-                "speed_test_http_code",
-                ""
-            )
-            quality_info["speed_test_size_bytes"] = speed_info.get(
-                "speed_test_size_bytes",
-                0
-            )
-            quality_info["speed_test_time_seconds"] = speed_info.get(
-                "speed_test_time_seconds",
-                0
-            )
-            quality_info["download_speed_bps"] = speed_info.get(
-                "download_speed_bps",
-                0
-            )
-            quality_info["download_speed_mbps"] = speed_info.get(
-                "download_speed_mbps",
-                0
-            )
-            quality_info["download_speed_mib_s"] = speed_info.get(
-                "download_speed_mib_s",
-                0
-            )
-
-        except Exception as exc:
-            quality_info["speed_test_checked"] = False
-            quality_info["speed_test_error"] = str(exc)
-
-            print(f"[测速] speedtest {get_active_proxy_interface()} 出口测速失败: {exc}", flush=True)
-            log_to_json("WARNING", "Speed", f"speedtest {get_active_proxy_interface()} 出口测速失败: {exc}")
-
-        # 7. 加入测速结果后，再完整判断一次
-        passed, reason = evaluate_ip_quality(quality_info)
-
-    # 8. 写入节点质量结果
+    # 写入节点质量结果
     update_node_quality(node_id, quality_info, passed, reason)
 
-    # 9. 写入全局状态
+    # 写入全局状态
     state_updates = {
         "proxy_quality_ok": passed,
         "proxy_quality_error": "" if passed else reason,
@@ -7080,26 +6447,14 @@ def check_active_exit_ip_quality(node_id: str) -> tuple[bool, str, dict[str, Any
         "proxy_ipapi_asn": quality_info.get("ipapi_asn", ""),
         "proxy_ipapi_org": quality_info.get("ipapi_org", ""),
 
-        "proxy_speed_test_checked": quality_info.get(
-            "speed_test_checked",
-            False
-        ),
-        "proxy_speed_test_error": quality_info.get("speed_test_error", ""),
-        "proxy_download_speed_bps": parse_int(
-            quality_info.get("download_speed_bps")
-        ),
-        "proxy_download_speed_mbps": parse_float(
-            quality_info.get("download_speed_mbps")
-        ),
-        "proxy_download_speed_mib_s": parse_float(
-            quality_info.get("download_speed_mib_s")
-        ),
-        "proxy_speed_test_size_bytes": parse_int(
-            quality_info.get("speed_test_size_bytes")
-        ),
-        "proxy_speed_test_time_seconds": parse_float(
-            quality_info.get("speed_test_time_seconds")
-        ),
+        # 清空旧测速状态，保留兼容字段。
+        "proxy_speed_test_checked": False,
+        "proxy_speed_test_error": "",
+        "proxy_download_speed_bps": 0,
+        "proxy_download_speed_mbps": 0,
+        "proxy_download_speed_mib_s": 0,
+        "proxy_speed_test_size_bytes": 0,
+        "proxy_speed_test_time_seconds": 0,
 
         "proxy_proxycheck_checked": False,
         "proxy_proxycheck_error": "",
@@ -7124,7 +6479,7 @@ def connect_node_with_quality_check(node_id: str) -> str:
 
     修复点：
     - OpenVPN 建立后先进入 quality_checking；
-    - 只有 IPPure / ipapi / 下载测速通过后，才标记为 connected；
+    - 只有 IPPure / ipapi通过后，才标记为 connected；
     - 只有 connected 后才写 active、connected_at、保存上次成功节点。
     """
     previous_node_id = active_openvpn_node_id
@@ -7179,7 +6534,7 @@ def connect_node_with_quality_check(node_id: str) -> str:
             connected_at=None,
         )
         is_connecting = False
-        mark_current_ip_uptime_pending_end(f"IP质量或测速不达标: {reason}")
+        mark_current_ip_uptime_pending_end(f"IP质量不达标: {reason}")
         stop_active_openvpn()
         raise QualityCheckFailed(reason)
 
@@ -7191,7 +6546,7 @@ def connect_node_with_quality_check(node_id: str) -> str:
     print(f"[质量检测] 节点 {node_id} 已通过质量检测，保存为上次成功节点", flush=True)
     log_to_json("INFO", "Quality", f"节点 {node_id} IP质量达标，已保存为上次成功节点: {quality_info}")
 
-    finish_node_switch_duration(f"已切换到 {node_id}，IP质量与测速达标")
+    finish_node_switch_duration(f"已切换到 {node_id}，IP质量达标")
 
     exit_ip = (
             quality_info.get("ip")
@@ -7203,7 +6558,7 @@ def connect_node_with_quality_check(node_id: str) -> str:
     begin_or_continue_ip_uptime(
         exit_ip,
         node_id=node_id,
-        reason="IP质量与测速达标，开始统计连接时间",
+        reason="IP质量达标，开始统计连接时间",
     )
 
     with lock:
@@ -7266,7 +6621,7 @@ def connect_saved_node_without_quality_check(node_id: str) -> str:
     """
     启动恢复专用：
     只要求 OpenVPN 连接成功，并且 7928 代理可以访问网络。
-    不执行 IPPure / ipapi / 下载测速，避免服务重启后恢复时间过长。
+    不执行 IPPure / ipapi，避免服务重启后恢复时间过长。
     """
     result = connect_node(node_id)
 
@@ -7563,7 +6918,7 @@ def maintain_valid_nodes(force: bool = False, show_ui_progress: bool = False) ->
             if hot_backup_ready():
                 check_hot_backup_health(force=False)
                 to_test_ids: list[str] = []
-                log_hot_backup("热备用已存在，本轮维护不再做新节点质量检测和测速")
+                log_hot_backup("热备用已存在，本轮维护不再做新节点质量检测")
             else:
                 stale_count = len([
                     n for n in current_nodes
@@ -8242,18 +7597,6 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.45;
     }
     
-    .speed-test-info {
-      display: inline-flex;
-      align-items: center;
-      padding: 2px 8px;
-      margin-left: 4px;
-      border-radius: 999px;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.28);
-      color: #34d399;
-      font-weight: 700;
-      white-space: nowrap;
-    }
     .proxy-auth-panel {
       margin-top: 8px;
       display: flex;
@@ -9402,7 +8745,7 @@ INDEX_HTML = r"""<!doctype html>
         <div>
           <div class="switch-chart-title">最近 10 个（不含当前连接 IP）IP 持续时长</div>
           <div class="switch-chart-subtitle">
-            从 IP 质量与测速通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
+            从 IP 质量通过后开始计时，到节点不可用、切换、断开或出口 IP 变化时结束；
             当前正在连接的 IP 不显示，结束后再进入统计。
           </div>
         </div>
@@ -9751,32 +9094,6 @@ async function copyProxyField(field, btn) {
 const base=p=>(p||"").split(/[\\/]/).pop();
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
-
-function formatSpeedTestResult(state, activeNode) {
-  let checked = false;
-  let speed = 0;
-
-  // 优先使用当前活动节点自己的测速结果，避免显示旧 state 里的测速值
-  if (activeNode) {
-    checked = !!activeNode.speed_test_checked;
-    speed = Number(activeNode.download_speed_mib_s || 0);
-  } else {
-    checked = !!state.proxy_speed_test_checked;
-    speed = Number(state.proxy_download_speed_mib_s || 0);
-  }
-
-  if (!checked || !Number.isFinite(speed) || speed <= 0) {
-    return "";
-  }
-
-  const msg = state.last_check_message || "";
-
-  if (msg.includes("已恢复上次节点")) {
-    return `上次测速: ${speed.toFixed(2)} MB/s`;
-  }
-
-  return `测速完成: ${speed.toFixed(2)} MB/s`;
-}
 
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
@@ -10910,13 +10227,8 @@ function render(){
          </span>`;
 
 const localProxyText = state.local_proxy || "http://0.0.0.0:7928";
-const speedTestText = formatSpeedTestResult(state, activeNode);
-const speedTestInfo = speedTestText
-  ? ` | <span class="speed-test-info">${esc(speedTestText)}</span>`
-  : "";
-
 $("status").innerHTML =
-  `<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}${speedTestInfo}`;
+  `<span class="status-dot"></span>HTTP 代理接口：${esc(localProxyText)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`;
   
   const maintenanceEl = $("maintenance_status");
 if (maintenanceEl) {
@@ -12447,7 +11759,7 @@ class Handler(BaseHTTPRequestHandler):
                 node_id = str(payload.get("id") or "")
 
                 # 手动点击“切换”也统计：
-                # 从点击切换开始，到新节点 IP 质量 / 测速达标结束。
+                # 从点击切换开始，到新节点 IP IP质量达标结束。
                 if node_id:
                     mark_node_switch_start(f"手动切换到 {node_id}")
 

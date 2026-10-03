@@ -63,22 +63,6 @@ apt-get install -y \
   lsb-release \
   fonts-liberation
 
-echo -e "  -> 正在检查 Ookla speedtest CLI..."
-if ! command -v speedtest >/dev/null 2>&1; then
-    echo -e "  -> 未检测到 speedtest，正在安装 Ookla speedtest CLI..."
-
-    curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
-      | gpg --dearmor -o /usr/share/keyrings/ookla-speedtest.gpg
-
-    echo "deb [signed-by=/usr/share/keyrings/ookla-speedtest.gpg] https://packagecloud.io/ookla/speedtest-cli/ubuntu/ $(lsb_release -cs) main" \
-      > /etc/apt/sources.list.d/ookla-speedtest.list
-
-    apt-get update -q || true
-    apt-get install -y speedtest
-else
-    echo -e "${GREEN}  -> speedtest 已安装，跳过。${PLAIN}"
-fi
-
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
 ENV_FILE="/etc/default/aimilivpn"
